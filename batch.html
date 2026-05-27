@@ -314,6 +314,7 @@
       .stat-success .num { color: #059669; }
       .stat-fail .num { color: #dc2626; }
       .stat-skipped .num { color: #d97706; }
+      .stat-manual .num { color: #b45309; }
       .stat-pending .num { color: #2563eb; }
 
       /* 处理过程中成功/失败数尚未确定时淡化显示 */
@@ -410,6 +411,7 @@
 
       .stats-card-value.total { color: #374151; }
       .stats-card-value.success { color: #059669; }
+      .stats-card-value.manual-required { color: #b45309; }
       .stats-card-value.no-comment-box { color: #d97706; }
       .stats-card-value.fail { color: #dc2626; }
       .stats-card-value.rate { color: #2563eb; }
@@ -492,6 +494,7 @@
       .stats-table tr.url-success td { background: #f0fdf4; }
       .stats-table tr.url-fail td { background: #fff5f5; }
       .stats-table tr.url-skipped td { background: #fffbeb; }
+      .stats-table tr.url-manual_required td { background: #fffbeb; }
 
       .result-badge {
         display: inline-block;
@@ -501,6 +504,7 @@
         font-weight: 600;
       }
       .result-badge.success { background: #d1fae5; color: #065f46; }
+      .result-badge.manual_required { background: #fde68a; color: #92400e; }
       .result-badge.no_comment_box { background: #fef3c7; color: #92400e; }
       .result-badge.fail { background: #fee2e2; color: #991b1b; }
       .result-badge.skipped { background: #fef3c7; color: #92400e; }
@@ -587,7 +591,6 @@
 
       .status-badge.idle { background: #f3f4f6; color: #6b7280; }
       .status-badge.running { background: #dbeafe; color: #1d4ed8; }
-      .status-badge.paused { background: #fef3c7; color: #b45309; }
       .status-badge.completed { background: #d1fae5; color: #065f46; }
       .status-badge.terminated { background: #f3e8ff; color: #7c3aed; }
 
@@ -729,9 +732,6 @@
         <button class="btn btn-primary" id="startBtn" disabled>
           ▶ 开始批量处理
         </button>
-        <button class="btn btn-warning" id="pauseBtn" style="display:none;">
-          ⏸ 暂停
-        </button>
         <button class="btn btn-danger" id="stopBtn" style="display:none;">
           ■ 停止
         </button>
@@ -752,6 +752,9 @@
           </div>
           <div class="stat-item stat-skipped inactive">
             <span class="num" id="skippedCount">0</span> 已存在
+          </div>
+          <div class="stat-item stat-manual inactive">
+            <span class="num" id="manualRequiredCount">0</span> 需手动处理
           </div>
           <div class="stat-item stat-pending">
             <span class="num" id="pendingCount">0</span> 待处理
@@ -779,6 +782,10 @@
             <div class="stats-card-value skipped" id="statsSkipped">0</div>
           </div>
           <div class="stats-card">
+            <div class="stats-card-label">需手动处理</div>
+            <div class="stats-card-value manual-required" id="statsManualRequired">0</div>
+          </div>
+          <div class="stats-card">
             <div class="stats-card-label">无评论框</div>
             <div class="stats-card-value no-comment-box" id="statsNoCommentBox">0</div>
           </div>
@@ -797,6 +804,7 @@
             <option value="all">全部结果</option>
             <option value="success">仅成功</option>
             <option value="skipped">仅已存在</option>
+            <option value="manual_required">仅需手动处理</option>
             <option value="no_comment_box">仅无评论框</option>
             <option value="fail">仅失败</option>
           </select>

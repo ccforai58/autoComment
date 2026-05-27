@@ -10,7 +10,7 @@ const TIMEOUT_STORAGE_KEY = 'batch_timeout_seconds';
 let batchId = null;
 let userId = null;
 let parsedUrls = [];                // [{originalIndex, url}]
-let status = 'idle';                // idle | running | paused | completed
+let status = 'idle';                // idle | running | completed
 let activeTabCount = 0;
 let currentIndex = 0;               // 当前处理到的索引（本地管理）
 let initialPoints = 0;
@@ -21,6 +21,7 @@ let successCount = 0;
 let failCount = 0;
 let skippedCount = 0;
 let noCommentBoxCount = 0;
+let manualRequiredCount = 0;
 let pendingCount = 0;
 
 // 本地结果存储
@@ -57,7 +58,6 @@ const fileRemove = document.getElementById('fileRemove');
 const urlPreview = document.getElementById('urlPreview');
 const urlPreviewBody = document.getElementById('urlPreviewBody');
 const startBtn = document.getElementById('startBtn');
-const pauseBtn = document.getElementById('pauseBtn');
 const stopBtn = document.getElementById('stopBtn');
 const progressSection = document.getElementById('progressSection');
 const progressBar = document.getElementById('progressBar');
@@ -65,6 +65,7 @@ const successCountEl = document.getElementById('successCount');
 const failCountEl = document.getElementById('failCount');
 const skippedCountEl = document.getElementById('skippedCount');
 const noCommentBoxCountEl = document.getElementById('statsNoCommentBox');
+const manualRequiredCountEl = document.getElementById('manualRequiredCount');
 const pendingCountEl = document.getElementById('pendingCount');
 const progressText = document.getElementById('progressText');
 const footerActions = document.getElementById('footerActions');
@@ -79,6 +80,8 @@ const statsPanel = document.getElementById('statsPanel');
 const statsTotal = document.getElementById('statsTotal');
 const statsSuccess = document.getElementById('statsSuccess');
 const statsSkipped = document.getElementById('statsSkipped');
+const statsManualRequired = document.getElementById('statsManualRequired');
+const statsNoCommentBox = document.getElementById('statsNoCommentBox');
 const statsFail = document.getElementById('statsFail');
 const statsRate = document.getElementById('statsRate');
 const filterResult = document.getElementById('filterResult');
@@ -214,7 +217,6 @@ function bindEvents() {
       startBatch();
     }
   });
-  pauseBtn.addEventListener('click', togglePause);
   stopBtn.addEventListener('click', stopBatch);
   exportBtn.addEventListener('click', exportResults);
   clearBtn.addEventListener('click', clearBatch);
@@ -465,6 +467,10 @@ async function startBatch() {
     return;
   }
 
+  await new Promise((resolve) => {
+    chrome.storage.local.remove(['batchCtx', 'batchSubmitCtx'], resolve);
+  });
+
   // 保存批量任务设置和 URL 列表到 storage.local，供 content.js 读取
   await saveBatchTaskSettings();
 
@@ -473,6 +479,9 @@ async function startBatch() {
   totalCount = parsedUrls.length;
   successCount = 0;
   failCount = 0;
+  skippedCount = 0;
+  noCommentBoxCount = 0;
+  manualRequiredCount = 0;
   pendingCount = totalCount;
   currentIndex = 0;
   localResults = [];
@@ -517,26 +526,13 @@ async function clearBatchTaskSettings() {
   });
 }
 
-function togglePause() {
-  if (status === 'running') {
-    setStatus('paused');
-    if (pollTimer) clearTimeout(pollTimer);
-    stopTimeoutChecker();
-  } else if (status === 'paused') {
-    setStatus('running');
-    // 继续处理（固定为1个标签页）
-    if (activeTabCount < 1 && currentIndex < totalCount) {
-      openNextTabSync();
-    }
-  }
-}
-
 // 终止标志：stopBatch 后保持 results 但不再处理
 let isTerminated = false;
 
 async function stopBatch() {
   // 停止继续打开新标签页
   isTerminated = true;
+  setStatus('terminated');
 
   // 标记所有待处理的为未处理（可用于恢复）
   const terminatedCount = pendingCount;
@@ -545,9 +541,21 @@ async function stopBatch() {
   if (pollTimer) clearTimeout(pollTimer);
   stopTimeoutChecker();
 
+  // 先把正在处理的标签页记为已终止，避免关闭回调把它当作待恢复项卡住。
+  const activeEntries = Array.from(activeTabs.entries());
+  for (const [tabId, info] of activeEntries) {
+    if (!localResults.some((r) => r.originalIndex === info.urlIndex)) {
+      const elapsed = Math.round((Date.now() - info.startTime) / 1000);
+      handleTabResult(info.urlIndex, 'fail', null, '手动终止', elapsed, { suppressCompletion: true });
+    }
+  }
+
   // 关闭所有打开的标签页
-  const tabIds = Array.from(activeTabs.keys());
+  const tabIds = activeEntries.map(([tabId]) => tabId);
   activeTabs.clear();
+  activeTabsByIndex.clear();
+  tabsPendingConfirm.clear();
+  tabsWaitingClose.clear();
   for (const tabId of tabIds) {
     try {
       await new Promise((resolve) => {
@@ -558,7 +566,6 @@ async function stopBatch() {
   activeTabCount = 0;
 
   // 状态设为 terminated，用于显示保留的结果
-  setStatus('terminated');
   updateStatsUI();
   updateUI();
 
@@ -580,8 +587,18 @@ async function resumeBatch() {
   isOpeningTab = false;  // 重置锁，确保可以继续打开
 
   // 重置待处理计数（仅统计还未处理的）
-  const processedCount = successCount + failCount + skippedCount + noCommentBoxCount;
+  const processedCount = successCount + failCount + skippedCount + noCommentBoxCount + manualRequiredCount;
   pendingCount = totalCount - processedCount;
+  const processedIndices = new Set(localResults.map((r) => r.originalIndex));
+  let nextIndex = currentIndex;
+  while (nextIndex < totalCount && processedIndices.has(nextIndex)) {
+    nextIndex++;
+  }
+  if (nextIndex >= totalCount) {
+    const fallbackIndex = parsedUrls.findIndex((_, idx) => !processedIndices.has(idx));
+    nextIndex = fallbackIndex === -1 ? totalCount : fallbackIndex;
+  }
+  currentIndex = nextIndex;
 
   console.log('[resumeBatch] 将要处理的 URL 索引范围:', currentIndex, '-', totalCount - 1);
 
@@ -672,11 +689,9 @@ async function openNextTab() {
             openNextTabSync();
           } else if (status === 'running' && activeTabCount === 0) {
             // 所有标签页都已关闭，检查是否全部完成
-            const processedCount = successCount + failCount + skippedCount + noCommentBoxCount;
+            const processedCount = getProcessedCount();
             console.log('[batch] 所有标签关闭，检查完成状态:', { processedCount, totalCount, activeTabCount });
-            if (processedCount >= totalCount) {
-              onAllCompleted();
-            }
+            checkAllCompleted();
           }
         }
       };
@@ -684,6 +699,10 @@ async function openNextTab() {
 
       // 等待 content script 就绪后再发送任务
       function sendWhenReady(tabId, retries = 0) {
+        if (status !== 'running' || isTerminated || !activeTabs.has(tabId)) {
+          console.log('[batch] sendWhenReady 停止重试：任务已停止或标签页不再活跃', { tabId, status, isTerminated });
+          return;
+        }
         if (retries > 20) {
           console.warn('[batch] content.js 就绪超时，放弃发送, tabId:', tabId);
           return;
@@ -699,6 +718,10 @@ async function openNextTab() {
           }).then((response) => {
             console.log('[batch] 收到 content.js 响应:', response, 'tabId:', tab.id, 'tabsPendingConfirm:', [...tabsPendingConfirm.keys()], 'time:', new Date().toISOString());
             if (response && response.ok) {
+              if (localResults.some((r) => r.originalIndex === urlIndex) || !activeTabs.has(tab.id)) {
+                console.log('[batch] 结果已确认或标签已关闭，不再登记 tabsPendingConfirm:', { tabId: tab.id, urlIndex });
+                return;
+              }
               console.log('[batch] 记录 tabId', tab.id, '到 tabsPendingConfirm, 等待 BATCH_CONFIRMED...');
               tabsPendingConfirm.set(tab.id, { urlIndex });
               tabsWaitingClose.add(tab.id);
@@ -731,7 +754,7 @@ async function openNextTab() {
 
 // 处理标签页结果
 // elapsed 可选，外部已知的耗时直接传入（如手动关闭时），否则从 activeTabsByIndex 计算
-function handleTabResult(urlIndex, result, aiContent, errorMessage, forcedElapsed) {
+function handleTabResult(urlIndex, result, aiContent, errorMessage, forcedElapsed, options = {}) {
   console.log('[batch] handleTabResult 被调用:', { urlIndex, result, aiContentLen: aiContent ? aiContent.length : 0, errorMessage });
   const item = parsedUrls[urlIndex];
   if (!item) {
@@ -775,12 +798,15 @@ function handleTabResult(urlIndex, result, aiContent, errorMessage, forcedElapse
   } else if (result === 'no_comment_box') {
     noCommentBoxCount++;
     highlightPreviewRow(urlIndex, 'no_comment_box');
+  } else if (result === 'manual_required') {
+    manualRequiredCount++;
+    highlightPreviewRow(urlIndex, 'manual_required');
   } else {
     failCount++;
     highlightPreviewRow(urlIndex, 'fail');
   }
 
-  pendingCount = totalCount - successCount - failCount - skippedCount - noCommentBoxCount;
+  pendingCount = totalCount - successCount - failCount - skippedCount - noCommentBoxCount - manualRequiredCount;
   updateStatsUI();
   renderStats();
 
@@ -788,20 +814,19 @@ function handleTabResult(urlIndex, result, aiContent, errorMessage, forcedElapse
   saveLocalResults();
 
   // 检查是否全部完成（成功 + 失败 + 已跳过 + 无评论框 >= 总数）
-  const processedCount = successCount + failCount + skippedCount + noCommentBoxCount;
+  const processedCount = successCount + failCount + skippedCount + noCommentBoxCount + manualRequiredCount;
   console.log('[batch] handleTabResult 完成检查:', {
     urlIndex,
     result,
     successCount,
     failCount,
     skippedCount,
+    manualRequiredCount,
     processedCount,
     totalCount,
     shouldComplete: processedCount >= totalCount
   });
-  if (processedCount >= totalCount) {
-    onAllCompleted();
-  }
+  checkAllCompleted(options);
 }
 
 // background 通知：结果已落盘，可以安全关闭标签页了
@@ -811,23 +836,61 @@ function handleTabConfirmed(urlIndex, result, aiContent, errorMessage) {
   // 如果已经记录过结果（标签页可能已被 onRemoved 提前关闭清理），跳过 handleTabResult
   if (localResults.some((r) => r.originalIndex === urlIndex)) {
     console.log('[batch] handleTabConfirmed: urlIndex', urlIndex, '已有结果，可能是标签页提前关闭，无需重复处理');
+    checkAllCompleted();
   } else {
     // 处理结果（更新 UI、写入 storage）
     handleTabResult(urlIndex, result, aiContent, errorMessage);
   }
 
   // 查找并关闭标签页（如果还在的话）
+  let closedTab = false;
   for (const [tabId, info] of tabsPendingConfirm) {
     if (info.urlIndex === urlIndex) {
       console.log('[batch] 关闭 tabId:', tabId, 'urlIndex:', urlIndex);
       tabsPendingConfirm.delete(tabId);
       tabsWaitingClose.delete(tabId);
+      closedTab = true;
       chrome.tabs.remove(tabId, () => {});
       break;
     }
   }
+
+  if (!closedTab) {
+    for (const [tabId, info] of activeTabs) {
+      if (info.urlIndex === urlIndex) {
+        console.log('[batch] tabsPendingConfirm 未登记，按 activeTabs 关闭 tabId:', tabId, 'urlIndex:', urlIndex);
+        chrome.tabs.remove(tabId, () => {});
+        break;
+      }
+    }
+  }
+
   // 找不到对应的 tabId 说明已经关闭了（用户手动关或超时自动关），无需处理
   console.log('[batch] handleTabConfirmed <<<');
+}
+
+function getProcessedCount() {
+  return successCount + failCount + skippedCount + noCommentBoxCount + manualRequiredCount;
+}
+
+function checkAllCompleted(options = {}) {
+  const processedCount = getProcessedCount();
+  const shouldComplete = !options.suppressCompletion &&
+    status === 'running' &&
+    totalCount > 0 &&
+    processedCount >= totalCount;
+
+  console.log('[batch] checkAllCompleted:', {
+    processedCount,
+    totalCount,
+    activeTabCount,
+    status,
+    shouldComplete
+  });
+
+  if (shouldComplete) {
+    onAllCompleted();
+  }
 }
 
 // 保存结果到本地存储
@@ -879,6 +942,7 @@ async function onAllCompleted() {
   }
 
   updateStatsUI();
+  updateUI();
 }
 
 // 超时检测
@@ -931,7 +995,6 @@ function setStatus(s) {
   statusBadge.textContent = {
     idle: '空闲',
     running: '运行中',
-    paused: '已暂停',
     completed: '已完成',
     terminated: '已终止'
   }[s] || s;
@@ -941,23 +1004,19 @@ function setStatus(s) {
 function updateUI() {
   const isIdle = status === 'idle';
   const isRunning = status === 'running';
-  const isPaused = status === 'paused';
   const isCompleted = status === 'completed';
   const isTerminated = status === 'terminated';
 
   // 开始按钮：空闲时可开始，终止时可重新开始
-  startBtn.disabled = (isRunning || isPaused) || parsedUrls.length === 0;
+  startBtn.disabled = isRunning || isCompleted || parsedUrls.length === 0;
   // 终止状态下显示"重新开始"，正常空闲显示"开始批量处理"
   startBtn.textContent = isTerminated ? '▶ 重新开始' : '▶ 开始批量处理';
 
-  pauseBtn.disabled = !isRunning && !isPaused;
-  pauseBtn.style.display = isTerminated ? 'none' : 'inline-flex';
-  pauseBtn.textContent = isPaused ? '继续' : '暂停';
-  stopBtn.disabled = isIdle || isTerminated;
-  stopBtn.style.display = isTerminated ? 'none' : 'inline-flex';
+  stopBtn.disabled = isIdle || isTerminated || isCompleted;
+  stopBtn.style.display = (isTerminated || isCompleted) ? 'none' : 'inline-flex';
 
   exportBtn.disabled = localResults.length === 0;
-  clearBtn.disabled = isRunning || isPaused;
+  clearBtn.disabled = isRunning;
 
   // 进度、实时日志、底部操作：终止状态保持显示
   progressSection.style.display = (isIdle) ? 'none' : 'block';
@@ -969,18 +1028,18 @@ function updateUI() {
     statsTableBody.innerHTML = '';
   } else if (localResults.length > 0) {
     statsPanel.classList.add('visible');
-    renderStatsTable();
+    renderStats();
   }
 
   // 终止状态下可重新开始，将待处理计数恢复
   if (isTerminated) {
-    pendingCount = totalCount - successCount - failCount;
+    pendingCount = totalCount - successCount - failCount - skippedCount - noCommentBoxCount - manualRequiredCount;
     updateStatsUI();
   }
 }
 
 function updateStatsUI() {
-  const processed = successCount + failCount + skippedCount + noCommentBoxCount;
+  const processed = getProcessedCount();
   const percent = totalCount > 0 ? Math.round((processed / totalCount) * 100) : 0;
   progressBar.style.width = percent + '%';
   progressText.textContent = `${processed}/${totalCount} (${percent}%)`;
@@ -988,6 +1047,7 @@ function updateStatsUI() {
   failCountEl.textContent = failCount;
   skippedCountEl.textContent = skippedCount;
   noCommentBoxCountEl.textContent = noCommentBoxCount;
+  if (manualRequiredCountEl) manualRequiredCountEl.textContent = manualRequiredCount;
   pendingCountEl.textContent = pendingCount;
 }
 
@@ -1005,7 +1065,7 @@ function exportResults() {
     return;
   }
 
-  const originalRowLen = sampleResult.originalRow.length;
+  const originalRowLen = getExportSourceColumnCount(sampleResult.originalRow);
 
   // 根据原始列数生成表头，保持与导入格式一致，最后加"运行结果"
   const originalHeaders = [];
@@ -1035,8 +1095,7 @@ function exportResults() {
     for (let i = 0; i < originalRowLen; i++) {
       baseCols.push(escape(r.originalRow[i] || ''));
     }
-    // 运行结果：success=√，其他=×
-    const runResult = r.result === 'success' ? '√' : '×';
+    const runResult = getExportRunResult(r.result);
     return [...baseCols, runResult].join(',');
   });
 
@@ -1052,10 +1111,29 @@ function exportResults() {
   URL.revokeObjectURL(url);
 }
 
+function getExportSourceColumnCount(originalRow) {
+  const len = originalRow.length;
+  if (len <= 0) return 0;
+
+  const lastValue = String(originalRow[len - 1] || '').trim();
+  const knownResultValues = new Set(['√', '×', '需手动处理', '成功', '失败']);
+  if (knownResultValues.has(lastValue)) {
+    return len - 1;
+  }
+
+  return len;
+}
+
+function getExportRunResult(result) {
+  if (result === 'success' || result === 'skipped') return '√';
+  if (result === 'manual_required') return '需手动处理';
+  return '×';
+}
+
 function clearBatch() {
   resetFile();
   batchId = null;
-  totalCount = successCount = failCount = pendingCount = 0;
+  totalCount = successCount = failCount = skippedCount = noCommentBoxCount = manualRequiredCount = pendingCount = 0;
   currentIndex = 0;
   localResults = [];
   activeTabs.clear();
@@ -1067,6 +1145,9 @@ function clearBatch() {
   statsTableBody.innerHTML = '';
   statsTotal.textContent = '0';
   statsSuccess.textContent = '0';
+  statsSkipped.textContent = '0';
+  if (statsManualRequired) statsManualRequired.textContent = '0';
+  statsNoCommentBox.textContent = '0';
   statsFail.textContent = '0';
   statsRate.textContent = '—';
   statsPanel.classList.remove('visible');
@@ -1076,7 +1157,7 @@ function clearBatch() {
   filterKeyword.value = '';
   setStatus('idle');
   updateUI();
-  chrome.storage.local.remove(['batchLocalResults', BATCH_SETTINGS_KEY, BATCH_URLS_KEY]);
+  chrome.storage.local.remove(['batchLocalResults', BATCH_SETTINGS_KEY, BATCH_URLS_KEY, 'batchCtx', 'batchSubmitCtx']);
 }
 
 // ==================== 统计面板 ====================
@@ -1099,7 +1180,7 @@ function highlightPreviewRow(urlIndex, state) {
   if (state === 'processing') row.classList.add('url-processing');
   else if (state === 'success') row.classList.add('url-done-success');
   else if (state === 'fail') row.classList.add('url-done-fail');
-  else if (state === 'skipped') row.classList.add('url-done-skipped');
+  else if (state === 'skipped' || state === 'manual_required') row.classList.add('url-done-skipped');
 }
 
 function clearPreviewRow(urlIndex) {
@@ -1155,9 +1236,11 @@ function renderStats() {
   const skipped = localResults.filter((r) => r.result === 'skipped').length;
   const fail = localResults.filter((r) => r.result === 'fail').length;
   const noCommentBox = localResults.filter((r) => r.result === 'no_comment_box').length;
+  const manualRequired = localResults.filter((r) => r.result === 'manual_required').length;
   statsTotal.textContent = total;
   statsSuccess.textContent = success;
   statsSkipped.textContent = skipped;
+  if (statsManualRequired) statsManualRequired.textContent = manualRequired;
   statsFail.textContent = fail;
   statsNoCommentBox.textContent = noCommentBox;
   // 成功率 = (成功 + 已存在) / 总数
@@ -1389,6 +1472,7 @@ function getResultText(result) {
   switch (result) {
     case 'success': return '成功';
     case 'skipped': return '已存在';
+    case 'manual_required': return '需手动处理';
     case 'no_comment_box': return '无评论框';
     case 'fail': return '失败';
     default: return result;
