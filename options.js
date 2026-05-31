@@ -1,18 +1,33 @@
-// 选项页逻辑：保存和读取 AI API Key、Skill 模板和用户ID
-
-const SKILL_TEMPLATE_STORAGE_KEY = 'qwen_skill_template';
+const LEGACY_SKILL_TEMPLATE_STORAGE_KEY = 'qwen_skill_template';
 const WEBSITE_URL_STORAGE_KEY = 'promotion_website_url';
+const WEBSITE_CONTENT_STORAGE_KEY = 'promotion_website_content';
 const USER_NAME_STORAGE_KEY = 'auto_fill_user_name';
 const USER_EMAIL_STORAGE_KEY = 'auto_fill_user_email';
 const USER_PASSWORD_STORAGE_KEY = 'auto_fill_user_password';
 const USER_ID_STORAGE_KEY = 'auto_comment_user_id';
+const LEGACY_PROMPT_FIELD_VALUES_STORAGE_KEY = 'auto_fill_prompt_field_values';
 
-// ====== 积分系统配置 ======
 const POINTS_API_BASE = 'https://jieyunsang.cn/api';
+const CONFIG_VERSION = 2;
+
+const ACTIVE_STORAGE_KEYS = [
+  WEBSITE_URL_STORAGE_KEY,
+  WEBSITE_CONTENT_STORAGE_KEY,
+  USER_NAME_STORAGE_KEY,
+  USER_EMAIL_STORAGE_KEY,
+  USER_PASSWORD_STORAGE_KEY,
+  USER_ID_STORAGE_KEY
+];
+
+const IMPORT_COMPAT_STORAGE_KEYS = [
+  ...ACTIVE_STORAGE_KEYS,
+  LEGACY_SKILL_TEMPLATE_STORAGE_KEY,
+  LEGACY_PROMPT_FIELD_VALUES_STORAGE_KEY
+];
 
 document.addEventListener('DOMContentLoaded', () => {
-  const skillTemplateInput = document.getElementById('skillTemplate');
   const websiteUrlInput = document.getElementById('websiteUrl');
+  const websiteContentInput = document.getElementById('websiteContent');
   const userNameInput = document.getElementById('userName');
   const userEmailInput = document.getElementById('userEmail');
   const userPasswordInput = document.getElementById('userPassword');
@@ -22,10 +37,15 @@ document.addEventListener('DOMContentLoaded', () => {
   const pointsStatusEl = document.getElementById('pointsStatus');
   const userIdInput = document.getElementById('userId');
   const pointsBalanceEl = document.getElementById('pointsBalance');
+  const exportConfigBtn = document.getElementById('exportConfigBtn');
+  const importConfigBtn = document.getElementById('importConfigBtn');
+  const importConfigFileInput = document.getElementById('importConfigFileInput');
+  const importExportStatus = document.getElementById('importExportStatus');
+  const openBatchBtn = document.getElementById('openBatchBtn');
 
   if (
-    !skillTemplateInput ||
     !websiteUrlInput ||
+    !websiteContentInput ||
     !userNameInput ||
     !userEmailInput ||
     !userPasswordInput ||
@@ -36,78 +56,158 @@ document.addEventListener('DOMContentLoaded', () => {
     return;
   }
 
-  // 默认 Skill 模板（仅用于选项页初次展示时的提示）
-  const DEFAULT_SKILL_TEMPLATE = [
-    '你是一个资深的网站营销与文案专家，擅长为各类网站撰写高转化率的推广文案。',
-    '请严格根据我提供的"当前网站内容"进行分析和创作，不要凭空捏造网站不存在的功能或信息。',
-    '',
-    '【输出要求】',
-    '1. 我需要在该网站发表评论，关联到我的网站【请在此处输入网站链接】，我的网站内容是关于【请在此处输入网站内容】',
-    '2. 语气可以专业但要自然、真实，避免夸张、虚假宣传。',
-    '3. 使用当前网站内容的主要语言作为输出语言，字数建议控制在 100词。',
-    '4. 只要评论的语句，不要输出其他无关的句子。'
-  ].join('\n');
-
-  // 初始化时从 chrome.storage.sync 读取
-  chrome.storage.sync.get(
-      [
-        SKILL_TEMPLATE_STORAGE_KEY,
-        WEBSITE_URL_STORAGE_KEY,
-        USER_NAME_STORAGE_KEY,
-        USER_EMAIL_STORAGE_KEY,
-        USER_PASSWORD_STORAGE_KEY,
-        USER_ID_STORAGE_KEY
-      ],
-    (result) => {
-      if (chrome.runtime.lastError) {
-        console.error('读取设置失败：', chrome.runtime.lastError);
-        return;
-      }
-      if (result && typeof result[SKILL_TEMPLATE_STORAGE_KEY] === 'string') {
-        skillTemplateInput.value = result[SKILL_TEMPLATE_STORAGE_KEY];
-      } else {
-        skillTemplateInput.value = DEFAULT_SKILL_TEMPLATE;
-      }
-      if (result && typeof result[WEBSITE_URL_STORAGE_KEY] === 'string') {
-        websiteUrlInput.value = result[WEBSITE_URL_STORAGE_KEY];
-      }
-      if (result && typeof result[USER_NAME_STORAGE_KEY] === 'string') {
-        userNameInput.value = result[USER_NAME_STORAGE_KEY];
-      }
-      if (result && typeof result[USER_EMAIL_STORAGE_KEY] === 'string') {
-        userEmailInput.value = result[USER_EMAIL_STORAGE_KEY];
-      }
-      if (result && typeof result[USER_PASSWORD_STORAGE_KEY] === 'string') {
-        userPasswordInput.value = result[USER_PASSWORD_STORAGE_KEY];
-      }
-      // 读取已保存的用户ID
-      if (result && typeof result[USER_ID_STORAGE_KEY] === 'string' && result[USER_ID_STORAGE_KEY]) {
-        userIdInput.value = result[USER_ID_STORAGE_KEY];
-      }
-    }
-  );
-
   function showStatus(el, text, timeout = 1600) {
+    if (!el) return;
     el.textContent = text;
     el.style.opacity = '1';
     setTimeout(() => {
       el.style.opacity = '0';
     }, timeout);
   }
+
+  function pickLegacyPromptValue(values, keywords) {
+    if (!values || typeof values !== 'object') return '';
+    const normalizedKeywords = keywords.map((keyword) => String(keyword).toLowerCase());
+    const entry = Object.entries(values).find(([key, value]) => {
+      if (!value) return false;
+      const normalizedKey = String(key || '').toLowerCase();
+      return normalizedKeywords.some((keyword) => normalizedKey.includes(keyword));
+    });
+    return entry ? String(entry[1] || '').trim() : '';
+  }
+
+  function getLegacyWebsiteUrl(data) {
+    return pickLegacyPromptValue(data[LEGACY_PROMPT_FIELD_VALUES_STORAGE_KEY], [
+      '网站链接',
+      '网址',
+      'website link',
+      'website url',
+      'url'
+    ]);
+  }
+
+  function getLegacyWebsiteContent(data) {
+    return pickLegacyPromptValue(data[LEGACY_PROMPT_FIELD_VALUES_STORAGE_KEY], [
+      '网站内容',
+      '网站介绍',
+      'website content',
+      'site content',
+      'description'
+    ]);
+  }
+
+  function getInputValue(input) {
+    return input && typeof input.value === 'string' ? input.value.trim() : '';
+  }
+
+  function mergeCurrentFormValues(data) {
+    const merged = { ...(data || {}) };
+    const currentValues = {
+      [WEBSITE_URL_STORAGE_KEY]: getInputValue(websiteUrlInput),
+      [WEBSITE_CONTENT_STORAGE_KEY]: getInputValue(websiteContentInput),
+      [USER_NAME_STORAGE_KEY]: getInputValue(userNameInput),
+      [USER_EMAIL_STORAGE_KEY]: getInputValue(userEmailInput),
+      [USER_PASSWORD_STORAGE_KEY]: getInputValue(userPasswordInput),
+      [USER_ID_STORAGE_KEY]: getInputValue(userIdInput)
+    };
+
+    ACTIVE_STORAGE_KEYS.forEach((key) => {
+      if (currentValues[key] !== '') {
+        merged[key] = currentValues[key];
+      }
+    });
+
+    return merged;
+  }
+
+  function getImportedData(config) {
+    if (!config || typeof config !== 'object') return null;
+    if (config.data && typeof config.data === 'object') {
+      return config.data;
+    }
+    return config;
+  }
+
+  function loadSettings() {
+    chrome.storage.sync.get(IMPORT_COMPAT_STORAGE_KEYS, (result) => {
+      if (chrome.runtime.lastError) {
+        console.error('读取设置失败：', chrome.runtime.lastError);
+        return;
+      }
+
+      const data = result || {};
+      websiteUrlInput.value = typeof data[WEBSITE_URL_STORAGE_KEY] === 'string'
+        ? data[WEBSITE_URL_STORAGE_KEY]
+        : getLegacyWebsiteUrl(data);
+      websiteContentInput.value = typeof data[WEBSITE_CONTENT_STORAGE_KEY] === 'string'
+        ? data[WEBSITE_CONTENT_STORAGE_KEY]
+        : getLegacyWebsiteContent(data);
+      userNameInput.value = typeof data[USER_NAME_STORAGE_KEY] === 'string'
+        ? data[USER_NAME_STORAGE_KEY]
+        : '';
+      userEmailInput.value = typeof data[USER_EMAIL_STORAGE_KEY] === 'string'
+        ? data[USER_EMAIL_STORAGE_KEY]
+        : '';
+      userPasswordInput.value = typeof data[USER_PASSWORD_STORAGE_KEY] === 'string'
+        ? data[USER_PASSWORD_STORAGE_KEY]
+        : '';
+      if (userIdInput && typeof data[USER_ID_STORAGE_KEY] === 'string') {
+        userIdInput.value = data[USER_ID_STORAGE_KEY];
+        if (data[USER_ID_STORAGE_KEY]) {
+          fetchPointsBalance(data[USER_ID_STORAGE_KEY]);
+        }
+      }
+    });
+  }
+
+  const requiredSettingsFields = [
+    { el: websiteUrlInput, label: '网站链接' },
+    { el: websiteContentInput, label: '网站内容' },
+    { el: userNameInput, label: '姓名/昵称' },
+    { el: userEmailInput, label: '邮箱' }
+  ];
+
+  function validateRequiredSettings() {
+    let firstInvalid = null;
+    const missingLabels = [];
+
+    requiredSettingsFields.forEach(({ el, label }) => {
+      const isValid = el.checkValidity() && !!el.value.trim();
+      el.classList.toggle('is-invalid', !isValid);
+      if (!isValid) {
+        missingLabels.push(label);
+        if (!firstInvalid) firstInvalid = el;
+      }
+    });
+
+    if (firstInvalid) {
+      firstInvalid.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      firstInvalid.focus();
+      showStatus(settingsStatusEl, `请先填写必填项：${missingLabels.join('、')}`, 2600);
+      return false;
+    }
+
+    return true;
+  }
+
+  requiredSettingsFields.forEach(({ el }) => {
+    el.addEventListener('input', () => {
+      el.classList.toggle('is-invalid', !(el.checkValidity() && !!el.value.trim()));
+    });
+  });
+
   saveSettingsBtn.addEventListener('click', () => {
-    const skillTemplate = skillTemplateInput.value.trim();
-    const websiteUrl = websiteUrlInput.value.trim();
-    const userName = userNameInput.value.trim();
-    const userEmail = userEmailInput.value.trim();
-    const userPassword = userPasswordInput.value.trim();
+    if (!validateRequiredSettings()) {
+      return;
+    }
 
     chrome.storage.sync.set(
       {
-        [SKILL_TEMPLATE_STORAGE_KEY]: skillTemplate,
-        [WEBSITE_URL_STORAGE_KEY]: websiteUrl,
-        [USER_NAME_STORAGE_KEY]: userName,
-        [USER_EMAIL_STORAGE_KEY]: userEmail,
-        [USER_PASSWORD_STORAGE_KEY]: userPassword
+        [WEBSITE_URL_STORAGE_KEY]: websiteUrlInput.value.trim(),
+        [WEBSITE_CONTENT_STORAGE_KEY]: websiteContentInput.value.trim(),
+        [USER_NAME_STORAGE_KEY]: userNameInput.value.trim(),
+        [USER_EMAIL_STORAGE_KEY]: userEmailInput.value.trim(),
+        [USER_PASSWORD_STORAGE_KEY]: userPasswordInput.value.trim()
       },
       () => {
         if (chrome.runtime.lastError) {
@@ -120,26 +220,26 @@ document.addEventListener('DOMContentLoaded', () => {
     );
   });
 
-  // 保存并刷新积分（仅保存用户ID + 查询积分）
-  savePointsBtn.addEventListener('click', () => {
-    const userId = userIdInput.value.trim();
-    chrome.storage.sync.set({ [USER_ID_STORAGE_KEY]: userId }, () => {
-      if (chrome.runtime.lastError) {
-        console.error('保存用户ID失败：', chrome.runtime.lastError);
-        showStatus(pointsStatusEl, '保存失败', 2000);
-        return;
-      }
-      showStatus(pointsStatusEl, '已保存');
-      if (userId) {
-        fetchPointsBalance(userId);
-      }
+  if (savePointsBtn && userIdInput) {
+    savePointsBtn.addEventListener('click', () => {
+      const userId = userIdInput.value.trim();
+      chrome.storage.sync.set({ [USER_ID_STORAGE_KEY]: userId }, () => {
+        if (chrome.runtime.lastError) {
+          console.error('保存用户ID失败：', chrome.runtime.lastError);
+          showStatus(pointsStatusEl, '保存失败', 2000);
+          return;
+        }
+        showStatus(pointsStatusEl, '已保存');
+        if (userId) {
+          fetchPointsBalance(userId);
+        }
+      });
     });
-  });
+  }
 
-  // ====== 积分查询功能 ======
   function setPointsBalance(points) {
     if (pointsBalanceEl) {
-      pointsBalanceEl.textContent = (points !== null && points !== undefined) ? points : '—';
+      pointsBalanceEl.textContent = (points !== null && points !== undefined) ? points : '-';
     }
   }
 
@@ -162,30 +262,8 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }
 
-  // 页面加载时自动查询积分（如果有用户ID）
-  chrome.storage.sync.get([USER_ID_STORAGE_KEY], (result) => {
-    if (result && typeof result[USER_ID_STORAGE_KEY] === 'string' && result[USER_ID_STORAGE_KEY]) {
-      fetchPointsBalance(result[USER_ID_STORAGE_KEY]);
-    }
-  });
-
-  // ====== 配置导入/导出功能 ======
-  const CONFIG_VERSION = 1;
-  const ALL_STORAGE_KEYS = [
-    SKILL_TEMPLATE_STORAGE_KEY,
-    WEBSITE_URL_STORAGE_KEY,
-    USER_NAME_STORAGE_KEY,
-    USER_EMAIL_STORAGE_KEY,
-    USER_PASSWORD_STORAGE_KEY,
-    USER_ID_STORAGE_KEY
-  ];
-
-  const exportConfigBtn = document.getElementById('exportConfigBtn');
-  const importConfigBtn = document.getElementById('importConfigBtn');
-  const importConfigFileInput = document.getElementById('importConfigFileInput');
-  const importExportStatus = document.getElementById('importExportStatus');
-
   function showImportExportStatus(text, isError) {
+    if (!importExportStatus) return;
     importExportStatus.textContent = text;
     importExportStatus.style.color = isError ? '#dc2626' : '#b45309';
     importExportStatus.style.opacity = '1';
@@ -194,35 +272,46 @@ document.addEventListener('DOMContentLoaded', () => {
     }, 3000);
   }
 
-  // 导出配置
   if (exportConfigBtn) {
     exportConfigBtn.addEventListener('click', () => {
-      chrome.storage.sync.get(ALL_STORAGE_KEYS, (result) => {
+      chrome.storage.sync.get(ACTIVE_STORAGE_KEYS, (result) => {
         if (chrome.runtime.lastError) {
           showImportExportStatus('导出失败：' + chrome.runtime.lastError.message, true);
           return;
         }
+
+        const mergedData = mergeCurrentFormValues(result);
         const config = {
           _version: CONFIG_VERSION,
           _exportTime: new Date().toISOString(),
           data: {}
         };
-        ALL_STORAGE_KEYS.forEach(key => {
-          config.data[key] = result[key];
+
+        ACTIVE_STORAGE_KEYS.forEach((key) => {
+          if (mergedData[key] !== undefined) {
+            config.data[key] = mergedData[key];
+          }
         });
+
+        if (!config.data[WEBSITE_CONTENT_STORAGE_KEY]) {
+          showImportExportStatus('导出失败：请先填写你的网站内容。', true);
+          return;
+        }
+
         const blob = new Blob([JSON.stringify(config, null, 2)], { type: 'application/json' });
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url;
         a.download = 'autocomment-config-' + new Date().toISOString().slice(0, 10) + '.json';
+        document.body.appendChild(a);
         a.click();
+        a.remove();
         URL.revokeObjectURL(url);
         showImportExportStatus('配置已导出！', false);
       });
     });
   }
 
-  // 导入配置
   if (importConfigBtn && importConfigFileInput) {
     importConfigBtn.addEventListener('click', () => {
       importConfigFileInput.click();
@@ -236,24 +325,39 @@ document.addEventListener('DOMContentLoaded', () => {
       reader.onload = (ev) => {
         try {
           const config = JSON.parse(ev.target.result);
-          if (!config || !config.data) {
+          const importedData = getImportedData(config);
+          if (!importedData) {
             showImportExportStatus('文件格式无效，不是有效的配置文件。', true);
             return;
           }
-          // 过滤出有效字段
+
           const toSave = {};
-          ALL_STORAGE_KEYS.forEach(key => {
-            if (config.data[key] !== undefined) {
-              toSave[key] = config.data[key];
+          IMPORT_COMPAT_STORAGE_KEYS.forEach((key) => {
+            if (importedData[key] !== undefined) {
+              toSave[key] = importedData[key];
             }
           });
+
+          if (toSave[WEBSITE_URL_STORAGE_KEY] === undefined) {
+            const legacyWebsiteUrl = getLegacyWebsiteUrl(importedData);
+            if (legacyWebsiteUrl) {
+              toSave[WEBSITE_URL_STORAGE_KEY] = legacyWebsiteUrl;
+            }
+          }
+
+          if (toSave[WEBSITE_CONTENT_STORAGE_KEY] === undefined) {
+            const legacyWebsiteContent = getLegacyWebsiteContent(importedData);
+            if (legacyWebsiteContent) {
+              toSave[WEBSITE_CONTENT_STORAGE_KEY] = legacyWebsiteContent;
+            }
+          }
+
           chrome.storage.sync.set(toSave, () => {
             if (chrome.runtime.lastError) {
               showImportExportStatus('导入失败：' + chrome.runtime.lastError.message, true);
               return;
             }
-            showImportExportStatus('配置已导入！页面将自动刷新…', false);
-            // 重新读取并更新表单显示
+            showImportExportStatus('配置已导入！页面将自动刷新...', false);
             setTimeout(() => {
               location.reload();
             }, 1500);
@@ -263,17 +367,15 @@ document.addEventListener('DOMContentLoaded', () => {
         }
       };
       reader.readAsText(file);
-      // 清空 input 以便下次选择同一文件
       importConfigFileInput.value = '';
     });
   }
 
-  // 批量外链评论按钮
-  const openBatchBtn = document.getElementById('openBatchBtn');
   if (openBatchBtn) {
     openBatchBtn.addEventListener('click', () => {
-      // 打开 batch.html（需要以 chrome-extension:// URL 打开）
       chrome.tabs.create({ url: 'batch.html' });
     });
   }
+
+  loadSettings();
 });

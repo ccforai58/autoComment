@@ -63,6 +63,36 @@
         box-shadow: 0 0 0 1px rgba(37, 99, 235, 0.15);
       }
 
+      textarea {
+        transition: border-color 0.15s ease, box-shadow 0.15s ease, background-color 0.15s ease;
+      }
+
+      .required-field {
+        background: #fff;
+      }
+
+      .required-field:focus {
+        border-color: #2563eb;
+        box-shadow: 0 0 0 1px rgba(37, 99, 235, 0.15);
+      }
+
+      .required-field.is-invalid {
+        border-color: #dc2626 !important;
+        box-shadow: 0 0 0 3px rgba(220, 38, 38, 0.2) !important;
+      }
+
+      .required-hint {
+        margin-top: 6px;
+        color: #dc2626;
+        font-size: 12px;
+        font-weight: 600;
+        display: none;
+      }
+
+      .required-field.is-invalid + .required-hint {
+        display: block;
+      }
+
       .hint {
         font-size: 12px;
         color: #6b7280;
@@ -132,13 +162,14 @@
         font-size: 11px;
         color: #9ca3af;
       }
+
     </style>
   </head>
   <body>
     <div class="container">
       <h1>Auto Register Filler 设置</h1>
       <div class="subtitle">
-        在这里配置 AI 文案生成所使用的语言模板，以及其他个性化设置。
+        在这里配置 AI 文案生成所需的网站信息、自动填表信息和积分账户。
       </div>
 
       <!-- 用户ID区域 -->
@@ -165,57 +196,70 @@
         </div>
       </div>
 
-      <div>
-        <label for="skillTemplate">AI 语言模板（system 提示词）</label>
-        <textarea
-          id="skillTemplate"
-          rows="10"
-          style="
-            width: 100%;
-            padding: 10px 12px;
-            border-radius: 8px;
-            border: 1px solid #d1d5db;
-            font-size: 13px;
-            box-sizing: border-box;
-            outline: none;
-            resize: vertical;
-          "
-        ></textarea>
-      </div>
-
       <div style="margin-top: 20px">
         <label>自动填表的信息</label>
         <div class="hint">
           - 这里配置的内容会用于评论表单中的 Website / URL / Name / Email 等信息
         </div>
         <div style="margin-top: 10px">
-          <label for="websiteUrl" style="font-weight: 500; font-size: 12px">你的网站链接</label>
+          <label for="websiteUrl" class="required-label" style="font-weight: 500; font-size: 12px">你的网站链接</label>
           <input
             type="url"
             id="websiteUrl"
-            placeholder="https://example.com"
+            class="required-field"
+            placeholder="https://test.com"
             autocomplete="off"
+            required
           />
+          <div class="required-hint">请填写你的网站链接，例如：https://test.com</div>
+        </div>
+        <div style="margin-top: 10px">
+          <label for="websiteContent" class="required-label" style="font-weight: 500; font-size: 12px">你的网站内容</label>
+          <textarea
+            id="websiteContent"
+            class="required-field"
+            rows="3"
+            placeholder="例如：test.com 是一个用于演示的网站。"
+            autocomplete="off"
+            required
+            style="
+              width: 100%;
+              padding: 10px 12px;
+              border-radius: 8px;
+              border: 1px solid #d1d5db;
+              font-size: 13px;
+              box-sizing: border-box;
+              outline: none;
+              resize: vertical;
+            "
+          ></textarea>
+          <div class="required-hint">请填写你的网站内容，这会用于生成评论文案。</div>
         </div>
 
         <div style="margin-top: 16px">
-          <label style="font-weight: 500; font-size: 12px">自动填表的个人信息（注册 / 评论表单）</label>
+          <label class="required-label" style="font-weight: 500; font-size: 12px">自动填表的个人信息（注册 / 评论表单）</label>
           <div style="display: flex; gap: 12px; margin-top: 6px; flex-wrap: wrap">
             <div style="flex: 1 1 160px">
               <input
                 type="text"
                 id="userName"
+                class="required-field"
                 placeholder="姓名 / 昵称，例如：CloudHu"
                 autocomplete="off"
+                required
               />
+              <div class="required-hint">请填写姓名或昵称。</div>
             </div>
             <div style="flex: 1 1 180px">
               <input
                 type="email"
                 id="userEmail"
-                placeholder="邮箱，例如：you@example.com"
+                class="required-field"
+                placeholder="邮箱，例如：you@test.com"
                 autocomplete="off"
+                required
               />
+              <div class="required-hint">请填写有效邮箱，例如：you@test.com</div>
             </div>
             <div style="flex: 1 1 180px">
               <input

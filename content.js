@@ -358,12 +358,13 @@
 
   // ====== AI 生成配置 ======
   const QWEN_API_BASE = 'https://jieyunsang.cn/api';
-  const SKILL_TEMPLATE_STORAGE_KEY = 'qwen_skill_template';
   const WEBSITE_URL_STORAGE_KEY = 'promotion_website_url';
+  const WEBSITE_CONTENT_STORAGE_KEY = 'promotion_website_content';
   const USER_NAME_STORAGE_KEY = 'auto_fill_user_name';
   const USER_EMAIL_STORAGE_KEY = 'auto_fill_user_email';
   const USER_PASSWORD_STORAGE_KEY = 'auto_fill_user_password';
   const USER_ID_STORAGE_KEY = 'auto_comment_user_id';
+  const PROMPT_FIELD_VALUES_STORAGE_KEY = 'auto_fill_prompt_field_values';
 
   // ====== 批量任务设置（从 storage.local 读取）======
   const BATCH_SETTINGS_KEY = 'batch_task_settings';
@@ -456,42 +457,43 @@
   // 最近一次 AI 生成的推广文案（用于页面自动填充 & 浮动窗口回显）
   let lastGeneratedPromotionCopy = '';
 
-  // 默认 Skill 语言模板（当 storage 中没有用户自定义模板时使用）
-  const DEFAULT_QWEN_SKILL_TEMPLATE = [
-    '你是一个资深的网站营销与文案专家，擅长为各类网站撰写高转化率的推广文案。',
-    '请严格根据我提供的"当前网站内容"进行分析和创作，不要凭空捏造网站不存在的功能或信息。',
-    '',
-    '【输出要求】',
-    '1. 先用 1–2 句话高度概括该网站的核心价值和目标用户。',
-    '2. 我需要在该网站发表评论，关联到我的网站并吸引用户点击访问我的网站。',
-    '3. 语气可以专业但要自然、真实，避免夸张、虚假宣传。',
-    '4. 使用英文输出，字数建议控制在 100-200词。'
-  ].join('\n');
+  function buildQwenSkillTemplate(promotionWebsiteUrl, promotionWebsiteContent) {
+    const targetWebsiteUrl = promotionWebsiteUrl || '未配置网站链接';
+    const targetWebsiteContent = promotionWebsiteContent || '未配置网站内容';
 
-  // 从 chrome.storage.sync 中异步获取 Skill 模板
-  function getQwenSkillTemplate() {
-    return new Promise((resolve) => {
-      if (typeof chrome === 'undefined' || !chrome.storage || !chrome.storage.sync) {
-        resolve(DEFAULT_QWEN_SKILL_TEMPLATE);
-        return;
-      }
-      chrome.storage.sync.get([SKILL_TEMPLATE_STORAGE_KEY], (result) => {
-        if (chrome.runtime && chrome.runtime.lastError) {
-          console.error('读取 Skill 模板失败：', chrome.runtime.lastError);
-          resolve(DEFAULT_QWEN_SKILL_TEMPLATE);
-          return;
-        }
-        const tpl =
-          result && typeof result[SKILL_TEMPLATE_STORAGE_KEY] === 'string'
-            ? result[SKILL_TEMPLATE_STORAGE_KEY].trim()
-            : '';
-        if (!tpl) {
-          resolve(DEFAULT_QWEN_SKILL_TEMPLATE);
-        } else {
-          resolve(tpl);
-        }
-      });
+    return [
+      '你是一个资深的网站营销与文案专家，擅长为各类网站撰写自然、真实的评论文案。',
+      '请严格根据我提供的"当前网站内容"进行分析和创作，不要凭空捏造当前网站不存在的功能或信息。',
+      '',
+      '【我的网站信息】',
+      `网站链接：${targetWebsiteUrl}`,
+      `网站内容：${targetWebsiteContent}`,
+      '',
+      '【输出要求】',
+      '1. 我需要在当前网站发表评论，评论需要自然关联到上面的"我的网站信息"，并吸引用户访问我的网站。',
+      '2. 语气可以专业但要自然、真实，避免夸张、虚假宣传，避免明显广告腔。',
+      '3. 使用当前网站内容的主要语言作为输出语言，字数建议控制在 100 词左右。',
+      '4. 只输出最终评论内容，不要输出标题、字段名、解释说明或多余格式。'
+    ].join('\n');
+  }
+
+  async function getQwenSkillTemplate() {
+    const [promotionWebsiteUrl, promotionWebsiteContent] = await Promise.all([
+      getWebsiteUrl(),
+      getWebsiteContent()
+    ]);
+    return buildQwenSkillTemplate(promotionWebsiteUrl, promotionWebsiteContent);
+  }
+
+  function pickLegacyPromptValue(values, keywords) {
+    if (!values || typeof values !== 'object') return '';
+    const normalizedKeywords = keywords.map((keyword) => String(keyword).toLowerCase());
+    const entry = Object.entries(values).find(([key, value]) => {
+      if (!value) return false;
+      const normalizedKey = String(key || '').toLowerCase();
+      return normalizedKeywords.some((keyword) => normalizedKey.includes(keyword));
     });
+    return entry ? String(entry[1] || '').trim() : '';
   }
 
   // 从 chrome.storage.sync 中异步获取推广网站地址
@@ -501,17 +503,50 @@
         resolve('');
         return;
       }
-      chrome.storage.sync.get([WEBSITE_URL_STORAGE_KEY], (result) => {
+      chrome.storage.sync.get([WEBSITE_URL_STORAGE_KEY, PROMPT_FIELD_VALUES_STORAGE_KEY], (result) => {
         if (chrome.runtime && chrome.runtime.lastError) {
           console.error('读取推广网站地址失败：', chrome.runtime.lastError);
           resolve('');
           return;
         }
-        const url =
-          result && typeof result[WEBSITE_URL_STORAGE_KEY] === 'string'
-            ? result[WEBSITE_URL_STORAGE_KEY].trim()
-            : '';
-        resolve(url);
+        const savedUrl = result && typeof result[WEBSITE_URL_STORAGE_KEY] === 'string'
+          ? result[WEBSITE_URL_STORAGE_KEY].trim()
+          : '';
+        const legacyUrl = pickLegacyPromptValue(result && result[PROMPT_FIELD_VALUES_STORAGE_KEY], [
+          '网站链接',
+          '网址',
+          'website link',
+          'website url',
+          'url'
+        ]);
+        resolve(savedUrl || legacyUrl);
+      });
+    });
+  }
+
+  function getWebsiteContent() {
+    return new Promise((resolve) => {
+      if (typeof chrome === 'undefined' || !chrome.storage || !chrome.storage.sync) {
+        resolve('');
+        return;
+      }
+      chrome.storage.sync.get([WEBSITE_CONTENT_STORAGE_KEY, PROMPT_FIELD_VALUES_STORAGE_KEY], (result) => {
+        if (chrome.runtime && chrome.runtime.lastError) {
+          console.error('读取推广网站内容失败：', chrome.runtime.lastError);
+          resolve('');
+          return;
+        }
+        const savedContent = result && typeof result[WEBSITE_CONTENT_STORAGE_KEY] === 'string'
+          ? result[WEBSITE_CONTENT_STORAGE_KEY].trim()
+          : '';
+        const legacyContent = pickLegacyPromptValue(result && result[PROMPT_FIELD_VALUES_STORAGE_KEY], [
+          '网站内容',
+          '网站介绍',
+          'website content',
+          'site content',
+          'description'
+        ]);
+        resolve(savedContent || legacyContent);
       });
     });
   }
@@ -1314,6 +1349,35 @@
     initOnPageReady();
   }
 
+  function findNativeWordPressCommentForm() {
+    const selectors = [
+      'form#commentform',
+      'form.comment-form',
+      'form[name="commentform"]',
+      'form[action*="wp-comments-post.php"]'
+    ];
+
+    for (const selector of selectors) {
+      const form = document.querySelector(selector);
+      if (form && getCommentTextareaFromForm(form)) {
+        return form;
+      }
+    }
+
+    return null;
+  }
+
+  function getCommentTextareaFromForm(form) {
+    if (!form) return null;
+    return (
+      form.querySelector('textarea#comment') ||
+      form.querySelector('textarea[name="comment"]') ||
+      form.querySelector('textarea[id*="comment" i]') ||
+      form.querySelector('textarea[name*="comment" i]') ||
+      null
+    );
+  }
+
   function findLikelyCommentTextarea(options) {
     const allowGenericFallback = options && options.allowGenericFallback;
     const allTextareas = Array.from(document.querySelectorAll('textarea'));
@@ -1321,6 +1385,18 @@
 
     const commentTextareas = [];
     const commentForms = new Set();
+
+    const wpNativeForm = findNativeWordPressCommentForm();
+    const wpNativeTextarea = getCommentTextareaFromForm(wpNativeForm);
+    if (wpNativeTextarea) {
+      console.log('[AutoComment] 优先命中 WordPress 原生评论框:', {
+        formId: wpNativeForm.id,
+        formClass: wpNativeForm.className,
+        textareaId: wpNativeTextarea.id,
+        textareaName: wpNativeTextarea.name
+      });
+      return wpNativeTextarea;
+    }
 
     // 方法0: 检测 wpDiscuz 可编辑 div（ contenteditable 评论框）
     const wpDiscuzEditor = findWpDiscuzEditor();
@@ -3954,6 +4030,8 @@
   const MANUAL_REQUIRED_MESSAGE = '检测到验证码/反垃圾验证，请手动填写后提交';
   const MANUAL_REQUIRED_KEYWORDS = [
     'captcha',
+    'aiowps-captcha',
+    'captcha-answer',
     'anti-spam',
     'antispam',
     'spam',
@@ -3961,32 +4039,98 @@
     'verify',
     'human',
     'robot',
+    'answer in digits',
+    'enter an answer',
+    'answer:',
+    'math',
+    'equation',
+    'security question',
     '验证码',
     '反垃圾',
     '验证'
+  ];
+  const MANUAL_REQUIRED_WIDGET_SELECTORS = [
+    '.g-recaptcha',
+    '.h-captcha',
+    '.cf-turnstile',
+    '[data-sitekey]',
+    '[name="g-recaptcha-response"]',
+    '[name="h-captcha-response"]',
+    '[name="cf-turnstile-response"]',
+    'iframe[src*="recaptcha"]',
+    'iframe[src*="hcaptcha"]',
+    'iframe[src*="challenges.cloudflare.com"]',
+    'iframe[title*="reCAPTCHA"]',
+    'iframe[title*="captcha"]'
   ];
 
   function detectManualRequiredChallenge(form) {
     const targetForm = form || findCommentForm();
     if (!targetForm) return { found: false };
 
-    const requiredFields = Array.from(targetForm.querySelectorAll('input, textarea, select'))
-      .filter((field) => isRequiredField(field) && isEmptyField(field) && isVisibleFormField(field));
+    const widget = findManualRequiredWidget(targetForm);
+    if (widget) {
+      console.log('[AutoComment] 检测到需手动处理的人机验证组件:', {
+        tag: widget.tagName,
+        className: widget.className,
+        src: widget.getAttribute && widget.getAttribute('src'),
+        title: widget.getAttribute && widget.getAttribute('title')
+      });
+      return { found: true, field: widget, message: MANUAL_REQUIRED_MESSAGE };
+    }
 
-    for (const field of requiredFields) {
+    const candidateFields = Array.from(targetForm.querySelectorAll('input, textarea, select'))
+      .filter((field) => isEmptyField(field) && isVisibleFormField(field));
+
+    for (const field of candidateFields) {
       const text = getFieldContextText(field, targetForm).toLowerCase();
-      if (MANUAL_REQUIRED_KEYWORDS.some((keyword) => text.includes(keyword.toLowerCase()))) {
-        console.log('[AutoComment] 检测到需手动处理的验证码/反垃圾字段:', {
+      const isRequiredManualField =
+        isRequiredField(field) ||
+        isLikelyManualChallengeField(field, targetForm, text);
+      if (isRequiredManualField && MANUAL_REQUIRED_KEYWORDS.some((keyword) => text.includes(keyword.toLowerCase()))) {
+        console.log('[AutoComment] 检测到需手动处理的验证/反垃圾字段:', {
           name: field.name,
           id: field.id,
           type: field.type,
-          placeholder: field.placeholder
+          placeholder: field.placeholder,
+          context: text.slice(0, 180)
         });
         return { found: true, field, message: MANUAL_REQUIRED_MESSAGE };
       }
     }
 
     return { found: false };
+  }
+
+  function findManualRequiredWidget(root) {
+    for (const selector of MANUAL_REQUIRED_WIDGET_SELECTORS) {
+      try {
+        const node = root.querySelector(selector);
+        if (node) return node;
+      } catch (_) {}
+    }
+    return null;
+  }
+
+  function isLikelyManualChallengeField(field, form, contextText) {
+    const name = (field.name || '').toLowerCase();
+    const id = (field.id || '').toLowerCase();
+    const className = (field.className || '').toLowerCase();
+    const type = (field.type || '').toLowerCase();
+    if (type === 'hidden' || type === 'submit' || type === 'button') return false;
+
+    const text = `${name} ${id} ${className} ${contextText || ''}`;
+    if (text.includes('aiowps-captcha') || text.includes('captcha-answer')) return true;
+    if (text.includes('answer in digits') || text.includes('enter an answer')) return true;
+    if (text.includes('equation') && (text.includes('captcha') || text.includes('='))) return true;
+
+    const container = field.closest && field.closest('p, div, label, section');
+    const containerText = ((container && container.textContent) || '').toLowerCase();
+    return (
+      containerText.includes('please enter an answer in digits') ||
+      (containerText.includes('captcha') && containerText.includes('answer')) ||
+      (containerText.includes('=') && containerText.includes('answer'))
+    );
   }
 
   function isRequiredField(field) {
