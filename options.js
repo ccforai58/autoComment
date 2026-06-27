@@ -42,6 +42,9 @@ document.addEventListener('DOMContentLoaded', () => {
   const importConfigFileInput = document.getElementById('importConfigFileInput');
   const importExportStatus = document.getElementById('importExportStatus');
   const openBatchBtn = document.getElementById('openBatchBtn');
+  const openPaymentBtn = document.getElementById('openPaymentBtn');
+  const purchaseStatusEl = document.getElementById('purchaseStatus');
+  const purchasePlanEl = document.getElementById('purchasePlan');
 
   if (
     !websiteUrlInput ||
@@ -155,6 +158,7 @@ document.addEventListener('DOMContentLoaded', () => {
         userIdInput.value = data[USER_ID_STORAGE_KEY];
         if (data[USER_ID_STORAGE_KEY]) {
           fetchPointsBalance(data[USER_ID_STORAGE_KEY]);
+          fetchPurchaseStatus(data[USER_ID_STORAGE_KEY]);
         }
       }
     });
@@ -232,6 +236,7 @@ document.addEventListener('DOMContentLoaded', () => {
         showStatus(pointsStatusEl, '已保存');
         if (userId) {
           fetchPointsBalance(userId);
+          fetchPurchaseStatus(userId);
         }
       });
     });
@@ -259,6 +264,51 @@ document.addEventListener('DOMContentLoaded', () => {
     } catch (error) {
       console.error('查询积分失败:', error);
       setPointsBalance('网络错误');
+    }
+  }
+
+  function setPurchaseStatus(data) {
+    if (!purchaseStatusEl) return;
+
+    if (!data || data.status === 'none') {
+      purchaseStatusEl.textContent = '未购买';
+      purchaseStatusEl.style.color = '#6b7280';
+      if (purchasePlanEl) {
+        purchasePlanEl.style.display = 'none';
+        purchasePlanEl.textContent = '';
+      }
+      return;
+    }
+
+    purchaseStatusEl.textContent = data.statusText || data.status || '未知状态';
+    purchaseStatusEl.style.color = data.status === 'fulfilled' ? '#059669' : '#1d4ed8';
+    if (purchasePlanEl) {
+      purchasePlanEl.style.display = 'block';
+      purchasePlanEl.textContent = data.planName ? `当前套餐：${data.planName}` : '';
+    }
+  }
+
+  async function fetchPurchaseStatus(userId) {
+    if (!userId) {
+      setPurchaseStatus(null);
+      return;
+    }
+
+    try {
+      const response = await fetch(`${POINTS_API_BASE}/purchase-status?userId=${encodeURIComponent(userId)}`);
+      const data = await response.json();
+      if (data.success) {
+        setPurchaseStatus(data);
+      } else if (purchaseStatusEl) {
+        purchaseStatusEl.textContent = '查询失败';
+        purchaseStatusEl.style.color = '#dc2626';
+      }
+    } catch (error) {
+      console.error('查询套餐状态失败:', error);
+      if (purchaseStatusEl) {
+        purchaseStatusEl.textContent = '网络错误';
+        purchaseStatusEl.style.color = '#dc2626';
+      }
     }
   }
 
@@ -374,6 +424,12 @@ document.addEventListener('DOMContentLoaded', () => {
   if (openBatchBtn) {
     openBatchBtn.addEventListener('click', () => {
       chrome.tabs.create({ url: 'batch.html' });
+    });
+  }
+
+  if (openPaymentBtn) {
+    openPaymentBtn.addEventListener('click', () => {
+      chrome.tabs.create({ url: 'payment.html' });
     });
   }
 

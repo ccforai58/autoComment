@@ -26,6 +26,7 @@ app.use((req, res, next) => {
 });
 
 const blogRunStatsHandler = require('./api/blog-run-stats');
+const alipayRouter = require('./api/alipay');
 
 // 挂载各 API 路由
 app.post('/api/generate-copy', require('./api/generate-copy'));
@@ -34,6 +35,7 @@ app.use('/api', require('./api/get-points'));
 app.use('/api', require('./api/deduct-points'));
 app.use('/api', require('./api/refund-points'));
 app.use('/api', require('./api/batch'));
+app.use('/api', alipayRouter);
 
 // 健康检查
 app.get('/health', (req, res) => {
@@ -53,5 +55,8 @@ app.listen(PORT, () => {
   console.log(`[Server] 后端服务已启动，监听端口 ${PORT}`);
   blogRunStatsHandler.ensureTable().catch((err) => {
     console.error('[Server] blog_run_stats 表初始化失败:', err);
+  });
+  alipayRouter.ensureTables().catch((err) => {
+    console.error('[Server] payment_orders table init failed:', err);
   });
 });
