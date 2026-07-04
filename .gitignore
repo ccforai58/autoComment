@@ -1,0 +1,6 @@
+# Local export helper files generated for private database exports.
+.gitignore
+/local_export_tools/
+
+# Generated CSV inventory for automatic paid fulfillment.
+/storage/csv-batches/

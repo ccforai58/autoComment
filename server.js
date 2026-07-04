@@ -26,6 +26,7 @@ app.use((req, res, next) => {
 });
 
 const blogRunStatsHandler = require('./api/blog-run-stats');
+const csvBatchesRouter = require('./api/csv-batches');
 const alipayRouter = require('./api/alipay');
 
 // 挂载各 API 路由
@@ -35,6 +36,7 @@ app.use('/api', require('./api/get-points'));
 app.use('/api', require('./api/deduct-points'));
 app.use('/api', require('./api/refund-points'));
 app.use('/api', require('./api/batch'));
+app.use('/api', csvBatchesRouter);
 app.use('/api', alipayRouter);
 
 // 健康检查
@@ -53,10 +55,15 @@ app.use((req, res) => {
 // 启动
 app.listen(PORT, () => {
   console.log(`[Server] 后端服务已启动，监听端口 ${PORT}`);
+  alipayRouter.logConfigDiagnostics();
   blogRunStatsHandler.ensureTable().catch((err) => {
     console.error('[Server] blog_run_stats 表初始化失败:', err);
   });
   alipayRouter.ensureTables().catch((err) => {
     console.error('[Server] payment_orders table init failed:', err);
   });
+  csvBatchesRouter.ensureTables().catch((err) => {
+    console.error('[Server] csv batch tables init failed:', err);
+  });
+  csvBatchesRouter.startScheduler();
 });

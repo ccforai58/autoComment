@@ -9,6 +9,8 @@ const express = require('express');
 function createDbMock() {
   const state = {
     orders: [],
+    batches: [],
+    purchases: [],
     executedSql: []
   };
 
@@ -83,6 +85,21 @@ function createDbMock() {
   }
 
   async function query(sql, params = []) {
+    if (/FROM\s+csv_batches\s+b/i.test(sql) && /LEFT\s+JOIN\s+user_csv_purchases/i.test(sql)) {
+      const userId = params[0];
+      return state.batches
+        .filter((batch) => ['ready', 'disabled'].includes(batch.status))
+        .map((batch) => {
+          const purchase = state.purchases.find((item) => item.user_id === userId && item.batch_id === batch.id);
+          return {
+            ...clone(batch),
+            purchase_user_id: purchase && purchase.user_id,
+            purchase_out_trade_no: purchase && purchase.out_trade_no,
+            purchase_batch_id: purchase && purchase.batch_id
+          };
+        });
+    }
+
     if (/FROM\s+payment_orders/i.test(sql) && /WHERE\s+user_id/i.test(sql)) {
       return state.orders
         .filter((order) => order.user_id === params[0])
@@ -94,6 +111,14 @@ function createDbMock() {
   }
 
   async function queryOne(sql, params = []) {
+    if (/FROM\s+csv_batches/i.test(sql) && /WHERE\s+id\s*=\s*\?/i.test(sql)) {
+      return clone(state.batches.find((batch) => batch.id === Number(params[0])));
+    }
+
+    if (/FROM\s+user_csv_purchases/i.test(sql) && /WHERE\s+user_id\s*=\s*\?/i.test(sql) && /batch_id\s*=\s*\?/i.test(sql)) {
+      return clone(state.purchases.find((purchase) => purchase.user_id === params[0] && purchase.batch_id === Number(params[1])));
+    }
+
     if (/WHERE\s+user_id\s*=\s*\?/i.test(sql) && /out_trade_no\s*=\s*\?/i.test(sql)) {
       return clone(state.orders.find((order) => order.user_id === params[0] && order.out_trade_no === params[1]));
     }
@@ -113,6 +138,9 @@ function createDbMock() {
     return {
       async getConnection() {
         return {
+          async beginTransaction() {},
+          async commit() {},
+          async rollback() {},
           async execute(sql, params = []) {
             if (/GET_LOCK/i.test(sql)) {
               return [[{ locked: 1 }]];
@@ -122,13 +150,21 @@ function createDbMock() {
               return [[{ released: 1 }]];
             }
 
+            if (/FROM\s+payment_orders/i.test(sql) && /out_trade_no\s*=\s*\?/i.test(sql) && /FOR\s+UPDATE/i.test(sql)) {
+              return [[clone(state.orders.find((order) => order.out_trade_no === params[0]))].filter(Boolean)];
+            }
+
+            if (/FROM\s+csv_batches/i.test(sql) && /WHERE\s+id\s*=\s*\?/i.test(sql) && /FOR\s+UPDATE/i.test(sql)) {
+              return [[clone(state.batches.find((batch) => batch.id === Number(params[0])))].filter(Boolean)];
+            }
+
             if (/FROM\s+payment_orders/i.test(sql) && /status\s+IN/i.test(sql)) {
               const order = activeOrderForUser(params[0], [params[1], params[2]]);
               return [[clone(order)].filter(Boolean)];
             }
 
             if (/INSERT\s+INTO\s+payment_orders/i.test(sql)) {
-              const [outTradeNo, userId, planId, subject, amount] = params;
+              const [outTradeNo, userId, planId, batchId, subject, amount] = params;
               const now = new Date();
               state.orders.push({
                 id: state.orders.length + 1,
@@ -136,6 +172,7 @@ function createDbMock() {
                 alipay_trade_no: null,
                 user_id: userId,
                 plan_id: planId,
+                batch_id: batchId,
                 subject,
                 amount,
                 status: 'pending_payment',
@@ -146,6 +183,37 @@ function createDbMock() {
                 updated_at: now
               });
               return [{ affectedRows: 1, insertId: state.orders.length }];
+            }
+
+            if (/INSERT\s+INTO\s+user_csv_purchases/i.test(sql)) {
+              const [userId, batchId, outTradeNo, tokenHash] = params;
+              const existing = state.purchases.find((purchase) => purchase.user_id === userId && purchase.batch_id === Number(batchId));
+              if (!existing) {
+                state.purchases.push({
+                  id: state.purchases.length + 1,
+                  user_id: userId,
+                  batch_id: Number(batchId),
+                  out_trade_no: outTradeNo,
+                  purchase_token_hash: tokenHash,
+                  paid_at: new Date('2026-06-27T10:00:00.000Z'),
+                  granted_at: new Date('2026-06-27T10:00:00.000Z')
+                });
+              }
+              return [{ affectedRows: 1, insertId: state.purchases.length }];
+            }
+
+            if (/UPDATE\s+payment_orders/i.test(sql) && /status\s*=\s*'fulfilled'/i.test(sql)) {
+              const [alipayTradeNo, rawNotify, outTradeNo] = params;
+              const order = state.orders.find((item) => item.out_trade_no === outTradeNo);
+              if (order) {
+                order.status = 'fulfilled';
+                order.alipay_trade_no = alipayTradeNo;
+                order.paid_at = order.paid_at || new Date('2026-06-27T10:00:00.000Z');
+                order.fulfilled_at = order.fulfilled_at || new Date('2026-06-27T10:00:00.000Z');
+                order.raw_notify = rawNotify;
+                order.updated_at = new Date('2026-06-27T10:00:00.000Z');
+              }
+              return [{ affectedRows: order ? 1 : 0 }];
             }
 
             return [{ affectedRows: 0 }];
@@ -170,8 +238,10 @@ function createDbMock() {
 function loadAlipayRouterWithMocks(dbMock) {
   const dbPath = require.resolve('../api/db');
   const alipayPath = require.resolve('../api/alipay');
+  const csvBatchesPath = require.resolve('../api/csv-batches');
   delete require.cache[dbPath];
   delete require.cache[alipayPath];
+  delete require.cache[csvBatchesPath];
   require.cache[dbPath] = {
     id: dbPath,
     filename: dbPath,
@@ -396,6 +466,7 @@ test('payment launch smoke: order creation, paid notify, status, duplicate guard
   assert.equal(statusBody.status, 'paid_pending_fulfillment');
   assert.equal(statusBody.planId, 'blog_250');
   assert.equal(statusBody.outTradeNo, createBody.outTradeNo);
+  assert.equal(statusBody.updatedAt, '2026-06-27T10:00:00.000Z');
 
   const duplicateResponse = await fetch(`${app.baseUrl}/api/alipay/create-order`, {
     method: 'POST',
@@ -417,4 +488,117 @@ test('payment launch smoke: order creation, paid notify, status, duplicate guard
   assert.match(schemaSql, /pending_payment/);
   assert.match(schemaSql, /paid_pending_fulfillment/);
   assert.match(schemaSql, /TRADE_SUCCESS/);
+});
+
+test('csv batch payment grants download access idempotently', async (t) => {
+  const { privateKey, publicKey } = crypto.generateKeyPairSync('rsa', {
+    modulusLength: 2048,
+    privateKeyEncoding: {
+      type: 'pkcs8',
+      format: 'pem'
+    },
+    publicKeyEncoding: {
+      type: 'spki',
+      format: 'pem'
+    }
+  });
+
+  process.env.ALIPAY_APP_ID = 'test-app-id';
+  process.env.ALIPAY_PRIVATE_KEY = privateKey;
+  process.env.ALIPAY_PUBLIC_KEY = publicKey;
+  process.env.ALIPAY_ENV = 'sandbox';
+  process.env.PURCHASE_TOKEN_SECRET = 'test-token-secret';
+
+  const dbMock = createDbMock();
+  dbMock.state.batches.push({
+    id: 88,
+    batch_no: 'BLOGS_20260601_20260701',
+    file_name: 'blogs_20260601_20260701.csv',
+    storage_path: 'E:\\autoComment-master\\autoComment-master\\storage\\csv-batches\\blogs_20260601_20260701.csv',
+    sha256: 'abc',
+    row_count: 250,
+    source_start_date: new Date('2026-06-01T00:00:00.000Z'),
+    source_end_date: new Date('2026-07-01T00:00:00.000Z'),
+    source_started_at: new Date('2026-06-01T08:00:00.000Z'),
+    source_ended_at: new Date('2026-07-01T08:00:00.000Z'),
+    price: '19.90',
+    status: 'ready',
+    created_at: new Date('2026-07-04T02:00:00.000Z'),
+    updated_at: new Date('2026-07-04T02:00:00.000Z')
+  });
+
+  const router = loadAlipayRouterWithMocks(dbMock);
+  const app = await startApp(router);
+  t.after(async () => {
+    await app.close();
+  });
+
+  const createResponse = await fetch(`${app.baseUrl}/api/alipay/create-order`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      userId: 'csv-user-001',
+      batchId: 88
+    })
+  });
+  const createBody = await createResponse.json();
+
+  assert.equal(createResponse.status, 200);
+  assert.equal(createBody.success, true);
+  assert.equal(createBody.plan.id, 'csv_batch');
+  assert.equal(createBody.plan.batchId, 88);
+  assert.equal(createBody.plan.name, 'blogs_20260601_20260701.csv');
+  assert.equal(createBody.plan.amount, '19.90');
+
+  const order = dbMock.state.orders.find((item) => item.out_trade_no === createBody.outTradeNo);
+  assert.equal(order.user_id, 'csv-user-001');
+  assert.equal(order.plan_id, 'csv_batch');
+  assert.equal(order.batch_id, 88);
+  assert.equal(order.status, 'pending_payment');
+
+  const notifyBody = {
+    app_id: 'test-app-id',
+    out_trade_no: createBody.outTradeNo,
+    trade_no: '2026062722000000000088',
+    total_amount: '19.90',
+    trade_status: 'TRADE_SUCCESS'
+  };
+
+  const notifyResponse = await fetch(`${app.baseUrl}/api/alipay/notify`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(notifyBody)
+  });
+  assert.equal(notifyResponse.status, 200);
+  assert.equal(await notifyResponse.text(), 'success');
+  assert.equal(order.status, 'fulfilled');
+  assert.equal(order.alipay_trade_no, '2026062722000000000088');
+  assert.equal(dbMock.state.purchases.length, 1);
+  assert.equal(dbMock.state.purchases[0].user_id, 'csv-user-001');
+  assert.equal(dbMock.state.purchases[0].batch_id, 88);
+  assert.equal(dbMock.state.purchases[0].out_trade_no, createBody.outTradeNo);
+  assert.match(dbMock.state.purchases[0].purchase_token_hash, /^[a-f0-9]{64}$/);
+
+  const repeatNotifyResponse = await fetch(`${app.baseUrl}/api/alipay/notify`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(notifyBody)
+  });
+  assert.equal(repeatNotifyResponse.status, 200);
+  assert.equal(await repeatNotifyResponse.text(), 'success');
+  assert.equal(dbMock.state.purchases.length, 1);
+
+  const duplicateResponse = await fetch(`${app.baseUrl}/api/alipay/create-order`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      userId: 'csv-user-001',
+      batchId: 88
+    })
+  });
+  const duplicateBody = await duplicateResponse.json();
+
+  assert.equal(duplicateResponse.status, 409);
+  assert.equal(duplicateBody.success, false);
+  assert.equal(duplicateBody.code, 'CSV_ALREADY_PURCHASED');
 });

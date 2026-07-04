@@ -196,16 +196,18 @@
         </div>
         <div style="margin-top: 12px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
           <button id="openPaymentBtn" class="btn btn-primary" style="padding: 8px 18px; font-size: 13px;">
-            支付宝购买套餐
+            购买 CSV
           </button>
-          <span style="font-size: 12px; color: #6b7280;">支持购买博客列表套餐，付款后由后台人工发货。</span>
+          <span style="font-size: 12px; color: #6b7280;">支持购买按日期范围导出的博客列表 CSV。</span>
         </div>
         <div style="margin-top: 12px; padding: 10px 12px; background: #ffffff; border-radius: 8px; border: 1px solid #dbeafe;">
           <div style="display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap;">
-            <span style="font-size: 12px; color: #374151; font-weight: 600;">套餐状态：</span>
+            <span style="font-size: 12px; color: #374151; font-weight: 600;">购买状态：</span>
             <span id="purchaseStatus" style="font-size: 13px; color: #1d4ed8; font-weight: 700;">未购买</span>
           </div>
           <div id="purchasePlan" style="display: none; margin-top: 6px; font-size: 12px; color: #6b7280;"></div>
+          <div id="purchaseOrderNo" style="display: none; margin-top: 4px; font-size: 12px; color: #6b7280; word-break: break-all;"></div>
+          <div id="purchaseUpdatedAt" style="display: none; margin-top: 4px; font-size: 12px; color: #6b7280;"></div>
         </div>
       </div>
 

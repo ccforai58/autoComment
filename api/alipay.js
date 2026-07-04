@@ -3,6 +3,7 @@ const crypto = require('crypto');
 const { AlipaySdk } = require('alipay-sdk');
 
 const { execute, getPool, query, queryOne } = require('./db');
+const csvBatches = require('./csv-batches');
 
 const router = express.Router();
 
@@ -32,8 +33,8 @@ const PLANS = {
 const STATUS_TEXT = {
   none: '未购买',
   pending_payment: '待支付',
-  paid_pending_fulfillment: '已支付，待人工发货',
-  fulfilled: '已发货',
+  paid_pending_fulfillment: '已支付，处理中',
+  fulfilled: '已购买，可下载',
   closed: '已关闭',
   failed: '异常或失败'
 };
@@ -191,9 +192,62 @@ function getSdk() {
   return sdkInstance;
 }
 
+async function columnExists(tableName, columnName) {
+  const rows = await query(
+    `
+      SELECT COLUMN_NAME
+      FROM INFORMATION_SCHEMA.COLUMNS
+      WHERE TABLE_SCHEMA = DATABASE()
+        AND TABLE_NAME = ?
+        AND COLUMN_NAME = ?
+      LIMIT 1
+    `,
+    [tableName, columnName]
+  );
+  return rows.length > 0;
+}
+
+async function indexExists(tableName, indexName) {
+  const rows = await query(
+    `
+      SELECT INDEX_NAME
+      FROM INFORMATION_SCHEMA.STATISTICS
+      WHERE TABLE_SCHEMA = DATABASE()
+        AND TABLE_NAME = ?
+        AND INDEX_NAME = ?
+      LIMIT 1
+    `,
+    [tableName, indexName]
+  );
+  return rows.length > 0;
+}
+
+async function ensurePaymentOrderBatchColumn() {
+  if (!(await columnExists('payment_orders', 'batch_id'))) {
+    await execute(
+      `
+        ALTER TABLE payment_orders
+          ADD COLUMN batch_id BIGINT UNSIGNED NULL COMMENT '购买的 CSV 批次ID' AFTER plan_id
+      `,
+      []
+    );
+  }
+
+  if (!(await indexExists('payment_orders', 'idx_payment_orders_batch_id'))) {
+    await execute(
+      `
+        CREATE INDEX idx_payment_orders_batch_id
+        ON payment_orders (batch_id)
+      `,
+      []
+    );
+  }
+}
+
 async function ensureTables() {
   if (!tablesReadyPromise) {
     tablesReadyPromise = (async () => {
+      await csvBatches.ensureTables();
       await execute(
         `
           CREATE TABLE IF NOT EXISTS payment_orders (
@@ -202,22 +256,26 @@ async function ensureTables() {
             alipay_trade_no VARCHAR(128) DEFAULT NULL COMMENT '支付宝交易号，支付通知返回的 trade_no',
             user_id VARCHAR(255) NOT NULL COMMENT '用户ID，来自插件端用户标识',
             plan_id VARCHAR(64) NOT NULL COMMENT '套餐ID枚举：blog_250=博客列表基础包，as_50=高AS博客精选包',
+            batch_id BIGINT UNSIGNED NULL COMMENT '购买的 CSV 批次ID',
             subject VARCHAR(255) NOT NULL COMMENT '支付订单标题，来自套餐 subject',
             amount DECIMAL(10,2) NOT NULL COMMENT '订单金额，单位：元',
-            status VARCHAR(40) NOT NULL DEFAULT 'pending_payment' COMMENT '订单状态枚举：pending_payment=待支付，paid_pending_fulfillment=已支付待人工发货，fulfilled=已发货，closed=已关闭，failed=异常或失败',
+            status VARCHAR(40) NOT NULL DEFAULT 'pending_payment' COMMENT '订单状态枚举：pending_payment=待支付，paid_pending_fulfillment=已支付处理中，fulfilled=已购买可下载，closed=已关闭，failed=异常或失败',
             paid_at TIMESTAMP NULL DEFAULT NULL COMMENT '首次确认支付成功时间；支付宝 trade_status 为 TRADE_SUCCESS 或 TRADE_FINISHED 时写入',
-            fulfilled_at TIMESTAMP NULL DEFAULT NULL COMMENT '人工发货完成时间',
+            fulfilled_at TIMESTAMP NULL DEFAULT NULL COMMENT '订单完成时间',
             raw_notify JSON DEFAULT NULL COMMENT '最近一次支付宝异步通知原文JSON；trade_status 参考：WAIT_BUYER_PAY=等待买家付款，TRADE_SUCCESS=支付成功，TRADE_FINISHED=交易结束，TRADE_CLOSED=交易关闭',
             created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '记录创建时间',
             updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '记录最后更新时间',
             PRIMARY KEY (id),
             UNIQUE KEY uk_payment_orders_out_trade_no (out_trade_no),
             INDEX idx_payment_orders_user_status (user_id, status),
-            INDEX idx_payment_orders_user_created (user_id, created_at)
+            INDEX idx_payment_orders_user_created (user_id, created_at),
+            INDEX idx_payment_orders_batch_id (batch_id)
           ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='支付宝支付订单表'
         `,
         []
       );
+
+      await ensurePaymentOrderBatchColumn();
 
       await execute(
         `
@@ -226,12 +284,12 @@ async function ensureTables() {
             MODIFY out_trade_no VARCHAR(64) NOT NULL COMMENT '本系统商户订单号，AC+时间戳+随机串；唯一',
             MODIFY alipay_trade_no VARCHAR(128) DEFAULT NULL COMMENT '支付宝交易号，支付通知返回的 trade_no',
             MODIFY user_id VARCHAR(255) NOT NULL COMMENT '用户ID，来自插件端用户标识',
-            MODIFY plan_id VARCHAR(64) NOT NULL COMMENT '套餐ID枚举：blog_250=博客列表基础包，as_50=高AS博客精选包',
+            MODIFY plan_id VARCHAR(64) NOT NULL COMMENT '套餐ID枚举：blog_250=博客列表基础包，as_50=高AS博客精选包，csv_batch=CSV批次',
             MODIFY subject VARCHAR(255) NOT NULL COMMENT '支付订单标题，来自套餐 subject',
             MODIFY amount DECIMAL(10,2) NOT NULL COMMENT '订单金额，单位：元',
-            MODIFY status VARCHAR(40) NOT NULL DEFAULT 'pending_payment' COMMENT '订单状态枚举：pending_payment=待支付，paid_pending_fulfillment=已支付待人工发货，fulfilled=已发货，closed=已关闭，failed=异常或失败',
+            MODIFY status VARCHAR(40) NOT NULL DEFAULT 'pending_payment' COMMENT '订单状态枚举：pending_payment=待支付，paid_pending_fulfillment=已支付处理中，fulfilled=已购买可下载，closed=已关闭，failed=异常或失败',
             MODIFY paid_at TIMESTAMP NULL DEFAULT NULL COMMENT '首次确认支付成功时间；支付宝 trade_status 为 TRADE_SUCCESS 或 TRADE_FINISHED 时写入',
-            MODIFY fulfilled_at TIMESTAMP NULL DEFAULT NULL COMMENT '人工发货完成时间',
+            MODIFY fulfilled_at TIMESTAMP NULL DEFAULT NULL COMMENT '订单完成时间',
             MODIFY raw_notify JSON DEFAULT NULL COMMENT '最近一次支付宝异步通知原文JSON；trade_status 参考：WAIT_BUYER_PAY=等待买家付款，TRADE_SUCCESS=支付成功，TRADE_FINISHED=交易结束，TRADE_CLOSED=交易关闭',
             MODIFY created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '记录创建时间',
             MODIFY updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '记录最后更新时间',
@@ -258,6 +316,20 @@ function generateOutTradeNo() {
 
 function getPlan(planId) {
   return PLANS[planId] || null;
+}
+
+function normalizeBatchId(value) {
+  const id = Number(value);
+  return Number.isInteger(id) && id > 0 ? id : 0;
+}
+
+async function getOrderPaymentProduct(order) {
+  if (order && order.batch_id) {
+    const batch = await csvBatches.getBatchById(order.batch_id);
+    if (!batch) return null;
+    return csvBatches.buildPaymentProduct(batch);
+  }
+  return order ? getPlan(order.plan_id) : null;
 }
 
 function formatDate(value) {
@@ -299,11 +371,13 @@ function buildPurchaseStatus(row) {
     status: row.status,
     statusText: STATUS_TEXT[row.status] || row.status,
     planId: row.plan_id,
-    planName: plan ? plan.name : row.plan_id,
+    planName: plan ? plan.name : row.subject || row.plan_id,
+    batchId: row.batch_id || null,
     outTradeNo: row.out_trade_no,
     paidAt: formatDate(row.paid_at),
     fulfilledAt: formatDate(row.fulfilled_at),
-    createdAt: formatDate(row.created_at)
+    createdAt: formatDate(row.created_at),
+    updatedAt: formatDate(row.updated_at)
   };
   const expiresAt = getPendingOrderExpiresAt(row);
   if (expiresAt) {
@@ -385,7 +459,7 @@ function getActiveOrderError(order) {
   if (order.status === 'paid_pending_fulfillment') {
     return {
       code: 'PENDING_FULFILLMENT_EXISTS',
-      message: '你已有已支付订单，正在等待人工发货'
+      message: '你已有已支付订单，正在处理下载权限'
     };
   }
   return {
@@ -447,7 +521,7 @@ async function closeAlipayTrade(outTradeNo) {
 }
 
 async function createOrder(req, res) {
-  const { userId, planId } = req.body || {};
+  const { userId, planId, batchId } = req.body || {};
 
   if (!userId || typeof userId !== 'string') {
     return res.status(400).json({ success: false, error: '缺少 userId 参数' });
@@ -458,9 +532,45 @@ async function createOrder(req, res) {
     return res.status(400).json({ success: false, error: '缺少 userId 参数' });
   }
 
-  const plan = getPlan(planId);
-  if (!plan) {
-    return res.status(400).json({ success: false, error: '无效的套餐' });
+  const normalizedBatchId = normalizeBatchId(batchId);
+  let product = null;
+  let orderBatchId = null;
+
+  if (typeof batchId !== 'undefined' && batchId !== null && batchId !== '') {
+    if (!normalizedBatchId) {
+      return res.status(400).json({ success: false, error: '无效的 CSV 文件' });
+    }
+
+    try {
+      const batch = await csvBatches.getReadyBatchForPurchase(normalizedBatchId);
+      if (!batch) {
+        return res.status(404).json({ success: false, code: 'CSV_BATCH_NOT_AVAILABLE', message: 'CSV 文件不存在或已下架' });
+      }
+
+      const existingPurchase = await csvBatches.findUserPurchase(normalizedUserId, normalizedBatchId);
+      if (existingPurchase) {
+        return res.status(409).json({
+          success: false,
+          code: 'CSV_ALREADY_PURCHASED',
+          message: '你已经购买过这个 CSV，可以直接下载'
+        });
+      }
+
+      product = csvBatches.buildPaymentProduct(batch);
+      orderBatchId = normalizedBatchId;
+    } catch (error) {
+      console.error('[alipay] prepare CSV order failed:', error);
+      return res.status(500).json({
+        success: false,
+        error: '读取 CSV 文件信息失败',
+        message: error.message
+      });
+    }
+  } else {
+    product = getPlan(planId);
+    if (!product) {
+      return res.status(400).json({ success: false, error: '无效的套餐' });
+    }
   }
 
   let conn = null;
@@ -484,6 +594,17 @@ async function createOrder(req, res) {
       });
     }
 
+    if (orderBatchId) {
+      const existingPurchase = await csvBatches.findUserPurchase(normalizedUserId, orderBatchId);
+      if (existingPurchase) {
+        return res.status(409).json({
+          success: false,
+          code: 'CSV_ALREADY_PURCHASED',
+          message: '你已经购买过这个 CSV，可以直接下载'
+        });
+      }
+    }
+
     const [activeRows] = await conn.execute(
       `
         SELECT *
@@ -497,8 +618,17 @@ async function createOrder(req, res) {
     );
     const activeOrder = activeRows && activeRows[0];
     if (activeOrder && activeOrder.status === 'pending_payment') {
-      const activePlan = getPlan(activeOrder.plan_id);
-      if (!activePlan) {
+      if (orderBatchId && Number(activeOrder.batch_id || 0) !== orderBatchId) {
+        return res.status(409).json({
+          success: false,
+          code: 'ACTIVE_ORDER_EXISTS',
+          message: '你有一笔其他 CSV 的待支付订单，请先完成或取消后再购买新的 CSV',
+          order: buildPurchaseStatus(activeOrder)
+        });
+      }
+
+      const activeProduct = await getOrderPaymentProduct(activeOrder);
+      if (!activeProduct) {
         return res.status(409).json({
           success: false,
           code: 'ACTIVE_ORDER_EXISTS',
@@ -510,13 +640,14 @@ async function createOrder(req, res) {
         success: true,
         reused: true,
         outTradeNo: activeOrder.out_trade_no,
-        payUrl: buildPayUrl({ outTradeNo: activeOrder.out_trade_no, plan: activePlan }),
+        payUrl: buildPayUrl({ outTradeNo: activeOrder.out_trade_no, plan: activeProduct }),
         env: getAlipayEnv(),
         order: buildPurchaseStatus(activeOrder),
         plan: {
-          id: activePlan.id,
-          name: activePlan.name,
-          amount: activePlan.amount
+          id: activeProduct.id,
+          name: activeProduct.name,
+          amount: activeProduct.amount,
+          batchId: activeProduct.batchId || null
         }
       });
     }
@@ -531,16 +662,16 @@ async function createOrder(req, res) {
     }
 
     const outTradeNo = generateOutTradeNo();
-    const payUrl = buildPayUrl({ outTradeNo, plan });
+    const payUrl = buildPayUrl({ outTradeNo, plan: product });
 
     await conn.execute(
       `
         INSERT INTO payment_orders
-          (out_trade_no, user_id, plan_id, subject, amount, status, created_at, updated_at)
+          (out_trade_no, user_id, plan_id, batch_id, subject, amount, status, created_at, updated_at)
         VALUES
-          (?, ?, ?, ?, ?, 'pending_payment', NOW(), NOW())
+          (?, ?, ?, ?, ?, ?, 'pending_payment', NOW(), NOW())
       `,
-      [outTradeNo, normalizedUserId, plan.id, plan.subject, plan.amount]
+      [outTradeNo, normalizedUserId, product.id, orderBatchId, product.subject, product.amount]
     );
 
     return res.status(200).json({
@@ -551,9 +682,10 @@ async function createOrder(req, res) {
       expiresAt: new Date(Date.now() + PAYMENT_TIMEOUT_MS).toISOString(),
       remainingSeconds: PAYMENT_TIMEOUT_SECONDS,
       plan: {
-        id: plan.id,
-        name: plan.name,
-        amount: plan.amount
+        id: product.id,
+        name: product.name,
+        amount: product.amount,
+        batchId: product.batchId || null
       }
     });
   } catch (error) {
@@ -613,12 +745,12 @@ async function continueOrder(req, res) {
       });
     }
 
-    const plan = getPlan(order.plan_id);
+    const plan = await getOrderPaymentProduct(order);
     if (!plan) {
       return res.status(409).json({
         success: false,
         code: 'UNKNOWN_ORDER_PLAN',
-        message: '订单套餐不存在，无法继续支付',
+        message: '订单商品不存在，无法继续支付',
         order: buildPurchaseStatus(order)
       });
     }
@@ -633,7 +765,8 @@ async function continueOrder(req, res) {
       plan: {
         id: plan.id,
         name: plan.name,
-        amount: plan.amount
+        amount: plan.amount,
+        batchId: plan.batchId || null
       }
     });
   } catch (error) {
@@ -755,6 +888,15 @@ async function handleNotify(req, res) {
     const tradeStatus = notifyData.trade_status;
     const rawNotify = JSON.stringify(notifyData);
     if (PAID_TRADE_STATUSES.includes(tradeStatus)) {
+      if (order.batch_id) {
+        await csvBatches.grantDownloadAccessFromPaidOrder({
+          outTradeNo,
+          alipayTradeNo: notifyData.trade_no || null,
+          rawNotify
+        });
+        return res.status(200).send('success');
+      }
+
       await execute(
         `
           UPDATE payment_orders
@@ -825,7 +967,7 @@ async function purchaseStatus(req, res) {
     console.error('[alipay] purchase-status failed:', error);
     return res.status(500).json({
       success: false,
-      error: '查询套餐状态失败',
+      error: '查询购买状态失败',
       message: error.message
     });
   }
@@ -903,7 +1045,7 @@ function returnPage(req, res) {
   <body>
     <div class="card">
       <h1>支付结果处理中</h1>
-      <p>支付宝已返回支付页面。订单是否成功以服务器异步通知为准，请回到插件设置页查看套餐状态。</p>
+      <p>支付宝已返回支付页面。订单是否成功以服务器异步通知为准，请回到插件购买页查看下载权限。</p>
     </div>
   </body>
 </html>`);

@@ -45,6 +45,8 @@ document.addEventListener('DOMContentLoaded', () => {
   const openPaymentBtn = document.getElementById('openPaymentBtn');
   const purchaseStatusEl = document.getElementById('purchaseStatus');
   const purchasePlanEl = document.getElementById('purchasePlan');
+  const purchaseOrderNoEl = document.getElementById('purchaseOrderNo');
+  const purchaseUpdatedAtEl = document.getElementById('purchaseUpdatedAt');
 
   if (
     !websiteUrlInput ||
@@ -267,6 +269,19 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }
 
+  function formatPurchaseDateText(value) {
+    if (!value) return '';
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return String(value);
+    return date.toLocaleString('zh-CN', {
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit'
+    });
+  }
+
   function setPurchaseStatus(data) {
     if (!purchaseStatusEl) return;
 
@@ -277,6 +292,14 @@ document.addEventListener('DOMContentLoaded', () => {
         purchasePlanEl.style.display = 'none';
         purchasePlanEl.textContent = '';
       }
+      if (purchaseUpdatedAtEl) {
+        purchaseUpdatedAtEl.style.display = 'none';
+        purchaseUpdatedAtEl.textContent = '';
+      }
+      if (purchaseOrderNoEl) {
+        purchaseOrderNoEl.style.display = 'none';
+        purchaseOrderNoEl.textContent = '';
+      }
       return;
     }
 
@@ -284,7 +307,16 @@ document.addEventListener('DOMContentLoaded', () => {
     purchaseStatusEl.style.color = data.status === 'fulfilled' ? '#059669' : '#1d4ed8';
     if (purchasePlanEl) {
       purchasePlanEl.style.display = 'block';
-      purchasePlanEl.textContent = data.planName ? `当前套餐：${data.planName}` : '';
+      purchasePlanEl.textContent = data.planName ? `当前文件：${data.planName}` : '';
+    }
+    if (purchaseOrderNoEl) {
+      purchaseOrderNoEl.style.display = data.outTradeNo ? 'block' : 'none';
+      purchaseOrderNoEl.textContent = data.outTradeNo ? `订单号：${data.outTradeNo}` : '';
+    }
+    if (purchaseUpdatedAtEl) {
+      const updatedAtText = formatPurchaseDateText(data.updatedAt || data.fulfilledAt || data.paidAt || data.createdAt);
+      purchaseUpdatedAtEl.style.display = updatedAtText ? 'block' : 'none';
+      purchaseUpdatedAtEl.textContent = updatedAtText ? `最后更新时间：${updatedAtText}` : '';
     }
   }
 
@@ -304,7 +336,7 @@ document.addEventListener('DOMContentLoaded', () => {
         purchaseStatusEl.style.color = '#dc2626';
       }
     } catch (error) {
-      console.error('查询套餐状态失败:', error);
+      console.error('查询购买状态失败:', error);
       if (purchaseStatusEl) {
         purchaseStatusEl.textContent = '网络错误';
         purchaseStatusEl.style.color = '#dc2626';
