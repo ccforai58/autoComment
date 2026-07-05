@@ -11,7 +11,8 @@ function createDbMock() {
     orders: [],
     batches: [],
     purchases: [],
-    executedSql: []
+    executedSql: [],
+    connectionSql: []
   };
 
   function clone(row) {
@@ -142,6 +143,7 @@ function createDbMock() {
           async commit() {},
           async rollback() {},
           async execute(sql, params = []) {
+            state.connectionSql.push(sql);
             if (/GET_LOCK/i.test(sql)) {
               return [[{ locked: 1 }]];
             }
@@ -161,6 +163,10 @@ function createDbMock() {
             if (/FROM\s+payment_orders/i.test(sql) && /status\s+IN/i.test(sql)) {
               const order = activeOrderForUser(params[0], [params[1], params[2]]);
               return [[clone(order)].filter(Boolean)];
+            }
+
+            if (/FROM\s+blog_run_stats\s+s/i.test(sql)) {
+              return [[]];
             }
 
             if (/INSERT\s+INTO\s+payment_orders/i.test(sql)) {
@@ -281,6 +287,20 @@ function loadAlipayRouterWithMocks(dbMock) {
   } finally {
     Module._load = originalLoad;
   }
+}
+
+function loadCsvBatchesWithMocks(dbMock) {
+  const dbPath = require.resolve('../api/db');
+  const csvBatchesPath = require.resolve('../api/csv-batches');
+  delete require.cache[dbPath];
+  delete require.cache[csvBatchesPath];
+  require.cache[dbPath] = {
+    id: dbPath,
+    filename: dbPath,
+    loaded: true,
+    exports: dbMock.exports
+  };
+  return require('../api/csv-batches');
 }
 
 async function startApp(router) {
@@ -601,4 +621,23 @@ test('csv batch payment grants download access idempotently', async (t) => {
   assert.equal(duplicateResponse.status, 409);
   assert.equal(duplicateBody.success, false);
   assert.equal(duplicateBody.code, 'CSV_ALREADY_PURCHASED');
+});
+
+test('csv export queries low and high AS batches separately', async () => {
+  const dbMock = createDbMock();
+  const csvBatches = loadCsvBatchesWithMocks(dbMock);
+
+  const result = await csvBatches.runExportJob({ maxBatches: 1 });
+
+  assert.equal(result.success, true);
+  assert.deepEqual(result.created, []);
+  assert.deepEqual(result.remainingRows, {
+    basic_low_as: 0,
+    high_as: 0
+  });
+
+  const sql = dbMock.state.connectionSql.join('\n');
+  assert.match(sql, /CAST\(TRIM\(s\.page_as\) AS DECIMAL\(10,2\)\)\s+<\s+50[\s\S]*LIMIT 250/);
+  assert.match(sql, /CAST\(TRIM\(s\.page_as\) AS DECIMAL\(10,2\)\)\s+>\s+50[\s\S]*LIMIT 50/);
+  assert.match(sql, /TRIM\(s\.page_as\) REGEXP '\^\[0-9\]\+\(\[.\]\[0-9\]\+\)\?\$'/);
 });

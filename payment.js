@@ -202,6 +202,7 @@ document.addEventListener('DOMContentLoaded', () => {
       const meta = document.createElement('div');
       meta.className = 'item-meta';
       [
+        ['类型', batch.batchTypeText],
         ['数据范围', batch.dateRangeText],
         ['行数', `${batch.rowCount || 0} 条`],
         ['价格', `￥${batch.price}`],

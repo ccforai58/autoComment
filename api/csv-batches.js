@@ -13,11 +13,34 @@ function normalizePositiveInteger(value, fallback) {
   return Number.isInteger(number) && number > 0 ? number : fallback;
 }
 
-const EXPORT_BATCH_SIZE = normalizePositiveInteger(process.env.CSV_EXPORT_BATCH_SIZE, 250);
+const BASIC_EXPORT_BATCH_SIZE = normalizePositiveInteger(
+  process.env.CSV_BASIC_EXPORT_BATCH_SIZE || process.env.CSV_EXPORT_BATCH_SIZE,
+  250
+);
+const HIGH_AS_EXPORT_BATCH_SIZE = normalizePositiveInteger(process.env.CSV_HIGH_AS_EXPORT_BATCH_SIZE, 50);
 const EXPORT_LOCK_NAME = 'csv_batch_export';
 const CSV_STORAGE_DIR = path.resolve(__dirname, '..', 'storage', 'csv-batches');
 const CSV_BATCH_PLAN_ID = 'csv_batch';
 const DEFAULT_BATCH_PRICE = process.env.CSV_BATCH_PRICE || '19.90';
+
+const EXPORT_SPECS = [
+  {
+    type: 'basic_low_as',
+    label: 'AS低于50',
+    filePrefix: 'blogs_basic',
+    batchNoPrefix: 'BLOGS_BASIC',
+    size: BASIC_EXPORT_BATCH_SIZE,
+    asOperator: '<'
+  },
+  {
+    type: 'high_as',
+    label: 'AS高于50',
+    filePrefix: 'blogs_high_as',
+    batchNoPrefix: 'BLOGS_HIGH_AS',
+    size: HIGH_AS_EXPORT_BATCH_SIZE,
+    asOperator: '>'
+  }
+];
 
 let tablesReadyPromise = null;
 let schedulerStarted = false;
@@ -123,6 +146,7 @@ async function ensureTables() {
         `
           CREATE TABLE IF NOT EXISTS csv_batches (
             id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+            batch_type VARCHAR(32) NOT NULL DEFAULT 'basic_low_as',
             batch_no VARCHAR(64) NOT NULL,
             file_name VARCHAR(255) NOT NULL,
             storage_path VARCHAR(500) NOT NULL,
@@ -139,6 +163,7 @@ async function ensureTables() {
             PRIMARY KEY (id),
             UNIQUE KEY uk_csv_batches_batch_no (batch_no),
             UNIQUE KEY uk_csv_batches_file_name (file_name),
+            INDEX idx_csv_batches_type_status (batch_type, status),
             INDEX idx_csv_batches_date_range (source_start_date, source_end_date),
             INDEX idx_csv_batches_status_created (status, created_at)
           ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='可售 CSV 批次'
@@ -183,12 +208,62 @@ async function ensureTables() {
         `,
         []
       );
+
+      if (!(await columnExists('csv_batches', 'batch_type'))) {
+        await execute(
+          `
+            ALTER TABLE csv_batches
+              ADD COLUMN batch_type VARCHAR(32) NOT NULL DEFAULT 'basic_low_as' AFTER id
+          `,
+          []
+        );
+      }
+
+      if (!(await indexExists('csv_batches', 'idx_csv_batches_type_status'))) {
+        await execute(
+          `
+            CREATE INDEX idx_csv_batches_type_status
+            ON csv_batches (batch_type, status)
+          `,
+          []
+        );
+      }
     })().catch((error) => {
       tablesReadyPromise = null;
       throw error;
     });
   }
   return tablesReadyPromise;
+}
+
+async function columnExists(tableName, columnName) {
+  const rows = await query(
+    `
+      SELECT COLUMN_NAME
+      FROM INFORMATION_SCHEMA.COLUMNS
+      WHERE TABLE_SCHEMA = DATABASE()
+        AND TABLE_NAME = ?
+        AND COLUMN_NAME = ?
+      LIMIT 1
+    `,
+    [tableName, columnName]
+  );
+  return rows.length > 0;
+}
+
+async function indexExists(tableName, indexName) {
+  const rows = await query(
+    `
+      SELECT INDEX_NAME
+      FROM INFORMATION_SCHEMA.STATISTICS
+      WHERE TABLE_SCHEMA = DATABASE()
+        AND TABLE_NAME = ?
+        AND INDEX_NAME = ?
+      LIMIT 1
+    `,
+    [tableName, indexName]
+  );
+  return rows.length > 0;
 }
 
 function buildBatchResponse(row, purchase) {
@@ -203,6 +278,8 @@ function buildBatchResponse(row, purchase) {
   const batchId = Number(row.id || row.batch_id);
   return {
     batchId,
+    batchType: row.batch_type || 'basic_low_as',
+    batchTypeText: getBatchTypeText(row.batch_type),
     batchNo: row.batch_no,
     fileName: row.file_name,
     dateRangeText: `${formatDateOnly(row.source_start_date)} 至 ${formatDateOnly(row.source_end_date)}`,
@@ -218,15 +295,21 @@ function buildBatchResponse(row, purchase) {
   };
 }
 
+function getBatchTypeText(batchType) {
+  const spec = EXPORT_SPECS.find((item) => item.type === batchType);
+  return spec ? spec.label : 'CSV';
+}
+
 function buildPaymentProduct(batch) {
   const price = formatAmount(batch.price);
+  const batchTypeText = getBatchTypeText(batch.batch_type);
   return {
     id: CSV_BATCH_PLAN_ID,
     batchId: Number(batch.id),
     name: batch.file_name,
     amount: price,
-    subject: `AutoComment CSV ${batch.file_name}`,
-    body: `${formatDateOnly(batch.source_start_date)} 至 ${formatDateOnly(batch.source_end_date)}，${batch.row_count} 条博客数据`
+    subject: `AutoComment ${batchTypeText} CSV ${batch.file_name}`,
+    body: `${batchTypeText}，${formatDateOnly(batch.source_start_date)} 至 ${formatDateOnly(batch.source_end_date)}，${batch.row_count} 条博客数据`
   };
 }
 
@@ -361,11 +444,11 @@ async function downloadBatch(req, res) {
   }
 }
 
-async function findAvailableBatchName(startDate, endDate) {
-  const base = `blogs_${startDate}_${endDate}`;
+async function findAvailableBatchName(spec, startDate, endDate) {
+  const base = `${spec.filePrefix}_${startDate}_${endDate}`;
   for (let index = 1; index < 10000; index += 1) {
     const suffix = index === 1 ? '' : `_${String(index).padStart(4, '0')}`;
-    const batchNo = `BLOGS_${startDate}_${endDate}${suffix}`;
+    const batchNo = `${spec.batchNoPrefix}_${startDate}_${endDate}${suffix}`;
     const fileName = `${base}${suffix}.csv`;
     const existing = await queryOne(
       `
@@ -384,25 +467,34 @@ async function findAvailableBatchName(startDate, endDate) {
   throw new Error(`无法为日期范围 ${startDate}-${endDate} 生成唯一 CSV 文件名`);
 }
 
-async function fetchExportRows(conn) {
+function getAsFilterSql(spec) {
+  const operator = spec.asOperator === '>' ? '>' : '<';
+  return `
+        AND TRIM(s.page_as) REGEXP '^[0-9]+([.][0-9]+)?$'
+        AND CAST(TRIM(s.page_as) AS DECIMAL(10,2)) ${operator} 50
+  `;
+}
+
+async function fetchExportRows(conn, spec) {
   const [rows] = await conn.execute(
     `
       SELECT s.*
       FROM blog_run_stats s
       LEFT JOIN csv_batch_items i ON i.blog_run_stat_id = s.id
       WHERE i.id IS NULL
+      ${getAsFilterSql(spec)}
       ORDER BY s.created_at ASC, s.id ASC
-      LIMIT ${EXPORT_BATCH_SIZE}
+      LIMIT ${spec.size}
     `,
     []
   );
   return rows;
 }
 
-async function exportOneBatch(conn) {
-  const rows = await fetchExportRows(conn);
-  if (rows.length < EXPORT_BATCH_SIZE) {
-    return { created: false, rowCount: rows.length };
+async function exportOneBatch(conn, spec) {
+  const rows = await fetchExportRows(conn, spec);
+  if (rows.length < spec.size) {
+    return { created: false, rowCount: rows.length, batchType: spec.type };
   }
 
   const startValue = rows[0].created_at;
@@ -410,6 +502,7 @@ async function exportOneBatch(conn) {
   const sourceStartDate = formatDateOnly(startValue);
   const sourceEndDate = formatDateOnly(endValue);
   const { batchNo, fileName } = await findAvailableBatchName(
+    spec,
     formatDateCompact(startValue),
     formatDateCompact(endValue)
   );
@@ -428,6 +521,7 @@ async function exportOneBatch(conn) {
     const [insertResult] = await conn.execute(
       `
         INSERT INTO csv_batches (
+          batch_type,
           batch_no,
           file_name,
           storage_path,
@@ -442,9 +536,10 @@ async function exportOneBatch(conn) {
           created_at,
           updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'building', NOW(), NOW())
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'building', NOW(), NOW())
       `,
       [
+        spec.type,
         batchNo,
         fileName,
         finalPath,
@@ -481,7 +576,7 @@ async function exportOneBatch(conn) {
       [batchId]
     );
 
-    return { created: true, batchId, fileName, rowCount: rows.length };
+    return { created: true, batchId, batchType: spec.type, batchTypeText: spec.label, fileName, rowCount: rows.length };
   } catch (error) {
     await conn.rollback().catch(() => {});
     await fs.promises.unlink(tempPath).catch(() => {});
@@ -510,7 +605,7 @@ async function runExportJob(options = {}) {
   const result = {
     success: true,
     created: [],
-    remainingRows: 0,
+    remainingRows: {},
     lockSkipped: false
   };
 
@@ -522,13 +617,15 @@ async function runExportJob(options = {}) {
       return result;
     }
 
-    for (let index = 0; index < maxBatches; index += 1) {
-      const batchResult = await exportOneBatch(conn);
-      if (!batchResult.created) {
-        result.remainingRows = batchResult.rowCount;
-        break;
+    for (const spec of EXPORT_SPECS) {
+      for (let index = 0; index < maxBatches; index += 1) {
+        const batchResult = await exportOneBatch(conn, spec);
+        if (!batchResult.created) {
+          result.remainingRows[spec.type] = batchResult.rowCount;
+          break;
+        }
+        result.created.push(batchResult);
       }
-      result.created.push(batchResult);
     }
 
     return result;
