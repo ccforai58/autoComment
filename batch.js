@@ -8,6 +8,7 @@ const POLL_INTERVAL = 3000;
 const TIMEOUT_CHECK_INTERVAL = 5000;
 const TIMEOUT_STORAGE_KEY = 'batch_timeout_seconds';
 const SUBMIT_CONTEXT_CONFIRMATION_GRACE_SECONDS = 8;
+const AI_REUSE_STATE_STORAGE_KEY = 'batch_ai_reuse_state_v1';
 
 function sendLocalDebugLog(source, payload) {
   try {
@@ -49,14 +50,32 @@ function buildSubmitContextGraceResult(submitCtx) {
   const ctx = submitCtx && typeof submitCtx === 'object' ? submitCtx : {};
   const evidence = ctx.successEvidence && typeof ctx.successEvidence === 'object' ? ctx.successEvidence : {};
   const isStrongSuccessEvidence = evidence.classifiedResult === 'success' && evidence.confidence === 'strong';
+  const hasAnySubmitEvidence = !!(evidence.classifiedResult || evidence.reason || evidence.confidence);
   const reason = evidence.reason || 'submit_evidence_without_backlink';
   return {
     result: 'submitted_unconfirmed',
     aiContent: ctx.aiContent || null,
     errorMessage: isStrongSuccessEvidence
       ? `submit observed as success/${reason} but backlink verification did not finish before grace timeout`
-      : (ctx.errorMessage || 'submit started but no confirmation returned after grace period')
+      : (hasAnySubmitEvidence
+        ? `submit observed as ${evidence.classifiedResult || 'unknown'}/${reason} before grace timeout`
+        : (ctx.errorMessage || 'submit started but no confirmation returned after grace period'))
   };
+}
+
+function getSubmitVerificationGraceSecondsLocal(evidence) {
+  const source = evidence && typeof evidence === 'object' ? evidence : {};
+  const result = String(source.classifiedResult || source.result || '').trim();
+  const confidence = String(source.confidence || '').trim();
+  const reason = String(source.reason || '').trim();
+  if (result === 'success' && confidence === 'strong') return 25;
+  if (
+    result === 'success' &&
+    (confidence === 'medium' || /navigation_without_error|textarea_cleared|comment/i.test(reason))
+  ) {
+    return 20;
+  }
+  return SUBMIT_CONTEXT_CONFIRMATION_GRACE_SECONDS;
 }
 
 function resetRuntimeForNewUpload(parsedUrlCount) {
@@ -67,6 +86,7 @@ function resetRuntimeForNewUpload(parsedUrlCount) {
   initialPoints = parseInt(pointsBalance.textContent || '0', 10) || 0;
   currentPromotionWebsiteUrl = '';
   totalCount = Number(parsedUrlCount || 0);
+  batchStartedAt = 0;
   successCount = 0;
   failCount = 0;
   skippedCount = 0;
@@ -96,7 +116,8 @@ function clearRuntimeStorageForNewUpload() {
       BATCH_RUNTIME_STATE_KEY,
       BATCH_PENDING_TASK_KEY,
       'batchCtx',
-      'batchSubmitCtx'
+      'batchSubmitCtx',
+      AI_REUSE_STATE_STORAGE_KEY
     ], () => {
       console.log('[batch][runtime] cleared previous runtime state for new upload');
     });
@@ -117,6 +138,7 @@ let currentPromotionWebsiteUrl = '';
 
 // Text cleanup: previous comment was mojibake.
 let totalCount = 0;
+let batchStartedAt = 0;
 let successCount = 0;
 let failCount = 0;
 let skippedCount = 0;
@@ -181,6 +203,7 @@ const setupWebsiteValue = document.getElementById('setupWebsiteValue');
 const setupIdentityValue = document.getElementById('setupIdentityValue');
 const setupUserValue = document.getElementById('setupUserValue');
 const setupStatusText = document.getElementById('setupStatusText');
+const serviceStatusStrip = document.getElementById('serviceStatusStrip');
 const resultsCard = document.getElementById('resultsCard');
 const resultsCurrentTab = document.getElementById('resultsCurrentTab');
 const resultsArchiveTab = document.getElementById('resultsArchiveTab');
@@ -271,6 +294,7 @@ async function init() {
   await loadUserId();
   await loadPoints();
   await refreshSetupSummary();
+  await refreshServiceStatus();
   await loadTimeoutSetting();
   await loadBatchCheckboxSettings();
   bindEvents();
@@ -377,6 +401,49 @@ async function refreshSetupSummary() {
   }
 }
 
+function renderServiceStatus(statusPayload) {
+  if (!serviceStatusStrip) return;
+  const logic = getBatchResultsLogic();
+  const summary = logic && logic.buildServiceStatusSummary
+    ? logic.buildServiceStatusSummary(statusPayload)
+    : null;
+  const items = summary && Array.isArray(summary.items) ? summary.items : [
+    { key: 'backend', label: 'Backend', status: 'bad', message: 'Unavailable' },
+    { key: 'database', label: 'Database', status: 'bad', message: 'Unavailable' },
+    { key: 'model', label: 'AI', status: 'bad', message: 'Unavailable' }
+  ];
+
+  items.forEach((item) => {
+    const el = serviceStatusStrip.querySelector(`[data-service-key="${item.key}"]`);
+    if (!el) return;
+    el.classList.toggle('ok', item.status === 'ok');
+    el.classList.toggle('bad', item.status === 'bad');
+    el.textContent = item.label;
+    el.title = item.message || '';
+  });
+}
+
+async function refreshServiceStatus() {
+  renderServiceStatus({});
+  try {
+    const response = await fetch(`${API_BASE}/local-status`, { cache: 'no-store' });
+    const payload = await response.json();
+    renderServiceStatus(payload);
+    console.info('[batch][api] GET /local-status', {
+      backend: payload && payload.backend ? payload.backend.ok : false,
+      database: payload && payload.database ? payload.database.ok : false,
+      model: payload && payload.model ? payload.model.ok : false
+    });
+  } catch (error) {
+    renderServiceStatus({
+      backend: { ok: false, error: 'Backend unavailable' },
+      database: { ok: false, error: 'Backend unavailable' },
+      model: { ok: false, error: 'Backend unavailable' }
+    });
+    console.warn('[batch][api] GET /local-status failed:', error);
+  }
+}
+
 async function loadPoints() {
   if (!userId) {
     pointsBalance.textContent = '--';
@@ -451,6 +518,7 @@ function bindEvents() {
   if (refreshSetupBtn) {
     refreshSetupBtn.addEventListener('click', () => {
       refreshSetupSummary();
+      refreshServiceStatus();
       loadPoints();
     });
   }
@@ -817,6 +885,7 @@ async function startBatch() {
   initialPoints = parseInt(pointsBalance.textContent || '0', 10);
   batchId = generateUUID();
   totalCount = parsedUrls.length;
+  batchStartedAt = Date.now();
   successCount = 0;
   failCount = 0;
   skippedCount = 0;
@@ -991,6 +1060,12 @@ async function openNextTab() {
   const item = parsedUrls[urlIndex];
   const { url, sourceDomain } = item;
   console.log('[openNextTab] opening tab', { urlIndex, url });
+  logSubmitFlow('batch.open_prepare', {
+    urlIndex,
+    url,
+    currentIndex,
+    totalCount
+  });
   currentIndex++;
 
   const illegalCheck = item.illegalCheck || evaluateIllegalSiteForBatchItem(url, sourceDomain);
@@ -1014,9 +1089,35 @@ async function openNextTab() {
         url,
         createdAt: Date.now()
       }
+    }, () => {
+      logSubmitFlow('batch.pending_task_saved', {
+        urlIndex,
+        url,
+        storageError: chrome.runtime.lastError ? chrome.runtime.lastError.message : ''
+      });
     });
 
     chrome.tabs.create({ url, active: true }, (tab) => {
+      const createError = chrome.runtime.lastError ? chrome.runtime.lastError.message : '';
+      if (createError || !tab || !tab.id) {
+        logSubmitFlow('batch.tab_create_failed', {
+          urlIndex,
+          url,
+          error: createError || 'chrome.tabs.create returned no tab'
+        });
+        handleTabResult(urlIndex, 'fail', null, 'Tab create failed: ' + (createError || 'missing tab'), 0);
+        if (status === 'running' && currentIndex < totalCount) {
+          setTimeout(openNextTabSync, 1000);
+        } else if (status === 'running' && activeTabCount === 0) {
+          checkAllCompleted();
+        }
+        return;
+      }
+      logSubmitFlow('batch.tab_create_done', {
+        urlIndex,
+        url,
+        tabId: tab.id
+      });
       activeTabCount++;
       activeTabs.set(tab.id, { urlIndex, startTime: Date.now() });
       activeTabsByIndex.set(urlIndex, { urlIndex, startTime: Date.now() });
@@ -1177,7 +1278,7 @@ function handleTabResult(urlIndex, result, aiContent, errorMessage, forcedElapse
 
   reportBlogRunStatsIfNeeded(item, result);
 
-  if (result === 'success') {
+  if (result === 'success' || result === 'success_pending_moderation') {
     successCount++;
     highlightPreviewRow(urlIndex, 'success');
   } else if (result === 'skipped') {
@@ -1272,7 +1373,7 @@ function buildBlogRunStatsPayload(item, result) {
     targetDomain,
     type: normalizeStatValue(row[4]),
     externalLinkCount: parseIntegerForStats(row[5]),
-    validationResult: result === 'success' ? 1 : 2
+    validationResult: (result === 'success' || result === 'success_pending_moderation') ? 1 : 2
   };
 }
 
@@ -1397,6 +1498,7 @@ function buildBatchRuntimeSnapshot() {
     batchId,
     status,
     totalCount,
+    batchStartedAt,
     currentIndex,
     parsedUrls,
     localResults,
@@ -1454,6 +1556,7 @@ async function restoreBatchRuntimeState() {
   batchId = snapshot.batchId;
   status = snapshot.status === 'running' ? 'terminated' : (snapshot.status || 'terminated');
   totalCount = Number(snapshot.totalCount || snapshot.parsedUrls.length || 0);
+  batchStartedAt = Number(snapshot.batchStartedAt || 0);
   currentIndex = Number(snapshot.currentIndex || 0);
   parsedUrls = snapshot.parsedUrls;
   localResults = Array.isArray(snapshot.localResults) ? snapshot.localResults : [];
@@ -1751,7 +1854,7 @@ function buildArchiveWebsiteOptions(records, selectedWebsite, optionsArg = {}) {
 function renderArchiveSummary(records, totalRecords) {
   if (!archiveSummary) return;
   const total = records.length;
-  const success = records.filter((r) => r.result === 'success' || r.result === 'skipped').length;
+  const success = records.filter((r) => r.result === 'success' || r.result === 'success_pending_moderation' || r.result === 'skipped').length;
   const fail = records.filter((r) => r.result === 'fail' || r.result === 'blocked_illegal').length;
   const manual = records.filter((r) => r.result === 'manual_required' || r.result === 'submitted_unconfirmed').length;
   const sourceDomains = new Set(records.map((r) => r.sourceDomain || extractDomain(r.sourceUrl || '')).filter(Boolean)).size;
@@ -1838,12 +1941,23 @@ async function checkTimeouts() {
   const submitCtx = submitData.batchSubmitCtx;
   for (const [tabId, info] of activeTabs) {
     const isAccepted = !!info.acceptedAt || tabsWaitingClose.has(tabId);
+    const successEvidence = submitCtx && submitCtx.successEvidence ? submitCtx.successEvidence : null;
+    const graceSeconds = getSubmitVerificationGraceSecondsLocal(successEvidence);
+    if (isAccepted && graceSeconds > SUBMIT_CONTEXT_CONFIRMATION_GRACE_SECONDS && submitCtx && submitCtx.batchId === batchId && Number(submitCtx.urlIndex) === Number(info.urlIndex)) {
+      logSubmitFlow('verify.wait_extended', {
+        urlIndex: info.urlIndex,
+        tabId,
+        graceSeconds,
+        baseGraceSeconds: SUBMIT_CONTEXT_CONFIRMATION_GRACE_SECONDS,
+        evidence: successEvidence || {}
+      });
+    }
     if (isAccepted && shouldFinalizePendingSubmitContextAfterGrace({
       ctx: submitCtx,
       batchId,
       urlIndex: info.urlIndex,
       now,
-      graceSeconds: SUBMIT_CONTEXT_CONFIRMATION_GRACE_SECONDS
+      graceSeconds
     })) {
       const graceResult = buildSubmitContextGraceResult(submitCtx);
       toRemove.push({
@@ -1854,7 +1968,7 @@ async function checkTimeouts() {
         aiContent: graceResult.aiContent,
         errorMessage: graceResult.errorMessage,
         stage: 'submit_context_grace_timeout',
-        timeoutSeconds: SUBMIT_CONTEXT_CONFIRMATION_GRACE_SECONDS
+        timeoutSeconds: graceSeconds
       });
       continue;
     }
@@ -1943,7 +2057,7 @@ function updateResultActionButtons() {
 function renderSummaryCounts(records) {
   const rows = Array.isArray(records) ? records : [];
   const total = rows.length;
-  const success = rows.filter((r) => r.result === 'success').length;
+  const success = rows.filter((r) => r.result === 'success' || r.result === 'success_pending_moderation').length;
   const skipped = rows.filter((r) => r.result === 'skipped').length;
   const manual = rows.filter((r) => r.result === 'manual_required' || r.result === 'submitted_unconfirmed').length;
   const noCommentBox = rows.filter((r) => r.result === 'no_comment_box').length;
@@ -2114,6 +2228,7 @@ async function clearBatch() {
 
   batchId = null;
   totalCount = successCount = failCount = skippedCount = noCommentBoxCount = manualRequiredCount = blockedIllegalCount = pendingCount = 0;
+  batchStartedAt = 0;
   currentIndex = 0;
   localResults = [];
   activeTabs.clear();
@@ -2560,6 +2675,7 @@ function isValidUrl(str) {
 function getResultText(result) {
   switch (result) {
     case 'success': return '成功';
+    case 'success_pending_moderation': return '提交成功，审核中';
     case 'skipped': return '已存在';
     case 'manual_required': return '需手动处理';
     case 'submitted_unconfirmed': return '待确认';

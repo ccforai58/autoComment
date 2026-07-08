@@ -7,10 +7,11 @@ try {
     const source = message && typeof message === 'object' ? message : {};
     const incomingResult = String(source.result || '').trim();
     const confirmedBy = String(source.confirmedBy || '').trim();
-    const strictSuccess = incomingResult === 'success' && confirmedBy === 'submit-confirmed-v3';
+    const strictSuccess = (incomingResult === 'success' || incomingResult === 'success_pending_moderation') &&
+      confirmedBy === 'submit-confirmed-v3';
     if (strictSuccess) {
       return {
-        result: 'success',
+        result: incomingResult,
         errorMessage: source.errorMessage || null,
         isStrictSuccess: true
       };
@@ -80,7 +81,7 @@ async function persistBatchReport(message) {
     linkVerification: linkVerification || null,
     timestamp: Date.now()
   };
-  if (result === 'success' && confirmedBy === 'submit-confirmed-v3') {
+  if ((result === 'success' || result === 'success_pending_moderation') && confirmedBy === 'submit-confirmed-v3') {
     entry.confirmedBy = confirmedBy;
     entry.confirmedAt = confirmedAt || entry.timestamp;
   }

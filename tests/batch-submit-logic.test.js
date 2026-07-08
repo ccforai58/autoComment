@@ -47,6 +47,16 @@ test('normalizeBatchConfirmMessage preserves submitted_unconfirmed', () => {
   assert.equal(normalized.errorMessage, 'submit triggered but no acceptance signal');
 });
 
+test('normalizeBatchConfirmMessage preserves pending moderation success status', () => {
+  const normalized = normalizeBatchConfirmMessage({
+    result: 'success_pending_moderation',
+    confirmedBy: BATCH_SUCCESS_CONFIRMATION_MARKER
+  });
+
+  assert.equal(normalized.result, 'success_pending_moderation');
+  assert.equal(normalized.isStrictSuccess, true);
+});
+
 test('classifySubmitEvidence detects strong success', () => {
   const result = classifySubmitEvidence({
     triggerResult: 'ajax',
@@ -267,7 +277,7 @@ test('classifyPostSubmitResult returns success only when backlink anchor is foun
   assert.equal(result.linkVerification.linkVerified, true);
 });
 
-test('classifyPostSubmitResult does not count private WordPress moderation preview as public success', () => {
+test('classifyPostSubmitResult treats moderation preview with backlink as success pending moderation', () => {
   const { classifyPostSubmitResult } = require('../lib/batch-submit-logic');
   const result = classifyPostSubmitResult({
     html: '<p>Your comment is awaiting moderation.</p><a href="https://promo.test/">Promo</a>',
@@ -277,9 +287,22 @@ test('classifyPostSubmitResult does not count private WordPress moderation previ
     successMessageFound: true
   });
 
-  assert.equal(result.result, 'submitted_unconfirmed');
-  assert.equal(result.reason, 'private_moderation_preview_without_public_backlink');
+  assert.equal(result.result, 'success_pending_moderation');
+  assert.equal(result.reason, 'backlink_anchor_found_in_moderation_preview');
   assert.equal(result.linkVerification.linkVerified, true);
+});
+
+test('buildBatchConfirmPayload marks pending moderation success as confirmed success evidence', () => {
+  const payload = buildBatchConfirmPayload({
+    batchId: 'batch-1',
+    urlIndex: 2,
+    result: 'success_pending_moderation',
+    confirmedAt: 123
+  });
+
+  assert.equal(payload.result, 'success_pending_moderation');
+  assert.equal(payload.confirmedBy, BATCH_SUCCESS_CONFIRMATION_MARKER);
+  assert.equal(payload.confirmedAt, 123);
 });
 
 test('classifyPostSubmitResult returns submitted_unconfirmed for moderation message without backlink', () => {
@@ -417,6 +440,55 @@ test('buildSubmitContextGraceResult preserves strong submit evidence as submitte
   });
 });
 
+test('buildSubmitContextGraceResult records weak submit evidence instead of generic timeout', () => {
+  const { buildSubmitContextGraceResult } = require('../lib/batch-submit-logic');
+
+  assert.deepEqual(buildSubmitContextGraceResult({
+    submitCtx: {
+      result: 'submitted_unconfirmed',
+      aiContent: 'Generated copy',
+      successEvidence: {
+        classifiedResult: 'submitted_unconfirmed',
+        reason: 'submit triggered but no acceptance signal',
+        confidence: 'weak'
+      }
+    }
+  }), {
+    result: 'submitted_unconfirmed',
+    aiContent: 'Generated copy',
+    errorMessage: 'submit observed as submitted_unconfirmed/submit triggered but no acceptance signal before grace timeout'
+  });
+});
+
+test('safeLowerString handles non-string DOMTokenList-like values', () => {
+  const { safeLowerString } = require('../lib/batch-submit-logic');
+  const tokenListLike = { toString() { return 'Comment Form'; } };
+
+  assert.equal(safeLowerString(tokenListLike), 'comment form');
+  assert.equal(safeLowerString(null), '');
+  assert.equal(safeLowerString(123), '123');
+});
+
+test('classifyDomainDrift blocks unexpected page drift away from original URL host', () => {
+  const { classifyDomainDrift } = require('../lib/batch-submit-logic');
+
+  assert.deepEqual(classifyDomainDrift({
+    originalUrl: 'https://www.completelydelicious.com/tips/make-brownies-shiny-crackly-crust/',
+    currentUrl: 'https://removebgvideo.com/'
+  }), {
+    drifted: true,
+    result: 'fail',
+    errorMessage: 'target page drifted from completelydelicious.com to removebgvideo.com',
+    originalHost: 'completelydelicious.com',
+    currentHost: 'removebgvideo.com'
+  });
+
+  assert.equal(classifyDomainDrift({
+    originalUrl: 'https://example.com/post',
+    currentUrl: 'https://www.example.com/post#comment-1'
+  }).drifted, false);
+});
+
 test('classifyInitialCommentFormScan quickly rejects forms without usable comment inputs', () => {
   const { classifyInitialCommentFormScan } = require('../lib/batch-submit-logic');
 
@@ -441,6 +513,25 @@ test('classifyInitialCommentFormScan quickly rejects forms without usable commen
     result: '',
     errorMessage: ''
   });
+
+  assert.deepEqual(classifyInitialCommentFormScan({
+    hasForm: false,
+    hasTextarea: false,
+    usableCommentFieldCount: 0,
+    hasEmbeddedCommentSignal: false
+  }), {
+    shouldStop: true,
+    result: 'no_comment_box',
+    errorMessage: 'no comment form found'
+  });
+
+  assert.equal(classifyInitialCommentFormScan({
+    hasForm: false,
+    hasTextarea: false,
+    usableCommentFieldCount: 0,
+    hasEmbeddedCommentSignal: true,
+    embeddedSignalReason: 'comment_action'
+  }).shouldStop, false);
 
   assert.equal(classifyInitialCommentFormScan({
     hasForm: true,
@@ -497,12 +588,12 @@ test('classifySubmitButtonClickability allows trusted wpDiscuz submit in unfocus
   }).clickable, false);
 });
 
-test('chooseInitialStopReportMode uses confirm channel for manual-required stops', () => {
+test('chooseInitialStopReportMode uses confirm channel for terminal initial stops', () => {
   const { chooseInitialStopReportMode } = require('../lib/batch-submit-logic');
 
   assert.equal(chooseInitialStopReportMode({ result: 'manual_required' }), 'confirm_and_close');
-  assert.equal(chooseInitialStopReportMode({ result: 'no_comment_box' }), 'report_only');
-  assert.equal(chooseInitialStopReportMode({ result: 'fail' }), 'report_only');
+  assert.equal(chooseInitialStopReportMode({ result: 'no_comment_box' }), 'confirm_and_close');
+  assert.equal(chooseInitialStopReportMode({ result: 'fail' }), 'confirm_and_close');
 });
 
 test('buildSubmitAttemptPlan prefers button click before native requestSubmit', () => {
@@ -556,4 +647,179 @@ test('getPreClickLayoutWaitTimeoutMs keeps pre-click layout wait short and bound
   assert.equal(getPreClickLayoutWaitTimeoutMs({ timeoutMs: 40 }), 50);
   assert.equal(getPreClickLayoutWaitTimeoutMs({ timeoutMs: 5000 }), 1000);
   assert.equal(getPreClickLayoutWaitTimeoutMs({ timeoutMs: 400 }), 400);
+});
+
+test('chooseBacklinkVerificationUrl prefers post-submit comment anchor page over original csv url', () => {
+  const { chooseBacklinkVerificationUrl } = require('../lib/batch-submit-logic');
+
+  const result = chooseBacklinkVerificationUrl({
+    originalUrl: 'https://example.test/post/comment-page-2/',
+    currentUrl: 'https://example.test/post/comment-page-233/#comment-1407439'
+  });
+
+  assert.equal(result.verificationUrl, 'https://example.test/post/comment-page-233/');
+  assert.equal(result.reason, 'current_comment_anchor_page');
+});
+
+test('buildBacklinkVerificationTargets falls back to original url after comment anchor page', () => {
+  const { buildBacklinkVerificationTargets } = require('../lib/batch-submit-logic');
+
+  const result = buildBacklinkVerificationTargets({
+    originalUrl: 'https://example.test/post/',
+    currentUrl: 'https://example.test/post/comment-page-233/#comment-1407439'
+  });
+
+  assert.deepEqual(result.map((item) => item.verificationUrl), [
+    'https://example.test/post/comment-page-233/',
+    'https://example.test/post/'
+  ]);
+  assert.deepEqual(result.map((item) => item.reason), [
+    'current_comment_anchor_page',
+    'original_url_fallback'
+  ]);
+});
+
+test('validateCommentReadyForSubmit requires actual field content to include promotion host', () => {
+  const { validateCommentReadyForSubmit } = require('../lib/batch-submit-logic');
+  const expected = 'Helpful comment with <a href="https://example-target.test/\n">useful design ideas</a> included.';
+
+  assert.equal(validateCommentReadyForSubmit({
+    expectedText: expected,
+    actualText: 'Helpful comment with ',
+    actualHtml: 'Helpful comment with ',
+    promotionUrl: 'https://example-target.test/'
+  }).ok, false);
+
+  assert.equal(validateCommentReadyForSubmit({
+    expectedText: expected,
+    actualText: 'Helpful comment with useful design ideas included.',
+    actualHtml: 'Helpful comment with useful design ideas included.',
+    promotionUrl: 'https://example-target.test/'
+  }).ok, false);
+
+  const complete = validateCommentReadyForSubmit({
+    expectedText: expected,
+    actualText: expected,
+    actualHtml: expected,
+    promotionUrl: 'https://example-target.test/'
+  });
+  assert.equal(complete.ok, true);
+  assert.equal(complete.hostFound, true);
+});
+
+test('chooseCommentReadyRecoveryAction escalates from segmented refill to direct fallback', () => {
+  const { chooseCommentReadyRecoveryAction } = require('../lib/batch-submit-logic');
+
+  assert.equal(chooseCommentReadyRecoveryAction({ ready: true, attempts: 0 }), 'none');
+  assert.equal(chooseCommentReadyRecoveryAction({ ready: false, attempts: 0 }), 'segmented_refill');
+  assert.equal(chooseCommentReadyRecoveryAction({ ready: false, attempts: 1 }), 'direct_set_value');
+  assert.equal(chooseCommentReadyRecoveryAction({ ready: false, attempts: 2 }), 'fail');
+});
+
+test('chooseBacklinkVerificationUrl verifies private moderation preview page when present', () => {
+  const { chooseBacklinkVerificationUrl } = require('../lib/batch-submit-logic');
+
+  const result = chooseBacklinkVerificationUrl({
+    originalUrl: 'https://example.test/post/',
+    currentUrl: 'https://example.test/post/?unapproved=123&moderation-hash=abc#comment-123'
+  });
+
+  assert.equal(result.verificationUrl, 'https://example.test/post/?unapproved=123&moderation-hash=abc');
+  assert.equal(result.privateModerationPreview, true);
+  assert.equal(result.reason, 'private_moderation_preview_page');
+});
+
+test('classifySubmitWatcherSignal keeps watching after submit event but finishes on navigation', () => {
+  const { classifySubmitWatcherSignal } = require('../lib/batch-submit-logic');
+
+  assert.equal(classifySubmitWatcherSignal({ signal: 'submit' }).shouldFinish, false);
+  assert.equal(classifySubmitWatcherSignal({ signal: 'fetch-submit' }).shouldFinish, false);
+  assert.deepEqual(classifySubmitWatcherSignal({ signal: 'beforeunload' }), {
+    shouldFinish: true,
+    result: 'navigating'
+  });
+});
+
+test('chooseReadyCommentField keeps valid preferred textarea over empty fallback', () => {
+  const { chooseReadyCommentField } = require('../lib/batch-submit-logic');
+  const expected = 'Helpful comment mentioning cfggt.com in the generated backlink text.';
+
+  const result = chooseReadyCommentField({
+    preferred: { id: 'comment', name: 'comment', text: expected, html: expected },
+    fallback: { id: 'ak_hp_textarea', name: 'ak_hp_textarea', text: '', html: '' },
+    expectedText: expected,
+    promotionUrl: 'https://cfggt.com/'
+  });
+
+  assert.equal(result.source, 'preferred');
+  assert.equal(result.reason, 'preferred_ready');
+  assert.equal(result.field.id, 'comment');
+  assert.equal(result.preferredValidation.ok, true);
+  assert.equal(result.fallbackValidation.ok, false);
+});
+
+test('chooseReadyCommentField falls back when preferred textarea no longer validates', () => {
+  const { chooseReadyCommentField } = require('../lib/batch-submit-logic');
+  const expected = 'Helpful comment mentioning cfggt.com in the generated backlink text.';
+
+  const result = chooseReadyCommentField({
+    preferred: { id: 'old', text: '', html: '' },
+    fallback: { id: 'comment', text: expected, html: expected },
+    expectedText: expected,
+    promotionUrl: 'https://cfggt.com/'
+  });
+
+  assert.equal(result.source, 'fallback');
+  assert.equal(result.reason, 'fallback_ready');
+  assert.equal(result.field.id, 'comment');
+});
+
+test('getSubmitVerificationGraceSeconds extends wait for success evidence', () => {
+  const { getSubmitVerificationGraceSeconds } = require('../lib/batch-submit-logic');
+
+  assert.equal(getSubmitVerificationGraceSeconds({
+    classifiedResult: 'success',
+    confidence: 'strong',
+    reason: 'success_message_found'
+  }), 25);
+
+  assert.equal(getSubmitVerificationGraceSeconds({
+    classifiedResult: 'success',
+    confidence: 'medium',
+    reason: 'navigation_without_error'
+  }), 20);
+
+  assert.equal(getSubmitVerificationGraceSeconds({
+    classifiedResult: 'submitted_unconfirmed',
+    confidence: 'weak'
+  }), 8);
+});
+
+test('buildAiReuseState fails first AI generation when no reusable copy exists', () => {
+  const { buildAiReuseState } = require('../lib/batch-submit-logic');
+
+  const result = buildAiReuseState({
+    aiOk: false,
+    reusableCopy: null
+  });
+
+  assert.equal(result.action, 'fail_first_generation');
+  assert.equal(result.warning, 'first_generation_failed');
+  assert.equal(result.reuseCount, 0);
+});
+
+test('buildAiReuseState warns after the same copy is reused three times', () => {
+  const { buildAiReuseState } = require('../lib/batch-submit-logic');
+
+  const result = buildAiReuseState({
+    aiOk: false,
+    reusableCopy: { text: 'Reusable generated copy with cfggt.com', key: 'copy-1' },
+    previousReuseKey: 'copy-1',
+    previousReuseCount: 2
+  });
+
+  assert.equal(result.action, 'reuse');
+  assert.equal(result.reusableCopy.text, 'Reusable generated copy with cfggt.com');
+  assert.equal(result.reuseCount, 3);
+  assert.equal(result.warning, 'same_copy_reused_3_times');
 });

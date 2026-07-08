@@ -114,6 +114,50 @@
         color: #6b7280;
       }
 
+      .service-status-strip {
+        display: flex;
+        gap: 6px;
+        flex-wrap: wrap;
+        margin-top: 10px;
+      }
+
+      .service-pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 5px;
+        border: 1px solid #e5e7eb;
+        border-radius: 999px;
+        padding: 4px 9px;
+        font-size: 11px;
+        font-weight: 700;
+        color: #4b5563;
+        background: #f9fafb;
+      }
+
+      .service-pill::before {
+        content: '';
+        width: 7px;
+        height: 7px;
+        border-radius: 999px;
+        background: #9ca3af;
+      }
+
+      .service-pill.ok {
+        color: #065f46;
+        border-color: #a7f3d0;
+        background: #ecfdf5;
+      }
+
+      .service-pill.ok::before { background: #10b981; }
+
+      .service-pill.bad {
+        color: #991b1b;
+        border-color: #fecaca;
+        background: #fff1f2;
+      }
+
+      .service-pill.bad::before { background: #ef4444; }
+
       /* 上传区域 */
       .upload-zone {
         border: 2px dashed #d1d5db;
@@ -827,6 +871,11 @@
         <div class="setup-status">
           <div class="setup-status-text" id="setupStatusText">正在读取配置...</div>
           <div class="hint">缺少配置时，请先打开设置页补齐推广网站、姓名和邮箱。</div>
+        </div>
+        <div class="service-status-strip" id="serviceStatusStrip" aria-label="Local service status">
+          <span class="service-pill" data-service-key="backend">Backend</span>
+          <span class="service-pill" data-service-key="database">Database</span>
+          <span class="service-pill" data-service-key="model">AI</span>
         </div>
       </div>
 

@@ -38,12 +38,12 @@ function getExportSourceColumnCount(originalRow) {
   const len = row.length;
   if (len <= 0) return 0;
   const lastValue = String(row[len - 1] || '').trim();
-  const knownResultValues = new Set(['OK', 'FAIL', 'MANUAL_REQUIRED', 'manual_required', 'success', 'fail', 'blocked']);
+  const knownResultValues = new Set(['OK', 'FAIL', 'MANUAL_REQUIRED', 'manual_required', 'success', 'success_pending_moderation', 'fail', 'blocked']);
   return knownResultValues.has(lastValue) ? len - 1 : len;
 }
 
 function getExportRunResult(result) {
-  if (result === 'success' || result === 'skipped') return 'OK';
+  if (result === 'success' || result === 'success_pending_moderation' || result === 'skipped') return 'OK';
   if (result === 'manual_required' || result === 'submitted_unconfirmed') return 'MANUAL_REQUIRED';
   if (result === 'blocked_illegal') return 'BLOCKED';
   return 'FAIL';
@@ -231,6 +231,127 @@ function removeCurrentBatchReportedState(input) {
   };
 }
 
+function formatCompactEta(ms) {
+  const value = Number(ms);
+  if (!Number.isFinite(value) || value < 0) return '估算中';
+  const minutes = Math.max(1, Math.ceil(value / 60000));
+  if (minutes < 60) return `约 ${minutes} 分钟后`;
+  const hours = Math.floor(minutes / 60);
+  const rest = minutes % 60;
+  return rest > 0 ? `约 ${hours} 小时 ${rest} 分钟后` : `约 ${hours} 小时后`;
+}
+
+function buildCompactBatchProgress(input) {
+  const source = input && typeof input === 'object' ? input : {};
+  const snapshot = source.snapshot && typeof source.snapshot === 'object' ? source.snapshot : null;
+  if (!snapshot || !snapshot.batchId && !snapshot.totalCount) {
+    return { isBatch: false };
+  }
+
+  const total = Math.max(0, Number(snapshot.totalCount || 0));
+  const completed = Math.min(total, Math.max(0, Array.isArray(snapshot.localResults)
+    ? snapshot.localResults.length
+    : Number(snapshot.completedCount || 0)));
+  const success = Math.max(0, Number(snapshot.successCount || 0));
+  const currentRaw = Number(snapshot.currentIndex || 0);
+  const current = total > 0 ? Math.min(total, Math.max(1, currentRaw)) : 0;
+  const percent = total > 0 ? Math.round((completed / total) * 100) : 0;
+  const status = String(snapshot.status || 'idle');
+  const now = Number.isFinite(Number(source.now)) ? Number(source.now) : Date.now();
+  const startedAt = Number(snapshot.batchStartedAt || snapshot.startedAt || 0);
+
+  let etaMs = null;
+  let etaText = '估算中';
+  if (status === 'completed' || (total > 0 && completed >= total)) {
+    etaMs = 0;
+    etaText = '已完成';
+  } else if (startedAt > 0 && completed > 0 && total > completed) {
+    const elapsedMs = Math.max(0, now - startedAt);
+    const avgMs = elapsedMs / completed;
+    etaMs = Math.max(0, Math.round(avgMs * (total - completed)));
+    etaText = formatCompactEta(etaMs);
+  }
+
+  const stageText = status === 'running'
+    ? '正在处理当前页面'
+    : (status === 'terminated' ? '任务已暂停' : (status === 'completed' ? '任务已完成' : '等待开始'));
+
+  return {
+    isBatch: true,
+    status,
+    total,
+    completed,
+    success,
+    current,
+    percent,
+    etaMs,
+    etaText,
+    stageText
+  };
+}
+
+function chooseAssistantProgressTab(input) {
+  const source = input && typeof input === 'object' ? input : {};
+  const currentTab = source.currentTab === 'progress' ? 'progress' : 'manual';
+  if (source.hasBatchContext === true && source.userSelectedTab !== true) {
+    return 'progress';
+  }
+  return currentTab;
+}
+
+function buildServiceStatusSummary(input) {
+  const source = input && typeof input === 'object' ? input : {};
+  const defs = [
+    ['backend', 'Backend'],
+    ['database', 'Database'],
+    ['model', 'AI']
+  ];
+  const items = defs.map(([key, label]) => {
+    const value = source[key] && typeof source[key] === 'object' ? source[key] : {};
+    const ok = value.ok === true;
+    return {
+      key,
+      label,
+      ok,
+      status: ok ? 'ok' : 'bad',
+      message: value.message || value.error || (ok ? 'OK' : 'Unavailable')
+    };
+  });
+  const okCount = items.filter((item) => item.ok).length;
+  return {
+    items,
+    okCount,
+    totalCount: items.length,
+    allOk: okCount === items.length
+  };
+}
+
+function buildAssistantWarning(input) {
+  const source = input && typeof input === 'object' ? input : {};
+  if (source.firstGenerationFailed === true || source.warning === 'first_generation_failed') {
+    return {
+      visible: true,
+      level: 'error',
+      text: 'AI generation failed and no reusable copy is available. Check the local backend or model service.'
+    };
+  }
+
+  const reuseCount = Number(source.sameCopyReuseCount || source.reuseCount || 0);
+  if (source.warning === 'same_copy_reused_3_times' || reuseCount >= 3) {
+    return {
+      visible: true,
+      level: 'error',
+      text: `The same AI copy has been reused ${Math.max(3, reuseCount)} times. Check the local backend or model service.`
+    };
+  }
+
+  return {
+    visible: false,
+    level: '',
+    text: ''
+  };
+}
+
 const BatchResultsLogic = {
   normalizePromotionWebsiteKey,
   getRecordPromotionKey,
@@ -239,6 +360,10 @@ const BatchResultsLogic = {
   deletePromotionWebsiteRecords,
   deleteAllPromotionWebsiteRecords,
   removeCurrentBatchReportedState,
+  buildCompactBatchProgress,
+  chooseAssistantProgressTab,
+  buildServiceStatusSummary,
+  buildAssistantWarning,
   getExportSourceColumnCount,
   getExportRunResult
 };

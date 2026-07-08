@@ -7,7 +7,11 @@ const {
   buildArchiveExportCsv,
   deletePromotionWebsiteRecords,
   deleteAllPromotionWebsiteRecords,
-  removeCurrentBatchReportedState
+  removeCurrentBatchReportedState,
+  buildCompactBatchProgress,
+  chooseAssistantProgressTab,
+  buildServiceStatusSummary,
+  buildAssistantWarning
 } = require('../lib/batch-results-logic');
 
 test('buildCurrentBatchExportCsv keeps original CSV order and appends run result', () => {
@@ -24,6 +28,26 @@ test('buildCurrentBatchExportCsv keeps original CSV order and appends run result
   assert.match(lines[0], /^Page AS,Original URL,URL Domain,Run Result$/);
   assert.equal(lines[1], '10,https://a.test/,a.test,OK');
   assert.equal(lines[2], '20,https://b.test/,b.test,FAIL');
+});
+
+test('chooseAssistantProgressTab switches to progress only before user tab choice', () => {
+  assert.equal(chooseAssistantProgressTab({
+    hasBatchContext: true,
+    userSelectedTab: false,
+    currentTab: 'manual'
+  }), 'progress');
+
+  assert.equal(chooseAssistantProgressTab({
+    hasBatchContext: true,
+    userSelectedTab: true,
+    currentTab: 'manual'
+  }), 'manual');
+
+  assert.equal(chooseAssistantProgressTab({
+    hasBatchContext: false,
+    userSelectedTab: false,
+    currentTab: 'manual'
+  }), 'manual');
 });
 
 test('buildArchiveExportCsv exports the selected promotion website only', () => {
@@ -94,4 +118,94 @@ test('removeCurrentBatchReportedState clears only the current batch runtime reco
   assert.deepEqual(result.batchResults.map((r) => r.batchId), ['old']);
   assert.deepEqual(result.batchReportedUrls, ['old:0']);
   assert.equal(result.removedBatchResultCount, 1);
+});
+
+test('buildCompactBatchProgress summarizes running batch and estimates finish time', () => {
+  const result = buildCompactBatchProgress({
+    snapshot: {
+      status: 'running',
+      totalCount: 10,
+      currentIndex: 5,
+      successCount: 3,
+      localResults: [{}, {}, {}, {}],
+      batchStartedAt: 1000
+    },
+    now: 61000
+  });
+
+  assert.deepEqual(result, {
+    isBatch: true,
+    status: 'running',
+    total: 10,
+    completed: 4,
+    success: 3,
+    current: 5,
+    percent: 40,
+    etaMs: 90000,
+    etaText: '约 2 分钟后',
+    stageText: '正在处理当前页面'
+  });
+});
+
+test('buildCompactBatchProgress keeps empty and completed states simple', () => {
+  assert.equal(buildCompactBatchProgress({ snapshot: null }).isBatch, false);
+
+  const completed = buildCompactBatchProgress({
+    snapshot: {
+      status: 'completed',
+      totalCount: 2,
+      currentIndex: 2,
+      successCount: 1,
+      localResults: [{}, {}],
+      batchStartedAt: 1000
+    },
+    now: 3000
+  });
+
+  assert.equal(completed.completed, 2);
+  assert.equal(completed.percent, 100);
+  assert.equal(completed.etaText, '已完成');
+});
+test('buildServiceStatusSummary keeps service checks compact', () => {
+  const result = buildServiceStatusSummary({
+    backend: { ok: true },
+    database: { ok: false, error: 'connect ECONNREFUSED' },
+    model: { ok: true, configured: true }
+  });
+
+  assert.equal(result.okCount, 2);
+  assert.equal(result.totalCount, 3);
+  assert.equal(result.allOk, false);
+  assert.deepEqual(result.items.map((item) => item.key), ['backend', 'database', 'model']);
+  assert.equal(result.items[1].status, 'bad');
+});
+
+test('buildAssistantWarning shows first generation failure in red', () => {
+  const result = buildAssistantWarning({
+    firstGenerationFailed: true
+  });
+
+  assert.equal(result.visible, true);
+  assert.equal(result.level, 'error');
+  assert.match(result.text, /AI generation failed/);
+});
+
+test('buildAssistantWarning shows repeated AI copy reuse warning', () => {
+  const result = buildAssistantWarning({
+    sameCopyReuseCount: 3
+  });
+
+  assert.equal(result.visible, true);
+  assert.equal(result.level, 'error');
+  assert.match(result.text, /same AI copy has been reused 3 times/);
+});
+
+test('buildAssistantWarning hides warning after AI generation recovers', () => {
+  const result = buildAssistantWarning({
+    firstGenerationFailed: false,
+    sameCopyReuseCount: 0
+  });
+
+  assert.equal(result.visible, false);
+  assert.equal(result.text, '');
 });

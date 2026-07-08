@@ -34,6 +34,7 @@ app.use('/api', require('./api/deduct-points'));
 app.use('/api', require('./api/refund-points'));
 app.use('/api', batchRouter);
 app.use('/api', require('./api/debug-log'));
+app.use('/api', require('./api/local-status'));
 
 if (ENABLE_PAYMENT) {
   app.use('/api', csvBatchesRouter);

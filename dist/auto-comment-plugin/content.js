@@ -115,9 +115,9 @@
     if (commentForms.size === 0) {
       const forms = Array.from(document.querySelectorAll('form'));
       forms.forEach((form) => {
-        const text = (form.textContent || '').toLowerCase();
-        const className = (form.className || '').toLowerCase();
-        const id = (form.id || '').toLowerCase();
+        const text = safeLowerStringLocal(form.textContent || '');
+        const className = safeLowerStringLocal(form.className || '');
+        const id = safeLowerStringLocal(form.id || '');
 
         const keywords = [
           'deja una respuesta',
@@ -520,6 +520,138 @@
     return '';
   }
 
+  function getReusableCopyKey(text) {
+    const value = String(text || '');
+    return `${value.length}:${value.slice(0, 32)}:${value.slice(-32)}`;
+  }
+
+  async function getBatchAiReuseState() {
+    if (typeof chrome === 'undefined' || !chrome.storage) return {};
+    return new Promise((resolve) => {
+      chrome.storage.local.get([AI_REUSE_STATE_STORAGE_KEY], (data) => {
+        const state = data && data[AI_REUSE_STATE_STORAGE_KEY];
+        resolve(state && typeof state === 'object' ? state : {});
+      });
+    });
+  }
+
+  async function setBatchAiReuseState(patch) {
+    if (typeof chrome === 'undefined' || !chrome.storage) return;
+    const previous = await getBatchAiReuseState();
+    await new Promise((resolve) => {
+      chrome.storage.local.set({
+        [AI_REUSE_STATE_STORAGE_KEY]: {
+          ...previous,
+          ...(patch || {}),
+          updatedAt: Date.now()
+        }
+      }, resolve);
+    });
+  }
+
+  async function rememberSuccessfulBatchAiCopy(text, source) {
+    const value = String(text || '').trim();
+    if (!isUsableGeneratedCopy(value)) return;
+    await setBatchAiReuseState({
+      latestCopy: {
+        text: value,
+        key: getReusableCopyKey(value),
+        sourceUrl: source && source.url ? source.url : location.href,
+        urlIndex: source && source.urlIndex !== undefined ? source.urlIndex : null,
+        savedAt: Date.now()
+      },
+      previousReuseKey: '',
+      previousReuseCount: 0,
+      warning: '',
+      firstGenerationFailed: false
+    });
+  }
+
+  function buildAiReuseStateLocal(input) {
+    const source = input && typeof input === 'object' ? input : {};
+    if (source.aiOk === true) return { action: 'fresh', reuseCount: 0, reuseKey: '', warning: '' };
+    const reusableCopy = source.reusableCopy && typeof source.reusableCopy === 'object' && isUsableGeneratedCopy(source.reusableCopy.text)
+      ? {
+        text: String(source.reusableCopy.text),
+        key: String(source.reusableCopy.key || getReusableCopyKey(source.reusableCopy.text)),
+        sourceUrl: source.reusableCopy.sourceUrl || '',
+        urlIndex: source.reusableCopy.urlIndex
+      }
+      : null;
+    if (!reusableCopy) return { action: 'fail_first_generation', reusableCopy: null, reuseCount: 0, reuseKey: '', warning: 'first_generation_failed' };
+    const previousReuseKey = String(source.previousReuseKey || '');
+    const previousReuseCount = Number(source.previousReuseCount || 0);
+    const reuseCount = previousReuseKey === reusableCopy.key ? Math.max(0, previousReuseCount) + 1 : 1;
+    return {
+      action: 'reuse',
+      reusableCopy,
+      reuseKey: reusableCopy.key,
+      reuseCount,
+      warning: reuseCount >= 3 ? 'same_copy_reused_3_times' : ''
+    };
+  }
+
+  async function getBatchAiCopyAfterGenerationFailure(error, source) {
+    const state = await getBatchAiReuseState();
+    const decision = buildAiReuseStateLocal({
+      aiOk: false,
+      reusableCopy: state.latestCopy || null,
+      previousReuseKey: state.previousReuseKey || '',
+      previousReuseCount: state.previousReuseCount || 0
+    });
+
+    if (decision.action === 'fail_first_generation') {
+      await setBatchAiReuseState({
+        firstGenerationFailed: true,
+        warning: 'first_generation_failed',
+        lastError: error && error.message ? error.message : String(error || 'AI generation failed')
+      });
+      logBatchSubmit('ai.first_generation_warning_shown', {
+        error: error && error.message ? error.message : String(error || 'AI generation failed')
+      });
+      return decision;
+    }
+
+    await setBatchAiReuseState({
+      firstGenerationFailed: false,
+      warning: decision.warning,
+      previousReuseKey: decision.reuseKey,
+      previousReuseCount: decision.reuseCount,
+      lastReuseSourceUrl: decision.reusableCopy.sourceUrl || '',
+      lastReuseSourceIndex: decision.reusableCopy.urlIndex,
+      lastReuseTargetUrl: source && source.url ? source.url : location.href,
+      lastReuseTargetIndex: source && source.urlIndex !== undefined ? source.urlIndex : null
+    });
+    logBatchSubmit('ai.generate_failed_reuse_done', {
+      reusedContentLength: decision.reusableCopy.text.length,
+      reuseSourceUrl: decision.reusableCopy.sourceUrl || '',
+      reuseSourceIndex: decision.reusableCopy.urlIndex,
+      reuseCount: decision.reuseCount,
+      warning: decision.warning
+    });
+    if (decision.warning) {
+      logBatchSubmit('ai.reuse_warning_shown', {
+        warning: decision.warning,
+        reuseCount: decision.reuseCount
+      });
+    }
+    return decision;
+  }
+
+  function getCommentFieldHtml(field) {
+    if (!field) return '';
+    if (field._isWpDiscuz && field._realElement) {
+      return (field._realElement.innerHTML || field._realElement.textContent || '').trim();
+    }
+    if (typeof field.value === 'string') {
+      return field.value.trim();
+    }
+    if (field.innerHTML) {
+      return field.innerHTML.trim();
+    }
+    return getCommentFieldText(field);
+  }
+
   function fillSpecificCommentTextarea(commentTextarea, commentText, options = {}) {
     if (!commentTextarea || !commentText) return false;
     if (commentTextarea._isWpDiscuz && commentTextarea._realElement) {
@@ -890,6 +1022,13 @@
         errorMessage: 'no usable comment input found'
       };
     }
+    if (!hasForm && !hasTextarea && usableCommentFieldCount <= 0 && !hasEmbeddedCommentSignal) {
+      return {
+        shouldStop: true,
+        result: 'no_comment_box',
+        errorMessage: 'no comment form found'
+      };
+    }
     return {
       shouldStop: false,
       result: '',
@@ -923,7 +1062,7 @@
   }
 
   function isConfirmedBatchSuccessRecord(record, url, promotionWebsiteUrl) {
-    if (!record || record.result !== 'success') return false;
+    if (!record || (record.result !== 'success' && record.result !== 'success_pending_moderation')) return false;
     if (url && record.url !== url) return false;
     if (!isSamePromotionWebsite(record.promotionWebsiteUrl, promotionWebsiteUrl)) return false;
     const currentPromotionKey = normalizePromotionWebsiteKey(promotionWebsiteUrl);
@@ -954,6 +1093,83 @@
     }
   }
 
+  function stripHashFromUrlLocal(url) {
+    const raw = String(url || '').trim();
+    if (!raw) return '';
+    try {
+      const parsed = new URL(raw, location.origin || 'https://placeholder.invalid/');
+      parsed.hash = '';
+      return parsed.href;
+    } catch (_) {
+      return raw.replace(/#.*$/, '');
+    }
+  }
+
+  function hasCommentAnchorUrlLocal(url) {
+    return /#comment-\d+\b/i.test(String(url || ''));
+  }
+
+  function chooseBacklinkVerificationUrlLocal(input) {
+    const source = input && typeof input === 'object' ? input : {};
+    const originalUrl = String(source.originalUrl || source.verificationUrl || '').trim();
+    const currentUrl = String(source.currentUrl || source.pageUrl || '').trim();
+    const privateModerationPreview = isPrivateModerationPreviewUrlLocal(currentUrl);
+    if (privateModerationPreview) {
+      return {
+        verificationUrl: stripHashFromUrlLocal(currentUrl) || originalUrl,
+        currentUrl,
+        privateModerationPreview: true,
+        reason: 'private_moderation_preview_page'
+      };
+    }
+    if (currentUrl && hasCommentAnchorUrlLocal(currentUrl) && currentUrl !== originalUrl) {
+      return {
+        verificationUrl: stripHashFromUrlLocal(currentUrl),
+        currentUrl,
+        privateModerationPreview: false,
+        reason: 'current_comment_anchor_page'
+      };
+    }
+    return {
+      verificationUrl: originalUrl || stripHashFromUrlLocal(currentUrl),
+      currentUrl,
+      privateModerationPreview: false,
+      reason: 'original_or_current_url'
+    };
+  }
+
+  function buildBacklinkVerificationTargetsLocal(input) {
+    const source = input && typeof input === 'object' ? input : {};
+    const originalUrl = String(source.originalUrl || source.verificationUrl || '').trim();
+    const primary = chooseBacklinkVerificationUrlLocal(source);
+    const targets = [];
+    const seen = new Set();
+
+    function addTarget(target) {
+      const verificationUrl = String(target && target.verificationUrl || '').trim();
+      if (!verificationUrl || seen.has(verificationUrl)) return;
+      seen.add(verificationUrl);
+      targets.push(target);
+    }
+
+    addTarget(primary);
+
+    if (
+      originalUrl &&
+      primary.reason === 'current_comment_anchor_page' &&
+      primary.verificationUrl !== originalUrl
+    ) {
+      addTarget({
+        verificationUrl: originalUrl,
+        currentUrl: primary.currentUrl,
+        privateModerationPreview: false,
+        reason: 'original_url_fallback'
+      });
+    }
+
+    return targets;
+  }
+
   async function generatePromotionCopyWithRetry(maxAttempts = 3) {
     let lastError = null;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -963,6 +1179,12 @@
         if (isUsableGeneratedCopy(text)) {
           lastGeneratedPromotionCopy = String(text).trim();
           lastGeneratedPromotionCopyKey = await getGenerationCacheKey();
+          if (maxAttempts <= 1 && _batchCtx) {
+            await rememberSuccessfulBatchAiCopy(lastGeneratedPromotionCopy, {
+              url: _batchCtx.url,
+              urlIndex: _batchCtx.urlIndex
+            });
+          }
           return lastGeneratedPromotionCopy;
         }
         lastError = new Error('AI generated empty or unusable copy');
@@ -972,6 +1194,18 @@
       }
       if (attempt < maxAttempts) {
         await new Promise((resolve) => setTimeout(resolve, 1200 * attempt));
+      }
+    }
+    if (maxAttempts <= 1 && _batchCtx) {
+      logBatchSubmit('ai.generate_failed_reuse_start', {
+        error: lastError && lastError.message ? lastError.message : 'AI copy generation failed'
+      });
+      const reuseDecision = await getBatchAiCopyAfterGenerationFailure(lastError || new Error('AI copy generation failed'), {
+        url: _batchCtx.url,
+        urlIndex: _batchCtx.urlIndex
+      });
+      if (reuseDecision.action === 'reuse') {
+        return reuseDecision.reusableCopy.text;
       }
     }
     throw lastError || new Error('AI copy generation failed');
@@ -989,11 +1223,13 @@
   const USER_ID_STORAGE_KEY = 'auto_comment_user_id';
   const DEFAULT_LOCAL_USER_ID = 'local-user';
   const PROMPT_FIELD_VALUES_STORAGE_KEY = 'auto_fill_prompt_field_values';
+  const AI_REUSE_STATE_STORAGE_KEY = 'batch_ai_reuse_state_v1';
 
   // ====== 批量任务设置（从 storage.local 读取）======
   const BATCH_SETTINGS_KEY = 'batch_task_settings';
   const BATCH_URLS_KEY = 'batch_task_urls';
   const BATCH_PENDING_TASK_KEY = 'batch_pending_task';
+  const BATCH_RUNTIME_STATE_KEY = 'batch_runtime_state_v1';
 
   // ====== 积分系统配置 ======
   const POINTS_API_BASE = API_BASE;
@@ -1008,6 +1244,37 @@
   const BATCH_SUCCESS_CONFIRMATION_MARKER = 'submit-confirmed-v3';
   const BATCH_PENDING_TASK_TTL_MS = 10 * 60 * 1000;
   const AI_COPY_REQUEST_TIMEOUT_MS = 45 * 1000;
+
+  function safeLowerStringLocal(value) {
+    if (value == null) return '';
+    return String(value).toLowerCase();
+  }
+
+  function normalizeHostForCompareLocal(value) {
+    const raw = String(value || '').trim();
+    if (!raw) return '';
+    try {
+      return new URL(/^https?:\/\//i.test(raw) ? raw : `https://${raw}`).hostname.replace(/^www\./i, '').toLowerCase();
+    } catch (_) {
+      return raw.replace(/^https?:\/\//i, '').replace(/^www\./i, '').split(/[/?#:]/)[0].toLowerCase();
+    }
+  }
+
+  function classifyDomainDriftLocal(input) {
+    const source = input && typeof input === 'object' ? input : {};
+    const originalHost = normalizeHostForCompareLocal(source.originalUrl);
+    const currentHost = normalizeHostForCompareLocal(source.currentUrl);
+    if (!originalHost || !currentHost || originalHost === currentHost) {
+      return { drifted: false, result: '', errorMessage: '', originalHost, currentHost };
+    }
+    return {
+      drifted: true,
+      result: 'fail',
+      errorMessage: `target page drifted from ${originalHost} to ${currentHost}`,
+      originalHost,
+      currentHost
+    };
+  }
 
   function buildBatchConfirmPayloadLocal(input) {
     const payload = {
@@ -1025,7 +1292,7 @@
       matchedHref: input.matchedHref || '',
       linkVerification: input.linkVerification || null
     };
-    if (payload.result === 'success') {
+    if (payload.result === 'success' || payload.result === 'success_pending_moderation') {
       payload.confirmedBy = BATCH_SUCCESS_CONFIRMATION_MARKER;
       payload.confirmedAt = input.confirmedAt || Date.now();
     }
@@ -1171,6 +1438,44 @@
     } catch (_) {
       return { raw, normalizedUrl: '', hostname: '', pathname: '/', valid: false };
     }
+  }
+
+  function validateCommentReadyForSubmitLocal(input) {
+    const source = input && typeof input === 'object' ? input : {};
+    const expectedText = String(source.expectedText || '');
+    const actualText = String(source.actualText || '');
+    const actualHtml = String(source.actualHtml || '');
+    const promotion = normalizePromotionTargetLocal(source.promotionUrl || '');
+    const expectedLength = expectedText.trim().length;
+    const actualLength = actualText.trim().length;
+    const minLength = expectedLength > 0 ? Math.max(5, Math.floor(expectedLength * 0.85)) : 5;
+    const searchable = `${actualText}\n${actualHtml}`.toLowerCase();
+    const promotionHost = promotion.hostname || '';
+    const hostFound = !!promotionHost && searchable.includes(promotionHost.toLowerCase());
+    const lengthOk = actualLength >= minLength;
+    const ok = lengthOk && hostFound;
+    let reason = 'ready';
+    if (!lengthOk) reason = 'comment_text_too_short';
+    else if (!hostFound) reason = 'promotion_host_missing';
+    return {
+      ok,
+      reason,
+      expectedLength,
+      actualLength,
+      minLength,
+      promotionHost,
+      hostFound,
+      lengthOk
+    };
+  }
+
+  function chooseCommentReadyRecoveryActionLocal(input) {
+    const source = input && typeof input === 'object' ? input : {};
+    if (source.ready === true) return 'none';
+    const attempts = Number(source.attempts);
+    if (!Number.isFinite(attempts) || attempts <= 0) return 'segmented_refill';
+    if (attempts === 1) return 'direct_set_value';
+    return 'fail';
   }
 
   function extractAnchorHrefsLocal(html) {
@@ -1754,9 +2059,9 @@
     document.addEventListener('submit', (event) => {
       const form = event.target;
       const isCommentForm = form && (
-        form.id?.toLowerCase().includes('comment') ||
-        form.className?.toLowerCase().includes('comment') ||
-        form.method?.toLowerCase() === 'post'
+        safeLowerStringLocal(form.id).includes('comment') ||
+        safeLowerStringLocal(form.className).includes('comment') ||
+        safeLowerStringLocal(form.method) === 'post'
       );
 
       if (isCommentForm) {
@@ -1776,6 +2081,7 @@
 
   function setBatchContext(batchId, urlIndex, url) {
     _batchCtx = { batchId, urlIndex, url };
+    activateQwenProgressTabForBatch();
   }
 
   function getBatchTaskKey(batchId, urlIndex) {
@@ -1867,8 +2173,8 @@
           promotionWebsiteUrl,
           promotionWebsiteKey: normalizePromotionWebsiteKey(promotionWebsiteUrl),
           copyPromotionWebsiteKey: normalizePromotionWebsiteKey(promotionWebsiteUrl),
-          confirmedBy: result === 'success' ? BATCH_SUCCESS_CONFIRMATION_MARKER : '',
-          confirmedAt: result === 'success' ? Date.now() : null,
+          confirmedBy: (result === 'success' || result === 'success_pending_moderation') ? BATCH_SUCCESS_CONFIRMATION_MARKER : '',
+          confirmedAt: (result === 'success' || result === 'success_pending_moderation') ? Date.now() : null,
           timestamp: Date.now()
         }
       }, resolve);
@@ -1913,9 +2219,44 @@
 
     console.log('[AutoComment] 恢复提交后上下文，仅补发确认，不重新生成AI:', ctx);
     const promotionUrl = ctx.promotionWebsiteUrl || await getWebsiteUrl();
-    const verificationUrl = ctx.url || location.href;
-    const html = await getCurrentPageHtmlForVerification(verificationUrl);
-    const linkVerification = verifyBacklinkInHtmlLocal(html, promotionUrl);
+    const verificationTargets = buildBacklinkVerificationTargetsLocal({
+      originalUrl: ctx.url || '',
+      currentUrl: location.href
+    });
+    if (!verificationTargets.length) {
+      verificationTargets.push({
+        verificationUrl: ctx.url || location.href,
+        currentUrl: location.href,
+        privateModerationPreview: false,
+        reason: 'fallback_context_url'
+      });
+    }
+    let verificationTarget = verificationTargets[0];
+    let verificationUrl = verificationTarget.verificationUrl || ctx.url || location.href;
+    let linkVerification = null;
+    const verificationAttempts = [];
+    for (const target of verificationTargets) {
+      const targetUrl = target.verificationUrl || ctx.url || location.href;
+      const html = await getCurrentPageHtmlForVerification(targetUrl);
+      const attemptVerification = verifyBacklinkInHtmlLocal(html, promotionUrl);
+      verificationAttempts.push({
+        verificationUrl: targetUrl,
+        reason: target.reason,
+        privateModerationPreview: !!target.privateModerationPreview,
+        linkVerified: attemptVerification.linkVerified,
+        matchedHref: attemptVerification.matchedHref || '',
+        candidateCount: attemptVerification.candidateCount,
+        hostMatchedCount: attemptVerification.hostMatchedCount,
+        verificationReason: attemptVerification.reason
+      });
+      verificationTarget = target;
+      verificationUrl = targetUrl;
+      linkVerification = attemptVerification;
+      if (attemptVerification.linkVerified) break;
+    }
+    if (!linkVerification) {
+      linkVerification = verifyBacklinkInHtmlLocal('', promotionUrl);
+    }
     const restoredEvidence = {
       explicitError: detectCommentSubmitError(),
       successMessageFound: !!detectSubmitSuccessMessage(),
@@ -1923,8 +2264,10 @@
     };
     const restoredOutcome = linkVerification.linkVerified
       ? {
-          result: 'success',
-          reason: 'backlink_anchor_found_after_restore',
+          result: verificationTarget.privateModerationPreview ? 'success_pending_moderation' : 'success',
+          reason: verificationTarget.privateModerationPreview
+            ? 'backlink_anchor_found_in_moderation_preview_after_restore'
+            : 'backlink_anchor_found_after_restore',
           confidence: 'strong',
           linkVerification
         }
@@ -1936,7 +2279,7 @@
     }
     restoredOutcome.linkVerification = linkVerification;
     const restoredResult = restoredOutcome.result;
-    const restoredError = restoredResult === 'success' ? null : restoredOutcome.reason;
+    const restoredError = (restoredResult === 'success' || restoredResult === 'success_pending_moderation') ? null : restoredOutcome.reason;
 
     logBatchSubmit('submit.restore_outcome', {
       batchId: ctx.batchId,
@@ -1950,7 +2293,10 @@
       commentAppeared: restoredEvidence.commentAppeared,
       verificationUrl,
       currentPageUrl: location.href,
-      privateModerationPreview: isPrivateModerationPreviewUrlLocal(location.href),
+      verificationChoiceReason: verificationTarget.reason,
+      verificationAttemptCount: verificationAttempts.length,
+      verificationAttempts,
+      privateModerationPreview: verificationTarget.privateModerationPreview,
       linkVerified: linkVerification.linkVerified,
       matchedHref: linkVerification.matchedHref
     });
@@ -2097,7 +2443,8 @@
         throw new Error('form fill failed: ' + (fillCheck.missingFields || []).join(', '));
       }
 
-      assertCommentReadyForSubmit(promotionText, form, ta);
+      const promotionWebsiteForSubmit = await getWebsiteUrl();
+      assertCommentReadyForSubmit(promotionText, form, ta, promotionWebsiteForSubmit);
 
       const manualCheckBeforeSubmit = detectManualRequiredChallenge();
       if (manualCheckBeforeSubmit.found) {
@@ -2629,10 +2976,10 @@
     if (commentForms.size === 0) {
       const forms = Array.from(document.querySelectorAll('form'));
       forms.forEach((form) => {
-        const text = (form.textContent || '').toLowerCase();
-        const className = (form.className || '').toLowerCase();
-        const id = (form.id || '').toLowerCase();
-        const action = (form.action || '').toString().toLowerCase();
+        const text = safeLowerStringLocal(form.textContent || '');
+        const className = safeLowerStringLocal(form.className || '');
+        const id = safeLowerStringLocal(form.id || '');
+        const action = safeLowerStringLocal(form.action || '');
 
         // WordPress 和其他评论表单关键词（增强：添加泰语/葡萄牙语/西班牙语关键词）
         const keywords = [
@@ -2979,8 +3326,8 @@
     // 备用：查找所有 contenteditable 元素并筛选
     const allEditable = document.querySelectorAll('[contenteditable="true"]');
     for (const el of allEditable) {
-      const className = (el.className || '').toLowerCase();
-      const id = (el.id || '').toLowerCase();
+      const className = safeLowerStringLocal(el.className || '');
+      const id = safeLowerStringLocal(el.id || '');
       const parent = el.closest('#comments, .comments, .comment-section');
       
       if (isLikelyWpDiscuzEditorCandidateLocal(el) &&
@@ -3049,9 +3396,9 @@
     // ── 方案D：直接找页面所有表单中含 comment/respond 关键词的 ─
     const allForms = Array.from(document.querySelectorAll('form'));
     for (const f of allForms) {
-      const text = (f.textContent || '').toLowerCase();
-      const cls = (f.className || '').toLowerCase();
-      const fid = (f.id || '').toLowerCase();
+      const text = safeLowerStringLocal(f.textContent || '');
+      const cls = safeLowerStringLocal(f.className || '');
+      const fid = safeLowerStringLocal(f.id || '');
       if (text.includes('comment') || text.includes('respond') ||
           cls.includes('comment') || fid.includes('comment') ||
           cls.includes('respond') || fid.includes('respond')) {
@@ -3097,9 +3444,9 @@
     // 方法3: 通过关键词文本查找
     const forms = Array.from(document.querySelectorAll('form'));
     for (const form of forms) {
-      const text = (form.textContent || '').toLowerCase();
-      const className = (form.className || '').toLowerCase();
-      const id = (form.id || '').toLowerCase();
+      const text = safeLowerStringLocal(form.textContent || '');
+      const className = safeLowerStringLocal(form.className || '');
+      const id = safeLowerStringLocal(form.id || '');
 
       const keywords = [
         'comment', 'reply', 'respond', '留言', '评论', '回复',
@@ -3385,7 +3732,7 @@
 
   function chooseInitialStopReportModeLocal(input) {
     const source = input && typeof input === 'object' ? input : {};
-    return source.result === 'manual_required' ? 'confirm_and_close' : 'report_only';
+    return source.result ? 'confirm_and_close' : 'report_only';
   }
 
   function isButtonClickable(button) {
@@ -3662,7 +4009,7 @@
         error: error && error.message ? error.message : String(error)
       });
     }
-    if (!isVerifyingCurrentPage || isPrivatePreview) {
+    if (!isVerifyingCurrentPage) {
       return '';
     }
     return domHtml;
@@ -3728,19 +4075,25 @@
     }
 
     const promotionWebsiteUrl = await getWebsiteUrl();
-    const verificationUrl = beforeUrl || (_batchCtx && _batchCtx.url) || location.href;
+    const verificationTarget = chooseBacklinkVerificationUrlLocal({
+      originalUrl: beforeUrl || (_batchCtx && _batchCtx.url) || '',
+      currentUrl: location.href
+    });
+    const verificationUrl = verificationTarget.verificationUrl || beforeUrl || (_batchCtx && _batchCtx.url) || location.href;
     logBatchSubmit('verify.link_start', {
       promotionHost: normalizePromotionTargetLocal(promotionWebsiteUrl).hostname,
       verificationUrl,
+      verificationChoiceReason: verificationTarget.reason,
       currentPageUrl: location.href,
-      privateModerationPreview: isPrivateModerationPreviewUrlLocal(location.href)
+      privateModerationPreview: verificationTarget.privateModerationPreview
     });
     const latestHtml = await getCurrentPageHtmlForVerification(verificationUrl);
     const linkVerification = verifyBacklinkInHtmlLocal(latestHtml, promotionWebsiteUrl);
     logBatchSubmit('verify.link_done', {
       verificationUrl,
+      verificationChoiceReason: verificationTarget.reason,
       currentPageUrl: location.href,
-      privateModerationPreview: isPrivateModerationPreviewUrlLocal(location.href),
+      privateModerationPreview: verificationTarget.privateModerationPreview,
       linkVerified: linkVerification.linkVerified,
       promotionHost: linkVerification.promotionHost,
       candidateCount: linkVerification.candidateCount,
@@ -3752,8 +4105,10 @@
 
     if (linkVerification.linkVerified) {
       return {
-        result: 'success',
-        reason: 'backlink_anchor_found',
+        result: verificationTarget.privateModerationPreview ? 'success_pending_moderation' : 'success',
+        reason: verificationTarget.privateModerationPreview
+          ? 'backlink_anchor_found_in_moderation_preview'
+          : 'backlink_anchor_found',
         confidence: 'strong',
         linkVerification
       };
@@ -3821,6 +4176,8 @@
   function createSubmitOrNavigateWatcher(timeoutMs = 10000) {
     return new Promise((resolve) => {
       let resolved = false;
+      let submitSignalSeen = false;
+      let submitSignalSource = '';
       function finish(result) {
         if (resolved) return;
         resolved = true;
@@ -3861,7 +4218,18 @@
       window.addEventListener('beforeunload', onBeforeUnload);
       window.addEventListener('pagehide', onPageHide);
 
-      const timer = setTimeout(() => finish('timeout'), timeoutMs);
+      const timer = setTimeout(() => {
+        if (submitSignalSeen) {
+          logBatchSubmit('submit.watcher_submit_signal_only', {
+            submitSignalSource,
+            timeoutMs,
+            currentUrl: location.href
+          });
+          finish('ajax');
+          return;
+        }
+        finish('timeout');
+      }, timeoutMs);
     }).then((result) => result);
   }
 
@@ -3887,19 +4255,25 @@
         window.removeEventListener('beforeunload', onBeforeUnload);
         window.removeEventListener('pagehide', onPageHide);
       }
-      function onSubmit(e) { finish('ajax'); }
+      function recordSubmitSignal(source) {
+        submitSignalSeen = true;
+        submitSignalSource = submitSignalSource || source;
+      }
+      function onSubmit(e) {
+        recordSubmitSignal(e && e.defaultPrevented ? 'submit-prevented' : 'submit');
+      }
       function onBeforeUnload() { finish('navigating'); }
       function onPageHide(e) { finish(e.persisted ? 'pagehide' : 'pagehide'); }
 
       const originalFetch = window.fetch;
       window.fetch = function(input, init) {
-        if (!resolved && isFormSubmitUrl(input)) finish('ajax');
+        if (!resolved && isFormSubmitUrl(input)) recordSubmitSignal('fetch-submit');
         return originalFetch.apply(this, arguments);
       };
 
       const originalXHROpen = window.XMLHttpRequest.prototype.open;
       window.XMLHttpRequest.prototype.open = function(method, url, ...rest) {
-        if (!resolved && isFormSubmitUrl(url)) finish('ajax');
+        if (!resolved && isFormSubmitUrl(url)) recordSubmitSignal('xhr-submit');
         return originalXHROpen.call(this, method, url, ...rest);
       };
 
@@ -4449,26 +4823,71 @@
     return await fillSpecificCommentTextareaHumanLike(targetTextarea, promotionText, options);
   }
 
-  function assertCommentReadyForSubmit(expectedText, preferredForm = null, preferredTextarea = null) {
+  function assertCommentReadyForSubmit(expectedText, preferredForm = null, preferredTextarea = null, promotionUrl = '') {
     const form = preferredForm || findCommentForm();
+    const expected = String(expectedText || '').trim();
     let textarea = preferredTextarea || null;
     if (form) {
       const formTextarea = getCommentTextareaFromForm(form) || form.querySelector('textarea');
-      if (formTextarea) textarea = formTextarea;
+      if (formTextarea && formTextarea !== preferredTextarea) {
+        const preferredValue = getCommentFieldText(preferredTextarea);
+        const preferredHtml = getCommentFieldHtml(preferredTextarea);
+        const preferredValidation = validateCommentReadyForSubmitLocal({
+          expectedText: expected,
+          actualText: preferredValue,
+          actualHtml: preferredHtml,
+          promotionUrl
+        });
+        const fallbackValue = getCommentFieldText(formTextarea);
+        const fallbackHtml = getCommentFieldHtml(formTextarea);
+        const fallbackValidation = validateCommentReadyForSubmitLocal({
+          expectedText: expected,
+          actualText: fallbackValue,
+          actualHtml: fallbackHtml,
+          promotionUrl
+        });
+        logBatchSubmit('submit.textarea_choice', {
+          choice: preferredValidation.ok ? 'preferred' : 'form',
+          preferredId: preferredTextarea && preferredTextarea.id ? preferredTextarea.id : '',
+          preferredName: preferredTextarea && preferredTextarea.name ? preferredTextarea.name : '',
+          preferredLength: preferredValue.length,
+          preferredReady: preferredValidation.ok,
+          preferredReason: preferredValidation.reason,
+          fallbackId: formTextarea && formTextarea.id ? formTextarea.id : '',
+          fallbackName: formTextarea && formTextarea.name ? formTextarea.name : '',
+          fallbackLength: fallbackValue.length,
+          fallbackReady: fallbackValidation.ok,
+          fallbackReason: fallbackValidation.reason
+        });
+        if (!preferredValidation.ok) textarea = formTextarea;
+      } else if (formTextarea) {
+        textarea = formTextarea;
+      }
     }
     if (!textarea) {
       textarea = findLikelyCommentTextarea({ allowGenericFallback: true });
     }
 
     const value = getCommentFieldText(textarea);
-    const expected = String(expectedText || '').trim();
+    const html = getCommentFieldHtml(textarea);
+    const validation = validateCommentReadyForSubmitLocal({
+      expectedText: expected,
+      actualText: value,
+      actualHtml: html,
+      promotionUrl
+    });
     console.log('[AutoComment] pre-submit comment check:', {
       hasForm: !!form,
       hasTextarea: !!textarea,
       valueLen: value.length,
+      htmlLen: html.length,
       expectedLen: expected.length,
       textareaId: textarea && textarea.id,
-      textareaName: textarea && textarea.name
+      textareaName: textarea && textarea.name,
+      ready: validation.ok,
+      reason: validation.reason,
+      hostFound: validation.hostFound,
+      promotionHost: validation.promotionHost
     });
 
     if (!expected || expected.length < 10) {
@@ -4477,10 +4896,78 @@
     if (!textarea || value.length < 5) {
       throw new Error('comment textarea is empty before submit');
     }
-    if (value !== expected && !value.includes(expected.slice(0, Math.min(40, expected.length)))) {
-      throw new Error('comment textarea does not contain generated AI content before submit');
+    if (!validation.ok) {
+      logBatchSubmit('submit.ready_check_failed', validation);
+      throw new Error('comment textarea is not ready before submit: ' + validation.reason);
     }
-    return true;
+    return validation;
+  }
+
+  async function ensureCommentReadyForSubmitWithRecovery(expectedText, preferredForm = null, preferredTextarea = null, promotionUrl = '', fillOptions = {}, stagePrefix = 'submit.ready') {
+    let textarea = preferredTextarea || findLikelyCommentTextarea({ allowGenericFallback: true });
+    let lastError = null;
+
+    for (let attempts = 0; attempts < 3; attempts++) {
+      try {
+        const validation = assertCommentReadyForSubmit(expectedText, preferredForm, textarea, promotionUrl);
+        logBatchSubmit(`${stagePrefix}_check_done`, {
+          ...validation,
+          recoveryAttempts: attempts,
+          recoveryAction: chooseCommentReadyRecoveryActionLocal({ ready: true, attempts })
+        });
+        return validation;
+      } catch (error) {
+        lastError = error;
+        const currentText = getCommentFieldText(textarea);
+        const currentHtml = getCommentFieldHtml(textarea);
+        const validation = validateCommentReadyForSubmitLocal({
+          expectedText,
+          actualText: currentText,
+          actualHtml: currentHtml,
+          promotionUrl
+        });
+        const action = chooseCommentReadyRecoveryActionLocal({
+          ready: validation.ok,
+          attempts
+        });
+        logBatchSubmit(`${stagePrefix}_check_failed`, {
+          ...validation,
+          recoveryAttempts: attempts,
+          recoveryAction: action,
+          error: error && error.message ? error.message : String(error || '')
+        });
+
+        if (action === 'segmented_refill') {
+          textarea = textarea || findLikelyCommentTextarea({ allowGenericFallback: true });
+          const retryFillResult = await fillSpecificCommentTextareaHumanLike(textarea, expectedText, fillOptions);
+          logBatchSubmit(`${stagePrefix}_segmented_refill_done`, {
+            success: !!(retryFillResult && retryFillResult.success),
+            strategy: retryFillResult && retryFillResult.strategy ? retryFillResult.strategy : '',
+            chars: retryFillResult && Number.isFinite(retryFillResult.chars) ? retryFillResult.chars : 0,
+            durationMs: retryFillResult && Number.isFinite(retryFillResult.durationMs) ? retryFillResult.durationMs : 0,
+            error: retryFillResult && retryFillResult.error ? retryFillResult.error : '',
+            filledLength: textarea ? getCommentFieldText(textarea).length : 0
+          });
+          await new Promise(resolve => setTimeout(resolve, 150));
+          continue;
+        }
+
+        if (action === 'direct_set_value') {
+          textarea = textarea || findLikelyCommentTextarea({ allowGenericFallback: true });
+          const directFilled = fillSpecificCommentTextarea(textarea, expectedText);
+          logBatchSubmit(`${stagePrefix}_direct_refill_done`, {
+            success: !!directFilled,
+            filledLength: textarea ? getCommentFieldText(textarea).length : 0
+          });
+          await new Promise(resolve => setTimeout(resolve, 150));
+          continue;
+        }
+
+        break;
+      }
+    }
+
+    throw lastError || new Error('comment textarea is not ready before submit');
   }
 
   async function findCommentTargetsForBatchUsingManualFlow(timeoutMs = 12000) {
@@ -4642,9 +5129,9 @@
     if (!form) {
       const allForms = Array.from(document.querySelectorAll('form'));
       for (const f of allForms) {
-        const text = (f.textContent || '').toLowerCase();
-        const cls = (f.className || '').toLowerCase();
-        const fid = (f.id || '').toLowerCase();
+        const text = safeLowerStringLocal(f.textContent || '');
+        const cls = safeLowerStringLocal(f.className || '');
+        const fid = safeLowerStringLocal(f.id || '');
         if (text.includes('comment') || text.includes('respond') ||
             cls.includes('comment') || fid.includes('comment') ||
             cls.includes('respond') || fid.includes('respond')) {
@@ -4966,11 +5453,100 @@
 
   // ====== 页面内浮动窗口 UI ======
   let qwenPanelEl = null;
+  let qwenProgressTimer = null;
+
+  function formatCompactBatchEtaLocal(ms) {
+    const value = Number(ms);
+    if (!Number.isFinite(value) || value < 0) return '估算中';
+    const minutes = Math.max(1, Math.ceil(value / 60000));
+    if (minutes < 60) return `约 ${minutes} 分钟后`;
+    const hours = Math.floor(minutes / 60);
+    const rest = minutes % 60;
+    return rest > 0 ? `约 ${hours} 小时 ${rest} 分钟后` : `约 ${hours} 小时后`;
+  }
+
+  function buildCompactBatchProgressLocal(snapshot, now = Date.now()) {
+    if (!snapshot || typeof snapshot !== 'object' || (!snapshot.batchId && !snapshot.totalCount)) {
+      return { isBatch: false };
+    }
+    const total = Math.max(0, Number(snapshot.totalCount || 0));
+    const completed = Math.min(total, Math.max(0, Array.isArray(snapshot.localResults)
+      ? snapshot.localResults.length
+      : Number(snapshot.completedCount || 0)));
+    const success = Math.max(0, Number(snapshot.successCount || 0));
+    const currentRaw = Number(snapshot.currentIndex || 0);
+    const current = total > 0 ? Math.min(total, Math.max(1, currentRaw)) : 0;
+    const percent = total > 0 ? Math.round((completed / total) * 100) : 0;
+    const status = String(snapshot.status || 'idle');
+    const startedAt = Number(snapshot.batchStartedAt || snapshot.startedAt || 0);
+    let etaText = '估算中';
+    if (status === 'completed' || (total > 0 && completed >= total)) {
+      etaText = '已完成';
+    } else if (startedAt > 0 && completed > 0 && total > completed) {
+      const elapsedMs = Math.max(0, Number(now || Date.now()) - startedAt);
+      etaText = formatCompactBatchEtaLocal((elapsedMs / completed) * (total - completed));
+    }
+    return {
+      isBatch: true,
+      status,
+      total,
+      completed,
+      success,
+      current,
+      percent,
+      etaText,
+      stageText: status === 'running'
+        ? '正在处理当前页面'
+        : (status === 'terminated' ? '任务已暂停' : (status === 'completed' ? '任务已完成' : '等待开始'))
+    };
+  }
+
+  function chooseAssistantProgressTabLocal(input) {
+    const source = input && typeof input === 'object' ? input : {};
+    const currentTab = source.currentTab === 'progress' ? 'progress' : 'manual';
+    if (source.hasBatchContext === true && source.userSelectedTab !== true) return 'progress';
+    return currentTab;
+  }
+
+  function buildAssistantWarningLocal(input) {
+    const source = input && typeof input === 'object' ? input : {};
+    if (source.firstGenerationFailed === true || source.warning === 'first_generation_failed') {
+      return {
+        visible: true,
+        text: 'AI generation failed and no reusable copy is available. Check the local backend or model service.'
+      };
+    }
+    const reuseCount = Number(source.previousReuseCount || source.reuseCount || 0);
+    if (source.warning === 'same_copy_reused_3_times' || reuseCount >= 3) {
+      return {
+        visible: true,
+        text: `The same AI copy has been reused ${Math.max(3, reuseCount)} times. Check the local backend or model service.`
+      };
+    }
+    return { visible: false, text: '' };
+  }
+
+  function activateQwenProgressTabForBatch() {
+    if (!qwenPanelEl || !qwenPanelEl.parentNode || typeof qwenPanelEl._qwenSetActiveTab !== 'function') return;
+    const nextTab = chooseAssistantProgressTabLocal({
+      hasBatchContext: !!_batchCtx,
+      userSelectedTab: qwenPanelEl._qwenUserSelectedTab === true,
+      currentTab: qwenPanelEl._qwenActiveTab || 'manual'
+    });
+    qwenPanelEl._qwenSetActiveTab(nextTab);
+    if (typeof qwenPanelEl._qwenRefreshBatchProgress === 'function') {
+      qwenPanelEl._qwenRefreshBatchProgress();
+    }
+  }
 
   function createOrToggleQwenPanel() {
     if (qwenPanelEl && qwenPanelEl.parentNode) {
       qwenPanelEl.parentNode.removeChild(qwenPanelEl);
       qwenPanelEl = null;
+      if (qwenProgressTimer) {
+        clearInterval(qwenProgressTimer);
+        qwenProgressTimer = null;
+      }
       return;
     }
 
@@ -5018,9 +5594,39 @@
     closeBtn.addEventListener('click', () => {
       if (panel.parentNode) panel.parentNode.removeChild(panel);
       qwenPanelEl = null;
+      if (qwenProgressTimer) {
+        clearInterval(qwenProgressTimer);
+        qwenProgressTimer = null;
+      }
     });
 
     header.appendChild(closeBtn);
+
+    const tabBar = document.createElement('div');
+    tabBar.style.display = 'flex';
+    tabBar.style.gap = '6px';
+    tabBar.style.padding = '8px 12px 0';
+    tabBar.style.borderBottom = '1px solid rgba(148,163,184,0.16)';
+
+    const manualTab = document.createElement('button');
+    manualTab.type = 'button';
+    manualTab.textContent = '手动助手';
+    const progressTab = document.createElement('button');
+    progressTab.type = 'button';
+    progressTab.textContent = '批量进度';
+    [manualTab, progressTab].forEach((tab) => {
+      tab.style.border = '1px solid rgba(148,163,184,0.35)';
+      tab.style.borderBottom = 'none';
+      tab.style.borderRadius = '8px 8px 0 0';
+      tab.style.background = 'rgba(15,23,42,0.55)';
+      tab.style.color = '#cbd5e1';
+      tab.style.cursor = 'pointer';
+      tab.style.fontSize = '12px';
+      tab.style.padding = '6px 10px';
+      tab.style.lineHeight = '1';
+    });
+    tabBar.appendChild(manualTab);
+    tabBar.appendChild(progressTab);
 
     const body = document.createElement('div');
     body.style.padding = '10px 12px 12px';
@@ -5098,8 +5704,90 @@
     body.appendChild(statusEl);
     body.appendChild(textarea);
 
+    const progressPane = document.createElement('div');
+    progressPane.style.padding = '10px 12px 12px';
+    progressPane.style.display = 'none';
+    progressPane.style.flexDirection = 'column';
+    progressPane.style.gap = '8px';
+    progressPane.style.fontSize = '12px';
+
+    const progressTitle = document.createElement('div');
+    progressTitle.textContent = '批量进度';
+    progressTitle.style.fontSize = '12px';
+    progressTitle.style.fontWeight = '700';
+    progressTitle.style.color = '#e5e7eb';
+
+    const progressGrid = document.createElement('div');
+    progressGrid.style.display = 'grid';
+    progressGrid.style.gridTemplateColumns = 'repeat(2, minmax(0, 1fr))';
+    progressGrid.style.gap = '6px';
+
+    function createProgressMetric(label) {
+      const box = document.createElement('div');
+      box.style.border = '1px solid rgba(148,163,184,0.24)';
+      box.style.borderRadius = '8px';
+      box.style.padding = '7px 8px';
+      box.style.background = 'rgba(15,23,42,0.62)';
+      const labelEl = document.createElement('div');
+      labelEl.textContent = label;
+      labelEl.style.color = '#94a3b8';
+      labelEl.style.fontSize = '10px';
+      const valueEl = document.createElement('div');
+      valueEl.textContent = '--';
+      valueEl.style.color = '#f8fafc';
+      valueEl.style.fontSize = '14px';
+      valueEl.style.fontWeight = '700';
+      valueEl.style.marginTop = '2px';
+      box.appendChild(labelEl);
+      box.appendChild(valueEl);
+      return { box, valueEl };
+    }
+
+    const metricCompleted = createProgressMetric('已完成');
+    const metricSuccess = createProgressMetric('成功');
+    const metricCurrent = createProgressMetric('当前');
+    const metricEta = createProgressMetric('预计结束');
+    [metricCompleted, metricSuccess, metricCurrent, metricEta].forEach((item) => progressGrid.appendChild(item.box));
+
+    const progressTrack = document.createElement('div');
+    progressTrack.style.height = '7px';
+    progressTrack.style.borderRadius = '999px';
+    progressTrack.style.background = 'rgba(148,163,184,0.22)';
+    progressTrack.style.overflow = 'hidden';
+    const progressFill = document.createElement('div');
+    progressFill.style.height = '100%';
+    progressFill.style.width = '0%';
+    progressFill.style.borderRadius = '999px';
+    progressFill.style.background = 'linear-gradient(90deg, #22c55e, #38bdf8)';
+    progressFill.style.transition = 'width 220ms ease';
+    progressTrack.appendChild(progressFill);
+
+    const progressStage = document.createElement('div');
+    progressStage.textContent = '等待批量任务开始';
+    progressStage.style.color = '#94a3b8';
+    progressStage.style.fontSize = '11px';
+    progressStage.style.lineHeight = '1.35';
+
+    const progressWarning = document.createElement('div');
+    progressWarning.style.display = 'none';
+    progressWarning.style.color = '#fecaca';
+    progressWarning.style.background = 'rgba(127,29,29,0.45)';
+    progressWarning.style.border = '1px solid rgba(248,113,113,0.45)';
+    progressWarning.style.borderRadius = '6px';
+    progressWarning.style.padding = '6px 7px';
+    progressWarning.style.fontSize = '11px';
+    progressWarning.style.lineHeight = '1.35';
+
+    progressPane.appendChild(progressTitle);
+    progressPane.appendChild(progressGrid);
+    progressPane.appendChild(progressTrack);
+    progressPane.appendChild(progressStage);
+    progressPane.appendChild(progressWarning);
+
     panel.appendChild(header);
+    panel.appendChild(tabBar);
     panel.appendChild(body);
+    panel.appendChild(progressPane);
 
     document.documentElement.appendChild(panel);
     qwenPanelEl = panel;
@@ -5108,6 +5796,64 @@
     qwenPanelEl._qwenSetStatus = setStatus;
     qwenPanelEl._qwenSetCopyEnabled = setCopyEnabled;
     qwenPanelEl._qwenSetGenerateLoading = setGenerateLoading;
+    qwenPanelEl._qwenActiveTab = 'manual';
+    qwenPanelEl._qwenUserSelectedTab = false;
+
+    function setTabActive(tabName) {
+      const isProgress = tabName === 'progress';
+      qwenPanelEl._qwenActiveTab = isProgress ? 'progress' : 'manual';
+      body.style.display = isProgress ? 'none' : 'flex';
+      progressPane.style.display = isProgress ? 'flex' : 'none';
+      manualTab.style.background = isProgress ? 'rgba(15,23,42,0.55)' : 'rgba(37,99,235,0.9)';
+      progressTab.style.background = isProgress ? 'rgba(37,99,235,0.9)' : 'rgba(15,23,42,0.55)';
+      manualTab.style.color = isProgress ? '#cbd5e1' : '#f8fafc';
+      progressTab.style.color = isProgress ? '#f8fafc' : '#cbd5e1';
+    }
+    qwenPanelEl._qwenSetActiveTab = setTabActive;
+    qwenPanelEl._qwenRefreshBatchProgress = refreshBatchProgressPane;
+
+    async function refreshBatchProgressPane() {
+      if (!qwenPanelEl || !qwenPanelEl.parentNode || typeof chrome === 'undefined' || !chrome.storage || !chrome.storage.local) return;
+      const data = await new Promise((resolve) => chrome.storage.local.get([BATCH_RUNTIME_STATE_KEY, AI_REUSE_STATE_STORAGE_KEY], resolve));
+      const progress = buildCompactBatchProgressLocal(data[BATCH_RUNTIME_STATE_KEY]);
+      const warning = buildAssistantWarningLocal(data[AI_REUSE_STATE_STORAGE_KEY]);
+      if (!progress.isBatch) {
+        metricCompleted.valueEl.textContent = '--';
+        metricSuccess.valueEl.textContent = '--';
+        metricCurrent.valueEl.textContent = '--';
+        metricEta.valueEl.textContent = '未运行';
+        progressFill.style.width = '0%';
+        progressStage.textContent = '当前没有批量任务';
+        progressWarning.style.display = 'none';
+        progressWarning.textContent = '';
+        return;
+      }
+      metricCompleted.valueEl.textContent = `${progress.completed} / ${progress.total}`;
+      metricSuccess.valueEl.textContent = String(progress.success);
+      metricCurrent.valueEl.textContent = progress.total > 0 ? `第 ${progress.current} 条` : '--';
+      metricEta.valueEl.textContent = progress.etaText;
+      progressFill.style.width = `${progress.percent}%`;
+      progressStage.textContent = progress.stageText;
+      progressWarning.style.display = warning.visible ? 'block' : 'none';
+      progressWarning.textContent = warning.text || '';
+    }
+
+    manualTab.addEventListener('click', () => {
+      qwenPanelEl._qwenUserSelectedTab = true;
+      setTabActive('manual');
+    });
+    progressTab.addEventListener('click', () => {
+      qwenPanelEl._qwenUserSelectedTab = true;
+      setTabActive('progress');
+      refreshBatchProgressPane();
+    });
+    setTabActive(chooseAssistantProgressTabLocal({
+      hasBatchContext: !!_batchCtx,
+      userSelectedTab: false,
+      currentTab: 'manual'
+    }));
+    refreshBatchProgressPane();
+    qwenProgressTimer = setInterval(refreshBatchProgressPane, 1500);
 
     if (lastGeneratedPromotionCopy) {
       textarea.value = lastGeneratedPromotionCopy;
@@ -5732,6 +6478,25 @@
       console.log('[content] 1/6 等待页面加载...');
       await waitForPageReady();
       logBatchSubmit('page.ready', { title: document.title || '', href: location.href });
+      const domainDrift = classifyDomainDriftLocal({ originalUrl: url, currentUrl: location.href });
+      if (domainDrift.drifted) {
+        logBatchSubmit('page.domain_drift', {
+          originalHost: domainDrift.originalHost,
+          currentHost: domainDrift.currentHost,
+          currentUrl: location.href,
+          result: domainDrift.result,
+          errorMessage: domainDrift.errorMessage
+        });
+        await reportTerminalBatchResultAndClose(
+          batchId,
+          urlIndex,
+          url,
+          domainDrift.result,
+          null,
+          domainDrift.errorMessage
+        );
+        return;
+      }
       const illegalCheck = evaluateCurrentPageForIllegalSite(url);
       if (illegalCheck.blocked) {
         await reportIllegalSiteAndClose(batchId, urlIndex, url, illegalCheck);
@@ -5783,7 +6548,14 @@
           reportMode
         });
         if (reportMode === 'confirm_and_close') {
-          await reportManualRequiredAndClose(batchId, urlIndex, url, null, initialFormDecision.errorMessage);
+          await reportTerminalBatchResultAndClose(
+            batchId,
+            urlIndex,
+            url,
+            initialFormDecision.result,
+            null,
+            initialFormDecision.errorMessage
+          );
         } else {
           await writePendingResult(batchId, urlIndex, url, initialFormDecision.result, null, initialFormDecision.errorMessage);
           await reportBatchResult(batchId, urlIndex, initialFormDecision.result, null, initialFormDecision.errorMessage, url);
@@ -5862,7 +6634,7 @@
         console.log('[content] 4/6 生成AI文案...');
         aiGenerated = true; // AI即将生成，标记用于失败时补偿
         logBatchSubmit('ai.generate_start');
-        aiContent = await generatePromotionCopyWithRetry(3);
+        aiContent = await generatePromotionCopyWithRetry(1);
         if (!aiContent) {
           aiGenerated = false;
           console.log('[content] AI文案命中黑名单，已由后端退回积分，跳过当前URL');
@@ -5968,7 +6740,7 @@
         throw new Error('表单字段缺失: ' + (fillResult.missingFields || []).join(', '));
       }
       logBatchSubmit('fill.fields_refill_start');
-      let refillResult = await ensureAllCommentFormFieldsFilled(aiContent);
+      let refillResult = await ensureAllCommentFormFieldsFilled('', true);
       logBatchSubmit('fill.fields_refill_done', {
         success: !!(refillResult && refillResult.success),
         missingFields: refillResult && refillResult.missingFields ? refillResult.missingFields : []
@@ -5981,7 +6753,7 @@
         });
         const retryFillResult = await fillSpecificCommentTextareaHumanLike(latestTextarea, aiContent, batchCommentFillOptions);
         if (retryFillResult && retryFillResult.success) {
-          refillResult = await ensureAllCommentFormFieldsFilled(aiContent);
+          refillResult = await ensureAllCommentFormFieldsFilled('', true);
         }
         logBatchSubmit('fill.comment_retry_done', {
           success: !!(refillResult && refillResult.success),
@@ -6006,8 +6778,15 @@
       }
 
       logBatchSubmit('submit.ready_check_start');
-      assertCommentReadyForSubmit(aiContent, form, ta);
-      logBatchSubmit('submit.ready_check_done');
+      const promotionWebsiteForSubmit = await getWebsiteUrl();
+      await ensureCommentReadyForSubmitWithRecovery(
+        aiContent,
+        form,
+        ta,
+        promotionWebsiteForSubmit,
+        batchCommentFillOptions,
+        'submit.ready'
+      );
 
       const manualCheckBeforeSubmit = detectManualRequiredChallenge(form);
       if (manualCheckBeforeSubmit.found) {
@@ -6019,6 +6798,14 @@
       logBatchSubmit('submit.manual_like_delay_start', { delayMs: batchPreSubmitDelayMs });
       await new Promise(resolve => setTimeout(resolve, batchPreSubmitDelayMs));
       logBatchSubmit('submit.manual_like_delay_done', { delayMs: batchPreSubmitDelayMs });
+      await ensureCommentReadyForSubmitWithRecovery(
+        aiContent,
+        form,
+        ta,
+        promotionWebsiteForSubmit,
+        batchCommentFillOptions,
+        'submit.final_ready'
+      );
 
       // 提交前先写入 pending 结果（页面刷新后 batch.js 仍能立即读到）
       console.log('[content] pending结果写入完成');
@@ -6268,7 +7055,7 @@
           r.batchId === batchId &&
           r.urlIndex === urlIndex &&
           r.url === url &&
-          r.result === 'success' &&
+          (r.result === 'success' || r.result === 'success_pending_moderation') &&
           r.confirmedBy === BATCH_SUCCESS_CONFIRMATION_MARKER &&
           isSamePromotionWebsite(r.promotionWebsiteUrl, promotionWebsiteUrl) &&
           r.copyPromotionWebsiteKey === normalizePromotionWebsiteKey(promotionWebsiteUrl) &&
@@ -6531,6 +7318,30 @@
     }, 500);
   }
 
+  async function reportTerminalBatchResultAndClose(batchId, urlIndex, url, result, aiContent, errorMessage) {
+    console.log('[content] reportTerminalBatchResultAndClose >>>', { batchId, urlIndex, url, result, errorMessage });
+    await writePendingResult(batchId, urlIndex, url, result, aiContent || null, errorMessage || null);
+    sendBeaconReport(batchId, urlIndex, result, aiContent || null, errorMessage || null);
+
+    if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.sendMessage) {
+      await new Promise((resolve) => {
+        chrome.runtime.sendMessage({
+          type: 'BATCH_HANDLE_CONFIRM',
+          batchId,
+          urlIndex,
+          url: url || '',
+          aiContent: aiContent || '',
+          result,
+          errorMessage: errorMessage || null
+        }).then(resolve).catch(resolve);
+      });
+    }
+
+    setTimeout(() => {
+      window.close();
+    }, 500);
+  }
+
   /**
    * 将待确认结果写入 storage（页面刷新前同步落盘，batch.js 轮询可立即读到）
    */
@@ -6558,7 +7369,7 @@
         copyPromotionWebsiteKey: normalizePromotionWebsiteKey(promotionWebsiteUrl),
         timestamp: Date.now()
       };
-      if (result === 'success') {
+      if (result === 'success' || result === 'success_pending_moderation') {
         entry.confirmedBy = BATCH_SUCCESS_CONFIRMATION_MARKER;
         entry.confirmedAt = entry.timestamp;
       }
