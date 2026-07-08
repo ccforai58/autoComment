@@ -2,5 +2,13 @@
 .gitignore
 /local_export_tools/
 
+# Local runtime secrets and installed dependencies.
+.env
+.env.*
+!.env.example
+/node_modules/
+.local-backend.pid
+/output/
+
 # Generated CSV inventory for automatic paid fulfillment.
 /storage/csv-batches/

@@ -1,19 +1,16 @@
-// 阿里云服务器部署入口
 require('dotenv').config();
+
 const express = require('express');
-const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const ENABLE_PAYMENT = String(process.env.ENABLE_PAYMENT || 'false').toLowerCase() === 'true';
 
-// 统一数据库入口（根据 DATABASE_TYPE=sqlite|mysql 自动选择适配器）
 require('./api/db');
 
-// 解析 JSON 请求体
 app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: true }));
 
-// 允许跨域
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -26,44 +23,58 @@ app.use((req, res, next) => {
 });
 
 const blogRunStatsHandler = require('./api/blog-run-stats');
-const csvBatchesRouter = require('./api/csv-batches');
-const alipayRouter = require('./api/alipay');
+const batchRouter = require('./api/batch');
+const csvBatchesRouter = ENABLE_PAYMENT ? require('./api/csv-batches') : null;
+const alipayRouter = ENABLE_PAYMENT ? require('./api/alipay') : null;
 
-// 挂载各 API 路由
 app.post('/api/generate-copy', require('./api/generate-copy'));
 app.post('/api/blog-run-stats', blogRunStatsHandler);
 app.use('/api', require('./api/get-points'));
 app.use('/api', require('./api/deduct-points'));
 app.use('/api', require('./api/refund-points'));
-app.use('/api', require('./api/batch'));
-app.use('/api', csvBatchesRouter);
-app.use('/api', alipayRouter);
+app.use('/api', batchRouter);
+app.use('/api', require('./api/debug-log'));
 
-// 健康检查
+if (ENABLE_PAYMENT) {
+  app.use('/api', csvBatchesRouter);
+  app.use('/api', alipayRouter);
+} else {
+  console.info('[Server] payment/csv purchase modules disabled (ENABLE_PAYMENT=false)');
+}
+
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// 静态文件（如果有）
-app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.static(__dirname, {
+  dotfiles: 'ignore',
+  index: 'index.html'
+}));
 
-// 404
 app.use((req, res) => {
   res.status(404).json({ error: 'Not Found' });
 });
 
-// 启动
 app.listen(PORT, () => {
-  console.log(`[Server] 后端服务已启动，监听端口 ${PORT}`);
-  alipayRouter.logConfigDiagnostics();
+  console.log(`[Server] local backend listening on port ${PORT}`);
+  console.info('[Server] ENABLE_PAYMENT =', ENABLE_PAYMENT);
+
   blogRunStatsHandler.ensureTable().catch((err) => {
-    console.error('[Server] blog_run_stats 表初始化失败:', err);
+    console.error('[Server] blog_run_stats table init failed:', err);
   });
-  alipayRouter.ensureTables().catch((err) => {
-    console.error('[Server] payment_orders table init failed:', err);
+
+  batchRouter.ensureTables().catch((err) => {
+    console.error('[Server] batch_reports table init failed:', err);
   });
-  csvBatchesRouter.ensureTables().catch((err) => {
-    console.error('[Server] csv batch tables init failed:', err);
-  });
-  csvBatchesRouter.startScheduler();
+
+  if (ENABLE_PAYMENT) {
+    alipayRouter.logConfigDiagnostics();
+    alipayRouter.ensureTables().catch((err) => {
+      console.error('[Server] payment_orders table init failed:', err);
+    });
+    csvBatchesRouter.ensureTables().catch((err) => {
+      console.error('[Server] csv batch tables init failed:', err);
+    });
+    csvBatchesRouter.startScheduler();
+  }
 });

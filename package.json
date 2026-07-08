@@ -7,6 +7,15 @@
     "test": "node --test tests/*.test.js",
     "start": "node server.js",
     "dev": "node server.js",
+    "local:db:start": "docker compose up -d mysql",
+    "local:db:stop": "docker compose stop mysql",
+    "local:db:logs": "docker compose logs -f mysql",
+    "local:db:setup": "node scripts/setup-local-db.js",
+    "local:init-user": "node scripts/init-local-user.js",
+    "local:stack:start": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/start-local-stack.ps1",
+    "local:stack:stop": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/stop-local-stack.ps1",
+    "local:autostart:install": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install-autostart.ps1",
+    "local:autostart:uninstall": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/uninstall-autostart.ps1",
     "csv:export": "node scripts/run-csv-export.js",
     "pm2:start": "pm2 start server.js --name auto-comment-api",
     "pm2:stop": "pm2 stop auto-comment-api",
@@ -22,6 +31,7 @@
     "papaparse": "^5.5.3"
   },
   "devDependencies": {
+    "playwright": "^1.61.1",
     "pm2": "^5.3.0"
   },
   "engines": {

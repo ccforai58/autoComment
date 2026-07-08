@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 
-const { execute, queryOne } = require('./db');
+const { queryOne } = require('./db');
 
 const USER_NOT_FOUND_RESPONSE = {
   success: false,
@@ -10,7 +10,7 @@ const USER_NOT_FOUND_RESPONSE = {
 };
 
 /**
- * Deduct user points.
+ * Local-only mode: points consumption is disabled.
  * POST /api/deduct-points
  * Body: { userId: string, points: number }
  */
@@ -40,30 +40,12 @@ router.post('/deduct-points', async (req, res) => {
       return res.status(404).json(USER_NOT_FOUND_RESPONSE);
     }
 
-    const currentPoints = Number(row.points) || 0;
-    if (currentPoints < pointsToDeduct) {
-      return res.status(200).json({
-        success: false,
-        error: 'Insufficient points',
-        currentPoints,
-        requiredPoints: pointsToDeduct
-      });
-    }
-
-    const newPoints = currentPoints - pointsToDeduct;
-    const result = await execute(
-      'UPDATE auto_comment_users SET points = ?, updated_at = NOW() WHERE user_id = ?',
-      [newPoints, userId]
-    );
-
-    if (result && result.affectedRows === 0) {
-      return res.status(404).json(USER_NOT_FOUND_RESPONSE);
-    }
-
     return res.status(200).json({
       success: true,
-      deductedPoints: pointsToDeduct,
-      remainingPoints: newPoints
+      deductedPoints: 0,
+      requestedPoints: pointsToDeduct,
+      remainingPoints: Number(row.points) || 0,
+      pointsDisabled: true
     });
   } catch (err) {
     console.error('[deduct-points] database operation failed:', err.message);

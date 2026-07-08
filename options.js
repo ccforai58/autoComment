@@ -5,9 +5,11 @@ const USER_NAME_STORAGE_KEY = 'auto_fill_user_name';
 const USER_EMAIL_STORAGE_KEY = 'auto_fill_user_email';
 const USER_PASSWORD_STORAGE_KEY = 'auto_fill_user_password';
 const USER_ID_STORAGE_KEY = 'auto_comment_user_id';
+const DEFAULT_LOCAL_USER_ID = 'local-user';
 const LEGACY_PROMPT_FIELD_VALUES_STORAGE_KEY = 'auto_fill_prompt_field_values';
 
-const POINTS_API_BASE = 'https://jieyunsang.cn/api';
+const POINTS_API_BASE = (window.AUTO_COMMENT_CONFIG && window.AUTO_COMMENT_CONFIG.API_BASE) || 'http://127.0.0.1:3000/api';
+console.info('[options][config] API_BASE =', POINTS_API_BASE);
 const CONFIG_VERSION = 2;
 const USER_ID_NOT_ASSIGNED_MESSAGE = 'userid需要由管理员手动分配';
 
@@ -157,12 +159,16 @@ document.addEventListener('DOMContentLoaded', () => {
       userPasswordInput.value = typeof data[USER_PASSWORD_STORAGE_KEY] === 'string'
         ? data[USER_PASSWORD_STORAGE_KEY]
         : '';
-      if (userIdInput && typeof data[USER_ID_STORAGE_KEY] === 'string') {
-        userIdInput.value = data[USER_ID_STORAGE_KEY];
-        if (data[USER_ID_STORAGE_KEY]) {
-          fetchPointsBalance(data[USER_ID_STORAGE_KEY]);
-          fetchPurchaseStatus(data[USER_ID_STORAGE_KEY]);
+      if (userIdInput) {
+        const savedUserId = typeof data[USER_ID_STORAGE_KEY] === 'string'
+          ? data[USER_ID_STORAGE_KEY].trim()
+          : '';
+        const effectiveUserId = savedUserId || DEFAULT_LOCAL_USER_ID;
+        userIdInput.value = effectiveUserId;
+        if (!savedUserId) {
+          chrome.storage.sync.set({ [USER_ID_STORAGE_KEY]: effectiveUserId }, () => {});
         }
+        fetchPointsBalance(effectiveUserId);
       }
     });
   }
@@ -229,7 +235,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
   if (savePointsBtn && userIdInput) {
     savePointsBtn.addEventListener('click', async () => {
-      const userId = userIdInput.value.trim();
+      const userId = userIdInput.value.trim() || DEFAULT_LOCAL_USER_ID;
+      userIdInput.value = userId;
       let validatedPoints = null;
 
       if (userId) {
@@ -259,7 +266,6 @@ document.addEventListener('DOMContentLoaded', () => {
         showStatus(pointsStatusEl, '已保存');
         if (userId) {
           setPointsBalance(validatedPoints);
-          fetchPurchaseStatus(userId);
         } else {
           setPointsBalance(null);
           setPurchaseStatus(null);
@@ -275,6 +281,10 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   async function validateUserIdExists(userId) {
+    if (userId === DEFAULT_LOCAL_USER_ID) {
+      return 'local/free';
+    }
+    console.info('[options][api] GET /get-points validate', { userId });
     const response = await fetch(`${POINTS_API_BASE}/get-points?userId=${encodeURIComponent(userId)}`);
     const data = await response.json().catch(() => ({}));
     if (response.status === 404 || data.code === 'USER_NOT_FOUND') {
@@ -293,7 +303,12 @@ document.addEventListener('DOMContentLoaded', () => {
       setPointsBalance(null);
       return;
     }
+    if (userId === DEFAULT_LOCAL_USER_ID) {
+      setPointsBalance('local/free');
+      return;
+    }
     try {
+      console.info('[options][api] GET /get-points', { userId });
       const response = await fetch(`${POINTS_API_BASE}/get-points?userId=${encodeURIComponent(userId)}`);
       const data = await response.json();
       if (data.success) {
@@ -367,6 +382,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     try {
+      console.info('[options][api] GET /purchase-status', { userId });
       const response = await fetch(`${POINTS_API_BASE}/purchase-status?userId=${encodeURIComponent(userId)}`);
       const data = await response.json();
       if (data.success) {
@@ -495,13 +511,23 @@ document.addEventListener('DOMContentLoaded', () => {
 
   if (openBatchBtn) {
     openBatchBtn.addEventListener('click', () => {
-      chrome.tabs.create({ url: 'batch.html' });
+      const url = chrome.runtime.getURL('batch.html');
+      try {
+        chrome.tabs.update({ url }, () => {
+          if (chrome.runtime.lastError) {
+            window.location.href = url;
+          }
+        });
+      } catch (_) {
+        window.location.href = url;
+      }
     });
   }
 
   if (openPaymentBtn) {
+    openPaymentBtn.style.display = 'none';
     openPaymentBtn.addEventListener('click', () => {
-      chrome.tabs.create({ url: 'payment.html' });
+      console.info('[options] payment page disabled for local mode');
     });
   }
 

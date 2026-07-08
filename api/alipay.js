@@ -152,11 +152,11 @@ function getRequiredEnv(name) {
 }
 
 function getReturnUrl() {
-  return process.env.ALIPAY_RETURN_URL || 'https://jieyunsang.cn/api/alipay/return';
+  return process.env.ALIPAY_RETURN_URL || 'http://127.0.0.1:3000/api/alipay/return';
 }
 
 function getNotifyUrl() {
-  return process.env.ALIPAY_NOTIFY_URL || 'https://jieyunsang.cn/api/alipay/notify';
+  return process.env.ALIPAY_NOTIFY_URL || 'http://127.0.0.1:3000/api/alipay/notify';
 }
 
 function getSdk() {

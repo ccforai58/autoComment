@@ -1,11 +1,17 @@
 const { execute, queryOne } = require('./db');
 const { findBlockedKeyword, loadBlockedKeywords } = require('./blocked-keywords');
+const { generateWithModel } = require('../lib/model-generate');
+const { ensurePromotionAnchor } = require('../lib/promotion-anchor-logic');
 
 const POINTS_COST_PER_GENERATION = 1;
 
 const LINK_HREF_NEWLINE_RULE = [
   '',
   '【链接格式要求】',
+  'You MUST include the promoted website exactly once as an HTML anchor tag, not as a bare URL.',
+  'The anchor text MUST be a natural contextual phrase that fits the current page and promoted website.',
+  'Do NOT use the URL, domain, "click here", "website", or generic repeated text as anchor text.',
+  'Avoid anchor texts already used in this batch if they are provided in the user prompt.',
   'If you output any HTML link, the href attribute value MUST contain a real line break immediately before the closing double quote.',
   'Correct example:',
   '<a href="https://example.com/',
@@ -74,7 +80,10 @@ function appendRequiredOutputRules(skillTemplate) {
   return `${skillTemplate.trim()}\n${LINK_HREF_NEWLINE_RULE}`;
 }
 
-function buildUserPrompt({ websiteUrl, title, description, bodyText }) {
+function buildUserPrompt({ websiteUrl, title, description, bodyText, usedAnchorTexts }) {
+  const usedAnchors = Array.isArray(usedAnchorTexts)
+    ? usedAnchorTexts.map((item) => String(item || '').trim()).filter(Boolean)
+    : [];
   const websiteContent = [
     `【网站标题】${title || '(无标题)'}`,
     `【网站 URL】${websiteUrl || '(无URL)'}`,
@@ -88,102 +97,37 @@ function buildUserPrompt({ websiteUrl, title, description, bodyText }) {
   return [
     '下面是当前网站的内容，请根据 Skill 模板的要求，为该网站生成一份推广文案：',
     '',
-    websiteContent
+    websiteContent,
+    usedAnchors.length ? `Already used anchor texts in this batch. Do not repeat them: ${usedAnchors.join(' | ')}` : ''
   ].join('\n');
 }
 
 async function deductPoint(userId) {
+  // Local-only mode: points consumption is disabled.
   const row = await queryOne('SELECT points FROM auto_comment_users WHERE user_id = ?', [userId]);
   if (!row) {
-    return { success: false, currentPoints: 0, code: 'USER_NOT_FOUND' };
+    await execute(
+      `
+        INSERT INTO auto_comment_users (user_id, points, updated_at)
+        VALUES (?, 0, NOW())
+        ON DUPLICATE KEY UPDATE updated_at = NOW()
+      `,
+      [userId]
+    );
+    return { success: true, remainingPoints: 0, pointsDisabled: true, autoCreatedUser: true };
   }
 
-  const currentPoints = row ? Number(row.points) : 0;
-
-  if (currentPoints < POINTS_COST_PER_GENERATION) {
-    return { success: false, currentPoints };
-  }
-
-  const remainingPoints = currentPoints - POINTS_COST_PER_GENERATION;
-  const result = await execute(
-    'UPDATE auto_comment_users SET points = ?, updated_at = NOW() WHERE user_id = ?',
-    [remainingPoints, userId]
-  );
-  if (result && result.affectedRows === 0) {
-    return { success: false, currentPoints: 0, code: 'USER_NOT_FOUND' };
-  }
-
-  return { success: true, remainingPoints };
+  return { success: true, remainingPoints: Number(row.points) || 0, pointsDisabled: true };
 }
 
 async function refundPoint(userId, url, reason) {
+  // Local-only mode: there is no deduction to refund.
   const row = await queryOne('SELECT points FROM auto_comment_users WHERE user_id = ?', [userId]);
   if (!row) {
-    throw new Error('USER_NOT_FOUND');
+    return { remainingPoints: 0, pointsDisabled: true, autoCreatedUser: true };
   }
 
-  const result = await execute(
-    `
-      UPDATE auto_comment_users
-      SET points = points + ?,
-          updated_at = NOW()
-      WHERE user_id = ?
-    `,
-    [POINTS_COST_PER_GENERATION, userId]
-  );
-  if (result && result.affectedRows === 0) {
-    throw new Error('USER_NOT_FOUND');
-  }
-
-  await execute(
-    `
-      INSERT INTO refund_points_log (user_id, url, points, reason, created_at)
-      VALUES (?, ?, ?, ?, NOW())
-    `,
-    [userId, url || null, POINTS_COST_PER_GENERATION, reason]
-  );
-
-  return result;
-}
-
-async function generateWithQwen(skillTemplate, userPrompt) {
-  const apiKey = process.env.DASHSCOPE_API_KEY;
-  if (!apiKey) {
-    throw new Error('后端未配置通义千问 API Key，请联系管理员。');
-  }
-
-  const qwenResponse = await fetch(
-    'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions',
-    {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${apiKey}`
-      },
-      body: JSON.stringify({
-        model: process.env.QWEN_MODEL || 'qwen-plus',
-        messages: [
-          { role: 'system', content: skillTemplate },
-          { role: 'user', content: userPrompt }
-        ]
-      })
-    }
-  );
-
-  if (!qwenResponse.ok) {
-    const errorText = await qwenResponse.text();
-    console.error('[generate-copy] qwen failed:', qwenResponse.status, errorText);
-    throw new Error('通义千问接口调用失败，请稍后重试。');
-  }
-
-  const qwenData = await qwenResponse.json();
-  return (
-    qwenData &&
-    qwenData.choices &&
-    qwenData.choices[0] &&
-    qwenData.choices[0].message &&
-    qwenData.choices[0].message.content
-  ) || '';
+  return { remainingPoints: Number(row.points) || 0, pointsDisabled: true };
 }
 
 module.exports = async function handler(req, res) {
@@ -198,7 +142,7 @@ module.exports = async function handler(req, res) {
   }
 
   const body = req.body || {};
-  const { userId, websiteUrl, title, description, bodyText, skillTemplate } = body;
+  const { userId, websiteUrl, title, description, bodyText, skillTemplate, promotionWebsiteUrl, promotionWebsiteContent, usedAnchorTexts } = body;
 
   if (!userId) {
     return res.status(400).json({ success: false, error: '缺少 userId 参数' });
@@ -219,9 +163,10 @@ module.exports = async function handler(req, res) {
 
       return res.status(200).json({
         success: false,
-        error: '积分不足',
+        error: 'Points consumption is disabled for local use',
         currentPoints: deducted.currentPoints,
-        requiredPoints: POINTS_COST_PER_GENERATION
+        requiredPoints: 0,
+        pointsDisabled: true
       });
     }
 
@@ -229,13 +174,28 @@ module.exports = async function handler(req, res) {
       ? skillTemplate.trim()
       : getDefaultSkillTemplate();
     const template = appendRequiredOutputRules(baseTemplate);
-    const userPrompt = buildUserPrompt({ websiteUrl, title, description, bodyText });
-    const generatedText = await generateWithQwen(template, userPrompt);
+    const userPrompt = buildUserPrompt({ websiteUrl, title, description, bodyText, usedAnchorTexts });
+    const generatedText = await generateWithModel(template, userPrompt);
+    const anchored = ensurePromotionAnchor(generatedText, {
+      promotionUrl: promotionWebsiteUrl || websiteUrl,
+      promotionContent: promotionWebsiteContent || '',
+      pageTitle: title || '',
+      usedAnchorTexts
+    });
+    if (anchored.changed) {
+      console.log('[generate-copy] promotion anchor normalized', {
+        anchorText: anchored.anchorText,
+        anchorSource: anchored.anchorSource,
+        anchorWasDuplicate: anchored.anchorWasDuplicate,
+        anchorRewritten: anchored.anchorRewritten,
+        usedAnchorCount: anchored.usedAnchorCount
+      });
+    }
 
-    const blockedKeyword = await findBlockedKeyword(generatedText);
+    const blockedKeyword = await findBlockedKeyword(anchored.text);
     if (blockedKeyword) {
       await refundPoint(userId, websiteUrl, `blocked_keyword:${blockedKeyword}`);
-      console.log('[generate-copy] blocked generated copy and refunded point:', {
+      console.log('[generate-copy] blocked generated copy; points disabled:', {
         userId,
         websiteUrl,
         blockedKeyword
@@ -245,17 +205,22 @@ module.exports = async function handler(req, res) {
         success: true,
         text: '',
         blocked: true,
-        remainingPoints: deducted.remainingPoints + POINTS_COST_PER_GENERATION
+        remainingPoints: deducted.remainingPoints
       });
     }
 
     return res.status(200).json({
       success: true,
-      text: generatedText,
+      text: anchored.text,
+      anchorText: anchored.anchorText,
+      anchorSource: anchored.anchorSource,
+      anchorWasDuplicate: anchored.anchorWasDuplicate,
+      anchorRewritten: anchored.anchorRewritten,
+      hrefNewlinePreserved: anchored.hrefNewlinePreserved,
       remainingPoints: deducted.remainingPoints
     });
   } catch (err) {
     console.error('[generate-copy] error:', err);
-    return res.status(500).json({ success: false, error: '服务器内部错误', message: err.message });
+    return res.status(500).json({ success: false, error: 'Internal server error', message: err.message });
   }
 };

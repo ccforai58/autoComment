@@ -1,6 +1,7 @@
 const USER_ID_STORAGE_KEY = 'auto_comment_user_id';
-const API_BASE = 'https://jieyunsang.cn/api';
+const API_BASE = (window.AUTO_COMMENT_CONFIG && window.AUTO_COMMENT_CONFIG.API_BASE) || 'http://127.0.0.1:3000/api';
 const API_ORIGIN = new URL(API_BASE).origin;
+console.info('[payment][config] API_BASE =', API_BASE);
 
 document.addEventListener('DOMContentLoaded', () => {
   const backBtn = document.getElementById('backBtn');
@@ -320,6 +321,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     setEmpty(batchList, '正在读取 CSV 列表...');
     try {
+      console.info('[payment][api] GET /csv-batches', { userId: currentUserId });
       const response = await fetch(`${API_BASE}/csv-batches?userId=${encodeURIComponent(currentUserId)}`);
       const data = await response.json();
       if (!response.ok || !data.success) {
@@ -343,6 +345,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     setEmpty(pendingOrdersList, '正在读取待支付订单...');
     try {
+      console.info('[payment][api] GET /alipay/orders', { userId: currentUserId });
       const response = await fetch(`${API_BASE}/alipay/orders?userId=${encodeURIComponent(currentUserId)}`);
       const data = await response.json();
       if (!response.ok || !data.success) {
@@ -489,6 +492,10 @@ document.addEventListener('DOMContentLoaded', () => {
     setButtonsDisabled(true);
     setStatus('正在创建支付宝订单...');
     try {
+      console.info('[payment][api] POST /alipay/create-order', {
+        userId: currentUserId,
+        batchId: batch.batchId
+      });
       const response = await fetch(`${API_BASE}/alipay/create-order`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
