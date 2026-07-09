@@ -5798,6 +5798,7 @@
     qwenPanelEl._qwenSetGenerateLoading = setGenerateLoading;
     qwenPanelEl._qwenActiveTab = 'manual';
     qwenPanelEl._qwenUserSelectedTab = false;
+    qwenPanelEl._qwenPresetCopyMode = false;
 
     function setTabActive(tabName) {
       const isProgress = tabName === 'progress';
@@ -5890,6 +5891,7 @@
     }
 
     generateBtn.addEventListener('click', async () => {
+      qwenPanelEl._qwenPresetCopyMode = false;
       setStatus('正在生成推广文案，请稍候…', '#9ca3af');
       textarea.value = '';
       setCopyEnabled(false);
@@ -6020,8 +6022,9 @@
     });
 
     copyBtn.addEventListener('click', async () => {
-      const text = textarea.value.trim();
-      if (!text) return;
+      const isPresetCopy = qwenPanelEl && qwenPanelEl._qwenPresetCopyMode === true;
+      const text = isPresetCopy ? textarea.value : textarea.value.trim();
+      if (!text && !isPresetCopy) return;
 
       try {
         if (navigator.clipboard && navigator.clipboard.writeText) {
@@ -6036,7 +6039,7 @@
           document.execCommand('copy');
           document.body.removeChild(temp);
         }
-        setStatus('文案已复制到剪贴板。', '#22c55e');
+        setStatus(text ? '文案已复制到剪贴板。' : '文案为空', text ? '#22c55e' : '#f59e0b');
       } catch (err) {
         setStatus('复制失败，请手动选择文本复制。', '#f97373');
       }
@@ -6329,6 +6332,39 @@
     console.log('[AutoComment] 已导出外链 CSV:', { host: csvHost, count: outlinks.length });
   }
 
+  function showQwenPanel(options = {}) {
+    if (!qwenPanelEl || !qwenPanelEl.parentNode) {
+      createOrToggleQwenPanel();
+    }
+    if (!qwenPanelEl || !qwenPanelEl.parentNode) return false;
+    qwenPanelEl.style.display = 'flex';
+    qwenPanelEl.style.zIndex = '2147483647';
+    if (options.tab === 'manual' && typeof qwenPanelEl._qwenSetActiveTab === 'function') {
+      qwenPanelEl._qwenUserSelectedTab = true;
+      qwenPanelEl._qwenSetActiveTab('manual');
+    }
+    if (Object.prototype.hasOwnProperty.call(options, 'presetAiContent') && qwenPanelEl._qwenTextarea) {
+      const presetText = String(options.presetAiContent || '');
+      lastGeneratedPromotionCopy = presetText;
+      lastGeneratedPromotionCopyKey = '';
+      qwenPanelEl._qwenPresetCopyMode = true;
+      qwenPanelEl._qwenTextarea.value = presetText;
+      if (typeof qwenPanelEl._qwenSetCopyEnabled === 'function') {
+        qwenPanelEl._qwenSetCopyEnabled(true);
+      }
+      if (typeof qwenPanelEl._qwenSetStatus === 'function') {
+        qwenPanelEl._qwenSetStatus(
+          presetText ? '已加载结果页已有文案，可直接复制。' : '文案为空',
+          presetText ? '#22c55e' : '#f59e0b'
+        );
+      }
+    }
+    if (qwenPanelEl._qwenTextarea && typeof qwenPanelEl._qwenTextarea.focus === 'function') {
+      qwenPanelEl._qwenTextarea.focus();
+    }
+    return true;
+  }
+
   function ensureOutlinkFloatingButton() {
     if (document.getElementById('auto-comment-export-outlinks-btn')) {
       return;
@@ -6384,6 +6420,15 @@
       }
       if (message && message.type === 'TOGGLE_PROMOTE_PANEL') {
         createOrToggleQwenPanel();
+      }
+      if (message && message.type === 'SHOW_PROMOTE_PANEL') {
+        const options = { tab: message.tab === 'progress' ? 'progress' : 'manual' };
+        if (Object.prototype.hasOwnProperty.call(message, 'presetAiContent')) {
+          options.presetAiContent = message.presetAiContent;
+        }
+        const shown = showQwenPanel(options);
+        _sendResponse({ ok: shown });
+        return;
       }
       if (message && message.type === 'BATCH_HANDLE') {
         console.log('[content] BATCH_HANDLE received', { batchId: message.batchId, urlIndex: message.urlIndex, url: message.url, time: new Date().toISOString() });

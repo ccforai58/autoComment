@@ -710,6 +710,8 @@ function parseCSV(raw, fileNameParam) {
   let validCount = 0;
   let invalidCount = 0;
   let illegalCount = 0;
+  let duplicateCount = 0;
+  const seenSourceUrlKeys = new Set();
   parsedUrls = [];
   urlPreviewBody.innerHTML = '';
 
@@ -730,6 +732,15 @@ function parseCSV(raw, fileNameParam) {
     if (!isValidUrl(url)) {
       invalidCount++;
       continue;
+    }
+
+    const sourceUrlKey = normalizeCsvSourceUrlKey(url);
+    if (sourceUrlKey && seenSourceUrlKeys.has(sourceUrlKey)) {
+      duplicateCount++;
+      continue;
+    }
+    if (sourceUrlKey) {
+      seenSourceUrlKeys.add(sourceUrlKey);
     }
 
     const illegalCheck = evaluateIllegalSiteForBatchItem(url, sourceDomain);
@@ -756,18 +767,6 @@ function parseCSV(raw, fileNameParam) {
     urlPreviewBody.appendChild(tr);
   }
 
-  // Text cleanup: previous comment was mojibake.
-  const seenUrls = new Set();
-  let duplicateCount = 0;
-  urlPreviewBody.querySelectorAll('tr').forEach((tr) => {
-    const url = tr.dataset.url;
-    if (seenUrls.has(url)) {
-      tr.classList.add('duplicate');
-      duplicateCount++;
-    }
-    seenUrls.add(url);
-  });
-
   urlPreview.classList.add('visible');
   fileName.textContent = fileNameParam || 'Uploaded file';
   fileInfo.classList.add('visible');
@@ -776,8 +775,8 @@ function parseCSV(raw, fileNameParam) {
   if (invalidCount > 0) fileCount.textContent += `, skipped ${invalidCount} invalid`;
   if (illegalCount > 0) fileCount.textContent += `, blocked ${illegalCount}`;
   if (duplicateCount > 0) {
-    fileCount.textContent += `, ${duplicateCount} duplicate(s)`;
-    document.getElementById('duplicateCount').textContent = `${duplicateCount} duplicate(s)`;
+    fileCount.textContent += `, deduped ${duplicateCount} duplicate source URL(s)`;
+    document.getElementById('duplicateCount').textContent = `deduped ${duplicateCount} duplicate source URL(s)`;
   }
   updateCostHint(Math.max(0, validCount - illegalCount));
   if (validCount > 0) {
@@ -786,6 +785,25 @@ function parseCSV(raw, fileNameParam) {
   }
   updateStatsUI();
   updateUI();
+}
+
+function normalizeCsvSourceUrlKey(url) {
+  const logic = getBatchResultsLogic();
+  if (logic && typeof logic.normalizeSubmissionSourceUrlKey === 'function') {
+    return logic.normalizeSubmissionSourceUrlKey(url);
+  }
+
+  const text = String(url || '').trim();
+  if (!text) return '';
+  try {
+    const parsed = new URL(/^https?:\/\//i.test(text) ? text : `https://${text}`);
+    parsed.hash = '';
+    parsed.hostname = parsed.hostname.toLowerCase();
+    parsed.pathname = parsed.pathname.replace(/\/+$/, '') || '/';
+    return parsed.href.toLowerCase();
+  } catch (_) {
+    return text.replace(/#.*$/, '').replace(/\/+$/, '').toLowerCase();
+  }
 }
 
 function normalizeCsvHeader(value) {
@@ -1068,6 +1086,37 @@ async function openNextTab() {
   });
   currentIndex++;
 
+  const duplicateSubmission = await findExistingPromotionSubmissionForUrl(url);
+  if (duplicateSubmission.shouldSkip) {
+    console.info('[batch] skip duplicate promotion submission', {
+      urlIndex,
+      url,
+      promotionWebsiteUrl: currentPromotionWebsiteUrl,
+      existingResult: duplicateSubmission.record && duplicateSubmission.record.result
+    });
+    logSubmitFlow('batch.duplicate_submission_skip', {
+      urlIndex,
+      url,
+      promotionWebsiteUrl: currentPromotionWebsiteUrl,
+      existingResult: duplicateSubmission.record && duplicateSubmission.record.result,
+      reason: duplicateSubmission.reason || 'duplicate_promotion_submission'
+    });
+    handleTabResult(
+      urlIndex,
+      'skipped',
+      duplicateSubmission.record && duplicateSubmission.record.aiContent,
+      'duplicate_promotion_submission',
+      0,
+      { suppressArchive: true }
+    );
+    if (status === 'running' && currentIndex < totalCount) {
+      setTimeout(openNextTabSync, 0);
+    } else if (status === 'running' && activeTabCount === 0) {
+      checkAllCompleted();
+    }
+    return;
+  }
+
   const illegalCheck = item.illegalCheck || evaluateIllegalSiteForBatchItem(url, sourceDomain);
   if (illegalCheck.blocked) {
     console.warn('[batch] message', { urlIndex, url, illegalCheck });
@@ -1309,9 +1358,11 @@ function handleTabResult(urlIndex, result, aiContent, errorMessage, forcedElapse
   // Text cleanup: previous comment was mojibake.
   saveLocalResults();
   persistBatchRuntimeState();
-  saveArchiveRecord(resultEntry).catch((error) => {
-    console.warn('[batch] archive save failed:', error);
-  });
+  if (!options.suppressArchive) {
+    saveArchiveRecord(resultEntry).catch((error) => {
+      console.warn('[batch] archive save failed:', error);
+    });
+  }
 
   // Text cleanup: previous comment was mojibake.
   const processedCount = getProcessedCount();
@@ -1711,6 +1762,36 @@ async function getArchiveRecords() {
   });
 }
 
+async function getRuntimeBatchResults() {
+  return new Promise((resolve) => {
+    if (!chrome.storage || !chrome.storage.local) {
+      resolve([]);
+      return;
+    }
+    chrome.storage.local.get(['batchResults'], (data) => {
+      resolve(Array.isArray(data.batchResults) ? data.batchResults : []);
+    });
+  });
+}
+
+async function findExistingPromotionSubmissionForUrl(url) {
+  const logic = getBatchResultsLogic();
+  if (!logic || typeof logic.findDuplicatePromotionSubmissionRecord !== 'function') {
+    return { shouldSkip: false, record: null, reason: '' };
+  }
+  const archiveRecords = await getArchiveRecords();
+  const runtimeResults = await getRuntimeBatchResults();
+  return logic.findDuplicatePromotionSubmissionRecord({
+    records: [
+      ...localResults,
+      ...archiveRecords,
+      ...runtimeResults
+    ],
+    url,
+    promotionWebsiteUrl: currentPromotionWebsiteUrl
+  });
+}
+
 async function renderArchive() {
   if (!archiveTableBody || !archiveWebsiteFilter) return;
   const records = await getArchiveRecords();
@@ -1759,45 +1840,30 @@ async function renderArchive() {
     const aiText = record.aiContent || '';
     const shortBatch = record.batchId ? String(record.batchId).slice(0, 8) : '--';
     const timeStr = record.timestamp ? formatTime(new Date(record.timestamp)) : '--';
+    const display = getResultDisplayLocal(record);
 
     tr.innerHTML = `
       <td style="color:#9ca3af;width:40px;text-align:center;">${escapeHtml(csvIndex)}</td>
       <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(websiteLabel)}">${escapeHtml(shortWebsite)}</td>
       <td style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(sourceUrl)}">${escapeHtml(shortSource)}</td>
-      <td><span class="result-badge ${record.result}">${getResultText(record.result)}</span></td>
+      <td><span class="result-badge ${display.cssClass}" title="${escapeHtml(display.categoryText)}">${escapeHtml(display.text)}</span></td>
       <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(record.errorMessage || '')}">${escapeHtml(record.errorMessage || '--')}</td>
       <td class="ai-content-cell" title="${escapeHtml(aiText)}">${escapeHtml(aiText || '--')}</td>
       <td style="font-size:11px;color:#9ca3af;white-space:nowrap;" title="${escapeHtml(record.batchId || '')}">${escapeHtml(shortBatch)}</td>
       <td style="font-size:11px;color:#9ca3af;white-space:nowrap;">${timeStr}</td>
     `;
+    attachManualReviewTargetCell(tr.children[2], record, 'archive', tr);
+    attachAiContentContextMenu(tr.children[5], record, tr);
     archiveTableBody.appendChild(tr);
   }
 }
 
 function filterArchiveRecords(records, filters) {
-  const source = Array.isArray(records) ? records : [];
-  const options = filters || {};
-  const websiteKey = options.websiteKey || 'all';
-  const result = options.result || 'all';
-  const keyword = String(options.keyword || '').trim().toLowerCase();
-  return source.filter((record) => {
-    const recordWebsiteKey = record.promotionWebsiteKey || normalizePromotionWebsiteKey(record.promotionWebsiteUrl);
-    if (websiteKey !== 'all' && recordWebsiteKey !== websiteKey) return false;
-    if (result !== 'all' && record.result !== result) return false;
-    if (keyword) {
-      const haystack = [
-        record.promotionWebsiteUrl,
-        record.sourceUrl,
-        record.sourceDomain,
-        record.result,
-        record.aiContent,
-        record.errorMessage,
-        record.batchId
-      ].join(' ').toLowerCase();
-      if (!haystack.includes(keyword)) return false;
-    }
-    return true;
-  });
+  const logic = getBatchResultsLogic();
+  if (logic && typeof logic.filterArchiveResultRecords === 'function') {
+    return logic.filterArchiveResultRecords(records, filters);
+  }
+  return Array.isArray(records) ? records : [];
 }
 
 function updateArchiveActionButtons(records, selectedWebsiteKey) {
@@ -1854,9 +1920,11 @@ function buildArchiveWebsiteOptions(records, selectedWebsite, optionsArg = {}) {
 function renderArchiveSummary(records, totalRecords) {
   if (!archiveSummary) return;
   const total = records.length;
-  const success = records.filter((r) => r.result === 'success' || r.result === 'success_pending_moderation' || r.result === 'skipped').length;
-  const fail = records.filter((r) => r.result === 'fail' || r.result === 'blocked_illegal').length;
-  const manual = records.filter((r) => r.result === 'manual_required' || r.result === 'submitted_unconfirmed').length;
+  const summary = getResultSummary(records);
+  const success = summary.success + summary.skipped;
+  const fail = summary.fail;
+  const manual = summary.manual;
+  const manualBreakdown = getManualBreakdownText(summary);
   const sourceDomains = new Set(records.map((r) => r.sourceDomain || extractDomain(r.sourceUrl || '')).filter(Boolean)).size;
   const rate = total > 0 ? Math.round((success / total) * 100) : 0;
   archiveSummary.innerHTML = `
@@ -1864,7 +1932,7 @@ function renderArchiveSummary(records, totalRecords) {
     <span>当前筛选：<strong>${total}</strong></span>
     <span>成功/已存在：<strong>${success}</strong></span>
     <span>失败：<strong>${fail}</strong></span>
-    <span>待处理：<strong>${manual}</strong></span>
+    <span title="${escapeHtml(manualBreakdown)}">待确认/需手动：<strong>${manual}</strong></span>
     <span>来源域名：<strong>${sourceDomains}</strong></span>
     <span>成功率：<strong>${total > 0 ? rate + '%' : '--'}</strong></span>
   `;
@@ -2055,21 +2123,15 @@ function updateResultActionButtons() {
 }
 
 function renderSummaryCounts(records) {
-  const rows = Array.isArray(records) ? records : [];
-  const total = rows.length;
-  const success = rows.filter((r) => r.result === 'success' || r.result === 'success_pending_moderation').length;
-  const skipped = rows.filter((r) => r.result === 'skipped').length;
-  const manual = rows.filter((r) => r.result === 'manual_required' || r.result === 'submitted_unconfirmed').length;
-  const noCommentBox = rows.filter((r) => r.result === 'no_comment_box').length;
-  const fail = rows.filter((r) => r.result === 'fail' || r.result === 'blocked_illegal').length;
-  const successRate = total > 0 ? Math.round(((success + skipped) / total) * 100) : 0;
-  statsTotal.textContent = total;
-  statsSuccess.textContent = success;
-  statsSkipped.textContent = skipped;
-  if (statsManualRequired) statsManualRequired.textContent = manual;
-  statsNoCommentBox.textContent = noCommentBox;
-  statsFail.textContent = fail;
-  statsRate.textContent = total > 0 ? `${successRate}%` : '--';
+  const summary = getResultSummary(records);
+  statsTotal.textContent = summary.total;
+  statsSuccess.textContent = summary.success;
+  statsSkipped.textContent = summary.skipped;
+  if (statsManualRequired) statsManualRequired.textContent = summary.manual;
+  if (statsManualRequired) statsManualRequired.title = getManualBreakdownText(summary);
+  statsNoCommentBox.textContent = summary.noCommentBox;
+  statsFail.textContent = summary.fail;
+  statsRate.textContent = summary.total > 0 ? `${summary.successRate}%` : '--';
 }
 
 function updateUI() {
@@ -2127,6 +2189,242 @@ function getBatchResultsLogic() {
   console.warn('[batch] BatchResultsLogic helper is not loaded');
   return null;
 }
+
+function getResultDisplayLocal(resultOrRecord) {
+  const logic = getBatchResultsLogic();
+  if (logic && typeof logic.getResultDisplay === 'function') {
+    return logic.getResultDisplay(resultOrRecord);
+  }
+  const value = String(resultOrRecord && typeof resultOrRecord === 'object' ? resultOrRecord.result : resultOrRecord || '').trim();
+  return {
+    value,
+    category: value,
+    text: value || '未知',
+    categoryText: value || '未知',
+    cssClass: value || 'unknown'
+  };
+}
+
+function getResultSummary(records) {
+  const logic = getBatchResultsLogic();
+  if (logic && typeof logic.buildResultSummary === 'function') {
+    return logic.buildResultSummary(records);
+  }
+  const rows = Array.isArray(records) ? records : [];
+  return {
+    total: rows.length,
+    success: rows.filter((r) => r.result === 'success' || r.result === 'success_pending_moderation').length,
+    skipped: rows.filter((r) => r.result === 'skipped').length,
+    manual: rows.filter((r) => r.result === 'manual_required' || r.result === 'submitted_unconfirmed').length,
+    manualRequired: rows.filter((r) => r.result === 'manual_required').length,
+    unconfirmedAcceptance: 0,
+    unconfirmedBacklink: 0,
+    unconfirmedTimeout: 0,
+    unconfirmedSubmitted: rows.filter((r) => r.result === 'submitted_unconfirmed').length,
+    noCommentBox: rows.filter((r) => r.result === 'no_comment_box').length,
+    fail: rows.filter((r) => r.result === 'fail' || r.result === 'blocked_illegal').length,
+    successRate: rows.length > 0 ? Math.round((rows.filter((r) => r.result === 'success' || r.result === 'success_pending_moderation' || r.result === 'skipped').length / rows.length) * 100) : 0
+  };
+}
+
+function getManualBreakdownText(summary) {
+  const source = summary || {};
+  return [
+    `需手动处理：${source.manualRequired || 0}`,
+    `页面未确认：${source.unconfirmedAcceptance || 0}`,
+    `反链未确认：${source.unconfirmedBacklink || 0}`,
+    `确认超时：${source.unconfirmedTimeout || 0}`,
+    `已提交待确认：${source.unconfirmedSubmitted || 0}`
+  ].join('；');
+}
+
+function buildManualReviewTargetLocal(record, source) {
+  const logic = getBatchResultsLogic();
+  if (logic && typeof logic.buildManualReviewTarget === 'function') {
+    return logic.buildManualReviewTarget({ record, source });
+  }
+  const resultSource = source === 'archive' ? 'archive' : 'current';
+  const rawUrl = resultSource === 'archive'
+    ? (record && (record.sourceUrl || record.url))
+    : (record && (record.url || record.sourceUrl));
+  const text = String(rawUrl || '').trim();
+  try {
+    const parsed = new URL(text);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      return { ok: false, url: text, source: resultSource, error: 'unsupported_protocol' };
+    }
+    return { ok: true, url: parsed.href, source: resultSource };
+  } catch (_) {
+    return { ok: false, url: text, source: resultSource, error: text ? 'invalid_url' : 'missing_url' };
+  }
+}
+
+function buildManualReviewOpenMessageLocal(record) {
+  const logic = getBatchResultsLogic();
+  if (logic && typeof logic.buildManualReviewOpenMessage === 'function') {
+    return logic.buildManualReviewOpenMessage({ record, tab: 'manual' });
+  }
+  return {
+    type: 'SHOW_PROMOTE_PANEL',
+    tab: 'manual',
+    presetAiContent: String(record && record.aiContent || ''),
+    presetAiContentSource: 'manual_review'
+  };
+}
+
+let manualReviewContextMenu = null;
+let selectedResultsRow = null;
+
+function selectResultsRow(row) {
+  if (selectedResultsRow && selectedResultsRow !== row) {
+    selectedResultsRow.classList.remove('results-row-selected');
+  }
+  selectedResultsRow = row || null;
+  if (selectedResultsRow) {
+    selectedResultsRow.classList.add('results-row-selected');
+  }
+}
+
+function copyTextToClipboard(text) {
+  const value = String(text || '');
+  if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+    return navigator.clipboard.writeText(value);
+  }
+  const temp = document.createElement('textarea');
+  temp.value = value;
+  temp.style.position = 'fixed';
+  temp.style.left = '-9999px';
+  temp.style.top = '0';
+  document.body.appendChild(temp);
+  temp.focus();
+  temp.select();
+  try {
+    document.execCommand('copy');
+    return Promise.resolve();
+  } catch (err) {
+    return Promise.reject(err);
+  } finally {
+    document.body.removeChild(temp);
+  }
+}
+
+function attachAiContentContextMenu(cell, record, row) {
+  if (!cell) return;
+  cell.style.cursor = 'context-menu';
+  cell.dataset.aiContentCopy = 'true';
+  cell.addEventListener('contextmenu', (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    selectResultsRow(row);
+    copyTextToClipboard(record && record.aiContent || '').catch((err) => {
+      console.warn('[batch][manual-review] copy AI content failed', err);
+    });
+  });
+}
+
+function hideManualReviewContextMenu() {
+  if (manualReviewContextMenu && manualReviewContextMenu.parentNode) {
+    manualReviewContextMenu.parentNode.removeChild(manualReviewContextMenu);
+  }
+  manualReviewContextMenu = null;
+}
+
+function ensureManualReviewContextMenu() {
+  hideManualReviewContextMenu();
+  const menu = document.createElement('div');
+  menu.style.position = 'fixed';
+  menu.style.zIndex = '2147483647';
+  menu.style.minWidth = '190px';
+  menu.style.padding = '6px';
+  menu.style.background = '#111827';
+  menu.style.border = '1px solid rgba(148,163,184,0.35)';
+  menu.style.borderRadius = '8px';
+  menu.style.boxShadow = '0 16px 38px rgba(15,23,42,0.28)';
+  menu.style.color = '#f9fafb';
+  menu.style.fontSize = '13px';
+  menu.style.userSelect = 'none';
+
+  const item = document.createElement('button');
+  item.type = 'button';
+  item.textContent = '打开网页';
+  item.style.display = 'block';
+  item.style.width = '100%';
+  item.style.border = 'none';
+  item.style.borderRadius = '6px';
+  item.style.padding = '8px 10px';
+  item.style.background = 'transparent';
+  item.style.color = '#f9fafb';
+  item.style.textAlign = 'left';
+  item.style.cursor = 'pointer';
+  item.addEventListener('mouseenter', () => {
+    item.style.background = 'rgba(37,99,235,0.9)';
+  });
+  item.addEventListener('mouseleave', () => {
+    item.style.background = 'transparent';
+  });
+  menu.appendChild(item);
+  document.body.appendChild(menu);
+  manualReviewContextMenu = menu;
+  return { menu, item };
+}
+
+function showManualReviewContextMenu(event, record, source, row) {
+  event.preventDefault();
+  event.stopPropagation();
+  selectResultsRow(row);
+  const { menu, item } = ensureManualReviewContextMenu();
+  item.onclick = () => {
+    hideManualReviewContextMenu();
+    openManualReviewTarget(record, source);
+  };
+  const menuRect = menu.getBoundingClientRect();
+  const maxLeft = Math.max(8, window.innerWidth - menuRect.width - 8);
+  const maxTop = Math.max(8, window.innerHeight - menuRect.height - 8);
+  menu.style.left = `${Math.min(event.clientX, maxLeft)}px`;
+  menu.style.top = `${Math.min(event.clientY, maxTop)}px`;
+}
+
+function attachManualReviewTargetCell(cell, record, source, row) {
+  if (!cell) return;
+  cell.style.cursor = 'context-menu';
+  cell.dataset.manualReviewTarget = 'true';
+  cell.addEventListener('contextmenu', (event) => showManualReviewContextMenu(event, record, source, row));
+}
+
+function waitForManualReviewAssistant(tabId, record, attempt = 0) {
+  if (!tabId || !chrome.tabs || typeof chrome.tabs.sendMessage !== 'function') return;
+  if (attempt > 30) {
+    console.warn('[batch][manual-review] assistant message timeout', { tabId });
+    return;
+  }
+  chrome.tabs.sendMessage(tabId, { type: 'PING' }).then(() => {
+    return chrome.tabs.sendMessage(tabId, buildManualReviewOpenMessageLocal(record));
+  }).catch(() => {
+    setTimeout(() => waitForManualReviewAssistant(tabId, record, attempt + 1), 500);
+  });
+}
+
+function openManualReviewTarget(record, source) {
+  const target = buildManualReviewTargetLocal(record, source);
+  if (!target.ok) {
+    alert('这个目标页面地址不可打开，请检查结果记录里的 URL。');
+    return;
+  }
+  chrome.tabs.create({ url: target.url, active: true }, (tab) => {
+    const createError = chrome.runtime.lastError ? chrome.runtime.lastError.message : '';
+    if (createError || !tab || !tab.id) {
+      alert('打开目标页面失败：' + (createError || '未能创建标签页'));
+      return;
+    }
+    waitForManualReviewAssistant(tab.id, record);
+  });
+}
+
+document.addEventListener('click', hideManualReviewContextMenu);
+document.addEventListener('scroll', hideManualReviewContextMenu, true);
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape') hideManualReviewContextMenu();
+});
 
 function downloadCsv(content, filename) {
   const blob = new Blob(['\ufeff' + content], { type: 'text/csv;charset=utf-8' });
@@ -2459,16 +2757,19 @@ function renderStats() {
   const domainFilter = filterDomain.value;
   const kw = filterKeyword.value.trim().toLowerCase();
 
-  const filtered = localResults.filter((r) => {
-    if (resultFilter !== 'all' && r.result !== resultFilter) return false;
-    if (domainFilter !== 'all' && extractDomain(r.url) !== domainFilter) return false;
-    if (!filterTimeBucket(r.elapsed)) return false;
-    if (kw) {
-      const haystack = (r.url + ' ' + (r.aiContent || '') + ' ' + (r.errorMessage || '')).toLowerCase();
-      if (!haystack.includes(kw)) return false;
-    }
-    return true;
-  });
+  const logic = getBatchResultsLogic();
+  const filtered = logic && typeof logic.filterBatchResultRecords === 'function'
+    ? logic.filterBatchResultRecords(localResults, {
+      result: resultFilter,
+      domain: domainFilter,
+      keyword: kw,
+      timeBucket: filterTimeBucket
+    })
+    : localResults.filter((r) => {
+      if (domainFilter !== 'all' && extractDomain(r.url) !== domainFilter) return false;
+      if (!filterTimeBucket(r.elapsed)) return false;
+      return true;
+    });
 
   statsCountLabel.textContent = `显示 ${filtered.length} / ${localResults.length} 条`;
 
@@ -2476,7 +2777,8 @@ function renderStats() {
   statsTableBody.innerHTML = '';
   for (const r of filtered) {
     const tr = document.createElement('tr');
-    tr.className = 'url-' + r.result;
+    const display = getResultDisplayLocal(r);
+    tr.className = 'url-' + display.cssClass;
 
     const elapsedStr = r.elapsed != null ? r.elapsed + 's' : '--';
     const timeStr = r.timestamp ? formatTime(new Date(r.timestamp)) : '--';
@@ -2495,13 +2797,12 @@ function renderStats() {
       aiCell.textContent = '--';
       aiCell.style.color = '#d1d5db';
     }
-
     tr.innerHTML = `
       <td style="color:#9ca3af;width:40px;text-align:center;">${r.originalIndex + 1}</td>
       <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(r.url)}">${escapeHtml(shortUrl)}</td>
-      <td><span class="result-badge ${r.result}">${getResultText(r.result)}</span></td>
+      <td><span class="result-badge ${display.cssClass}" title="${escapeHtml(display.categoryText)}">${escapeHtml(display.text)}</span></td>
     `;
-    tr.className = `url-${r.result}`;
+    tr.className = `url-${display.cssClass}`;
 
     const errCell = document.createElement('td');
     if (r.errorMessage) {
@@ -2519,6 +2820,14 @@ function renderStats() {
       <td style="font-size:11px;color:#9ca3af;white-space:nowrap;">${elapsedStr}</td>
       <td style="font-size:11px;color:#9ca3af;white-space:nowrap;">${timeStr}</td>
     `;
+    const renderedAiCell = tr.children[4];
+    if (r.aiContent && renderedAiCell) {
+      renderedAiCell.addEventListener('click', () => {
+        renderedAiCell.classList.toggle('expanded');
+      });
+    }
+    attachAiContentContextMenu(renderedAiCell, r, tr);
+    attachManualReviewTargetCell(tr.children[1], r, 'current', tr);
 
     statsTableBody.appendChild(tr);
   }
@@ -2673,6 +2982,10 @@ function isValidUrl(str) {
 }
 
 function getResultText(result) {
+  const logic = getBatchResultsLogic();
+  if (logic && typeof logic.getResultDisplay === 'function') {
+    return logic.getResultDisplay(result).text;
+  }
   switch (result) {
     case 'success': return '成功';
     case 'success_pending_moderation': return '提交成功，审核中';

@@ -657,7 +657,7 @@
 
       .stats-table td {
         padding: 6px 10px;
-        border-top: 1px solid #f3f4f6;
+        border-top: 0;
         color: #374151;
         vertical-align: middle;
         max-width: 300px;
@@ -665,6 +665,10 @@
         text-overflow: ellipsis;
         white-space: nowrap;
         word-break: break-all;
+      }
+
+      .stats-table tbody tr + tr td {
+        border-top: 1px solid rgba(229, 231, 235, 0.55);
       }
 
       .stats-table tr:hover td { background: #f0fdf4; }
@@ -676,6 +680,12 @@
       .stats-table tr.url-manual_required td { background: #fffbeb; }
       .stats-table tr.url-submitted_unconfirmed td { background: #eff6ff; }
       .stats-table tr.url-blocked_illegal td { background: #fff1f2; }
+      .stats-table tr.results-row-selected td {
+        background: #dbeafe !important;
+      }
+      .stats-table tr.results-row-selected td:first-child {
+        box-shadow: inset 3px 0 0 #2563eb;
+      }
       .archive-panel {
         display: block;
         border: 1px solid #e5e7eb;
@@ -1033,7 +1043,7 @@
             <div class="stats-card-value total" id="statsTotal">0</div>
           </div>
           <div class="stats-card">
-            <div class="stats-card-label">成功</div>
+            <div class="stats-card-label" title="包含：成功、提交成功审核中">成功/审核中</div>
             <div class="stats-card-value success" id="statsSuccess">0</div>
           </div>
           <div class="stats-card">
@@ -1041,7 +1051,7 @@
             <div class="stats-card-value skipped" id="statsSkipped">0</div>
           </div>
           <div class="stats-card">
-            <div class="stats-card-label">待处理</div>
+            <div class="stats-card-label" title="包含：待确认、需手动处理">待确认/需手动</div>
             <div class="stats-card-value manual-required" id="statsManualRequired">0</div>
           </div>
           <div class="stats-card">
@@ -1049,11 +1059,11 @@
             <div class="stats-card-value no-comment-box" id="statsNoCommentBox">0</div>
           </div>
           <div class="stats-card">
-            <div class="stats-card-label">失败</div>
+            <div class="stats-card-label" title="包含：失败、已拦截">失败/已拦截</div>
             <div class="stats-card-value fail" id="statsFail">0</div>
           </div>
           <div class="stats-card">
-            <div class="stats-card-label">成功率</div>
+            <div class="stats-card-label" title="计算方式：(成功/审核中 + 已存在) / 总数">成功率</div>
             <div class="stats-card-value rate" id="statsRate">—</div>
           </div>
         </div>
@@ -1062,13 +1072,16 @@
           <span class="stats-filter-label">筛选：</span>
           <select id="filterResult">
             <option value="all">全部结果</option>
-            <option value="success">仅成功</option>
+            <option value="success">成功/审核中</option>
             <option value="skipped">仅已存在</option>
+            <option value="action_required">待确认/需手动</option>
             <option value="manual_required">仅需手动处理</option>
-            <option value="submitted_unconfirmed">仅待确认</option>
+            <option value="unconfirmed_acceptance">已提交，页面未确认</option>
+            <option value="unconfirmed_backlink">已提交，反链未确认</option>
+            <option value="unconfirmed_timeout">已提交，确认超时</option>
+            <option value="unconfirmed_submitted">仅已提交待确认</option>
             <option value="no_comment_box">仅无评论框</option>
-            <option value="blocked_illegal">仅非法拦截</option>
-            <option value="fail">仅失败</option>
+            <option value="fail">失败/已拦截</option>
           </select>
           <select id="filterDomain">
             <option value="all">全部域名</option>
@@ -1111,13 +1124,16 @@
           </select>
           <select id="archiveResultFilter">
             <option value="all">全部结果</option>
-            <option value="success">成功</option>
+            <option value="success">成功/审核中</option>
             <option value="skipped">已存在</option>
+            <option value="action_required">待确认/需手动</option>
             <option value="manual_required">需手动处理</option>
-            <option value="submitted_unconfirmed">待确认</option>
+            <option value="unconfirmed_acceptance">已提交，页面未确认</option>
+            <option value="unconfirmed_backlink">已提交，反链未确认</option>
+            <option value="unconfirmed_timeout">已提交，确认超时</option>
+            <option value="unconfirmed_submitted">已提交待确认</option>
             <option value="no_comment_box">无评论框</option>
-            <option value="blocked_illegal">已拦截</option>
-            <option value="fail">失败</option>
+            <option value="fail">失败/已拦截</option>
           </select>
           <input type="text" id="archiveKeyword" placeholder="搜索来源 URL、推广网站、AI 内容或错误" />
           <div class="stats-filter-actions">

@@ -11,7 +11,14 @@ const {
   buildCompactBatchProgress,
   chooseAssistantProgressTab,
   buildServiceStatusSummary,
-  buildAssistantWarning
+  buildAssistantWarning,
+  buildResultSummary,
+  filterBatchResultRecords,
+  getResultDisplay,
+  buildManualReviewTarget,
+  buildManualReviewOpenMessage,
+  dedupeCsvSourceUrlItems,
+  findDuplicatePromotionSubmissionRecord
 } = require('../lib/batch-results-logic');
 
 test('buildCurrentBatchExportCsv keeps original CSV order and appends run result', () => {
@@ -67,6 +74,217 @@ test('buildArchiveExportCsv exports the selected promotion website only', () => 
   assert.equal(lines[1].includes('https://a.test/'), true);
   assert.equal(lines[2].includes('https://b.test/'), true);
   assert.equal(csv.content.includes('https://other-source.test/'), false);
+});
+
+test('dedupeCsvSourceUrlItems keeps the first row for duplicate CSV source URLs', () => {
+  const result = dedupeCsvSourceUrlItems([
+    { url: 'blog.test/post', originalRow: ['first'] },
+    { url: 'https://blog.test/post/', originalRow: ['duplicate trailing slash'] },
+    { url: 'https://other.test/post', originalRow: ['other'] },
+    { url: 'https://BLOG.test/post#comments', originalRow: ['duplicate hash'] }
+  ]);
+
+  assert.equal(result.duplicateCount, 2);
+  assert.equal(result.items.length, 2);
+  assert.equal(result.items[0].url, 'blog.test/post');
+  assert.deepEqual(result.items[0].originalRow, ['first']);
+  assert.equal(result.items[1].url, 'https://other.test/post');
+});
+
+test('buildResultSummary uses the same visible result groups as the page filters', () => {
+  const summary = buildResultSummary([
+    { result: 'success' },
+    { result: 'success_pending_moderation' },
+    { result: 'skipped' },
+    { result: 'manual_required' },
+    { result: 'submitted_unconfirmed', errorMessage: 'restored page did not show acceptance signal' },
+    { result: 'submitted_unconfirmed', errorMessage: 'submit observed as success/submit_evidence_without_backlink but backlink verification did not finish before grace timeout' },
+    { result: 'submitted_unconfirmed', errorMessage: 'submit started but no confirmation returned after grace period' },
+    { result: 'no_comment_box' },
+    { result: 'blocked_illegal' },
+    { result: 'fail' }
+  ]);
+
+  assert.deepEqual(summary, {
+    total: 10,
+    success: 2,
+    skipped: 1,
+    manual: 4,
+    manualRequired: 1,
+    unconfirmedAcceptance: 1,
+    unconfirmedBacklink: 1,
+    unconfirmedTimeout: 1,
+    unconfirmedSubmitted: 0,
+    noCommentBox: 1,
+    fail: 2,
+    successRate: 30
+  });
+});
+
+test('filterBatchResultRecords matches result groups and visible Chinese labels', () => {
+  const records = [
+    { originalIndex: 0, url: 'https://a.test/post', result: 'success_pending_moderation', aiContent: 'copy', errorMessage: '' },
+    { originalIndex: 1, url: 'https://b.test/post', result: 'submitted_unconfirmed', aiContent: '', errorMessage: 'restored page did not show acceptance signal' },
+    { originalIndex: 2, url: 'https://c.test/post', result: 'no_comment_box', aiContent: '', errorMessage: 'no comment form found' },
+    { originalIndex: 3, url: 'https://d.test/post', result: 'submitted_unconfirmed', aiContent: '', errorMessage: 'submit observed as success/submit_evidence_without_backlink but backlink verification did not finish before grace timeout' }
+  ];
+
+  assert.deepEqual(
+    filterBatchResultRecords(records, { result: 'success' }).map((record) => record.originalIndex),
+    [0]
+  );
+  assert.deepEqual(
+    filterBatchResultRecords(records, { result: 'action_required' }).map((record) => record.originalIndex),
+    [1, 3]
+  );
+  assert.deepEqual(
+    filterBatchResultRecords([
+      ...records,
+      { originalIndex: 4, url: 'https://e.test/post', result: 'manual_required', aiContent: '', errorMessage: 'captcha required' }
+    ], { result: 'manual_required' }).map((record) => record.originalIndex),
+    [4]
+  );
+  assert.deepEqual(
+    filterBatchResultRecords(records, { result: 'unconfirmed_acceptance' }).map((record) => record.originalIndex),
+    [1]
+  );
+  assert.deepEqual(
+    filterBatchResultRecords(records, { result: 'unconfirmed_backlink' }).map((record) => record.originalIndex),
+    [3]
+  );
+  assert.deepEqual(
+    filterBatchResultRecords(records, { keyword: '提交成功' }).map((record) => record.originalIndex),
+    [0]
+  );
+  assert.deepEqual(
+    filterBatchResultRecords(records, { keyword: '反链未确认' }).map((record) => record.originalIndex),
+    [3]
+  );
+  assert.deepEqual(
+    filterBatchResultRecords(records, { keyword: '无评论框' }).map((record) => record.originalIndex),
+    [2]
+  );
+});
+
+test('getResultDisplay maps legacy and raw result values to stable UI labels', () => {
+  assert.deepEqual(getResultDisplay('success_pending_moderation'), {
+    value: 'success_pending_moderation',
+    category: 'success',
+    subcategory: 'success_pending_moderation',
+    text: '提交成功，审核中',
+    categoryText: '成功/审核中',
+    cssClass: 'success_pending_moderation'
+  });
+  assert.equal(getResultDisplay('MANUAL_REQUIRED').category, 'action_required');
+  assert.equal(getResultDisplay('blocked').category, 'fail');
+});
+
+test('getResultDisplay splits submitted_unconfirmed into understandable sub statuses', () => {
+  assert.deepEqual(getResultDisplay({
+    result: 'submitted_unconfirmed',
+    errorMessage: 'restored page did not show acceptance signal'
+  }), {
+    value: 'submitted_unconfirmed',
+    category: 'action_required',
+    subcategory: 'unconfirmed_acceptance',
+    text: '已提交，页面未确认',
+    categoryText: '待确认/需手动',
+    cssClass: 'submitted_unconfirmed'
+  });
+
+  assert.equal(getResultDisplay({
+    result: 'submitted_unconfirmed',
+    errorMessage: 'submit observed as success/submit_evidence_without_backlink but backlink verification did not finish before grace timeout'
+  }).text, '已提交，反链未确认');
+
+  assert.equal(getResultDisplay({
+    result: 'submitted_unconfirmed',
+    errorMessage: 'submit started but no confirmation returned after grace period'
+  }).subcategory, 'unconfirmed_timeout');
+});
+
+test('buildManualReviewTarget extracts a browser-openable target page URL', () => {
+  assert.deepEqual(buildManualReviewTarget({
+    record: { url: 'https://target.test/post' },
+    source: 'current'
+  }), {
+    ok: true,
+    url: 'https://target.test/post',
+    source: 'current'
+  });
+
+  assert.deepEqual(buildManualReviewTarget({
+    record: { sourceUrl: 'https://archive-source.test/post' },
+    source: 'archive'
+  }), {
+    ok: true,
+    url: 'https://archive-source.test/post',
+    source: 'archive'
+  });
+
+  assert.equal(buildManualReviewTarget({
+    record: { url: 'javascript:alert(1)' },
+    source: 'current'
+  }).ok, false);
+});
+
+test('buildManualReviewOpenMessage carries existing AI content for manual review', () => {
+  assert.deepEqual(buildManualReviewOpenMessage({
+    record: { aiContent: 'Existing copy' },
+    tab: 'manual'
+  }), {
+    type: 'SHOW_PROMOTE_PANEL',
+    tab: 'manual',
+    presetAiContent: 'Existing copy',
+    presetAiContentSource: 'manual_review'
+  });
+
+  assert.deepEqual(buildManualReviewOpenMessage({
+    record: { aiContent: '' },
+    tab: 'progress'
+  }), {
+    type: 'SHOW_PROMOTE_PANEL',
+    tab: 'progress',
+    presetAiContent: '',
+    presetAiContentSource: 'manual_review'
+  });
+});
+
+test('findDuplicatePromotionSubmissionRecord skips submitted or probably submitted promotion records only', () => {
+  const records = [
+    { sourceUrl: 'https://target.test/post#comment-1', promotionWebsiteUrl: 'https://promo.test/', result: 'fail' },
+    { sourceUrl: 'https://target.test/post/', promotionWebsiteUrl: 'https://other.test/', result: 'success' },
+    { sourceUrl: 'https://target.test/post', promotionWebsiteUrl: 'https://promo.test/', result: 'manual_required' },
+    { sourceUrl: 'https://target.test/post', promotionWebsiteUrl: 'https://promo.test/', result: 'submitted_unconfirmed', errorMessage: 'submit observed as success/submit_evidence_without_backlink but backlink verification did not finish before grace timeout' }
+  ];
+
+  const match = findDuplicatePromotionSubmissionRecord({
+    records,
+    url: 'https://target.test/post/',
+    promotionWebsiteUrl: 'promo.test'
+  });
+
+  assert.equal(match.shouldSkip, true);
+  assert.equal(match.record.result, 'submitted_unconfirmed');
+  assert.equal(match.reason, 'duplicate_promotion_submission');
+
+  assert.equal(findDuplicatePromotionSubmissionRecord({
+    records,
+    url: 'https://target.test/post/',
+    promotionWebsiteUrl: 'https://other-promo.test/'
+  }).shouldSkip, false);
+});
+
+test('findDuplicatePromotionSubmissionRecord treats success and moderation success as duplicate submissions', () => {
+  for (const result of ['success', 'success_pending_moderation', 'pending']) {
+    const match = findDuplicatePromotionSubmissionRecord({
+      records: [{ url: 'https://target.test/post', promotionWebsiteUrl: 'https://promo.test', result }],
+      url: 'https://target.test/post#reply',
+      promotionWebsiteUrl: 'https://promo.test/'
+    });
+    assert.equal(match.shouldSkip, true);
+    assert.equal(match.record.result, result);
+  }
 });
 
 test('deletePromotionWebsiteRecords removes archive and runtime records for one promotion website', () => {

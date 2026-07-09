@@ -15,6 +15,299 @@ function getRecordPromotionKey(record) {
   return source.promotionWebsiteKey || source.copyPromotionWebsiteKey || normalizePromotionWebsiteKey(source.promotionWebsiteUrl);
 }
 
+function normalizeSubmissionSourceUrlKey(url) {
+  const text = String(url || '').trim();
+  if (!text) return '';
+  try {
+    const parsed = new URL(/^https?:\/\//i.test(text) ? text : `https://${text}`);
+    parsed.hash = '';
+    parsed.hostname = parsed.hostname.toLowerCase();
+    parsed.pathname = parsed.pathname.replace(/\/+$/, '') || '/';
+    return parsed.href.toLowerCase();
+  } catch (_) {
+    return text.replace(/#.*$/, '').replace(/\/+$/, '').toLowerCase();
+  }
+}
+
+function dedupeCsvSourceUrlItems(items) {
+  const sourceItems = Array.isArray(items) ? items : [];
+  const seen = new Set();
+  const uniqueItems = [];
+  let duplicateCount = 0;
+
+  for (const item of sourceItems) {
+    const key = normalizeSubmissionSourceUrlKey(item && item.url);
+    if (!key) {
+      uniqueItems.push(item);
+      continue;
+    }
+
+    if (seen.has(key)) {
+      duplicateCount++;
+      continue;
+    }
+
+    seen.add(key);
+    uniqueItems.push(item);
+  }
+
+  return {
+    items: uniqueItems,
+    duplicateCount
+  };
+}
+
+const RESULT_DISPLAY = {
+  success: {
+    value: 'success',
+    category: 'success',
+    subcategory: 'success',
+    text: '成功',
+    categoryText: '成功/审核中',
+    cssClass: 'success'
+  },
+  success_pending_moderation: {
+    value: 'success_pending_moderation',
+    category: 'success',
+    subcategory: 'success_pending_moderation',
+    text: '提交成功，审核中',
+    categoryText: '成功/审核中',
+    cssClass: 'success_pending_moderation'
+  },
+  skipped: {
+    value: 'skipped',
+    category: 'skipped',
+    subcategory: 'skipped',
+    text: '已存在',
+    categoryText: '已存在',
+    cssClass: 'skipped'
+  },
+  manual_required: {
+    value: 'manual_required',
+    category: 'action_required',
+    subcategory: 'manual_required',
+    text: '需手动处理',
+    categoryText: '待确认/需手动',
+    cssClass: 'manual_required'
+  },
+  submitted_unconfirmed: {
+    value: 'submitted_unconfirmed',
+    category: 'action_required',
+    subcategory: 'submitted_unconfirmed',
+    text: '待确认',
+    categoryText: '待确认/需手动',
+    cssClass: 'submitted_unconfirmed'
+  },
+  no_comment_box: {
+    value: 'no_comment_box',
+    category: 'no_comment_box',
+    subcategory: 'no_comment_box',
+    text: '无评论框',
+    categoryText: '无评论框',
+    cssClass: 'no_comment_box'
+  },
+  blocked_illegal: {
+    value: 'blocked_illegal',
+    category: 'fail',
+    subcategory: 'blocked_illegal',
+    text: '已拦截',
+    categoryText: '失败/已拦截',
+    cssClass: 'blocked_illegal'
+  },
+  fail: {
+    value: 'fail',
+    category: 'fail',
+    subcategory: 'fail',
+    text: '失败',
+    categoryText: '失败/已拦截',
+    cssClass: 'fail'
+  }
+};
+
+function normalizeResultValue(result) {
+  const raw = String(result || '').trim();
+  const normalized = raw.toLowerCase();
+  if (normalized === 'ok') return 'success';
+  if (normalized === 'manual_required') return 'manual_required';
+  if (normalized === 'fail') return 'fail';
+  if (normalized === 'blocked' || normalized === 'blocked_illegal') return 'blocked_illegal';
+  if (normalized === 'pending' || normalized === 'submitted_unconfirmed') return 'submitted_unconfirmed';
+  return RESULT_DISPLAY[raw] ? raw : normalized;
+}
+
+function getSubmittedUnconfirmedDisplay(record) {
+  const source = record && typeof record === 'object' ? record : {};
+  const message = String(source.errorMessage || source.reason || '').toLowerCase();
+  const base = { ...RESULT_DISPLAY.submitted_unconfirmed };
+  if (/without[_ -]?backlink|backlink verification|未检测到反链|反链/.test(message)) {
+    return {
+      ...base,
+      subcategory: 'unconfirmed_backlink',
+      text: '已提交，反链未确认'
+    };
+  }
+  if (/grace timeout|after grace period|confirmation returned|timed out|timeout|超时/.test(message)) {
+    return {
+      ...base,
+      subcategory: 'unconfirmed_timeout',
+      text: '已提交，确认超时'
+    };
+  }
+  if (/acceptance signal|no acceptance|page did not show|without acceptance|未确认|未显示/.test(message)) {
+    return {
+      ...base,
+      subcategory: 'unconfirmed_acceptance',
+      text: '已提交，页面未确认'
+    };
+  }
+  if (/submit triggered|submit observed|submit started|submitted|已提交/.test(message)) {
+    return {
+      ...base,
+      subcategory: 'unconfirmed_submitted',
+      text: '已提交，待确认'
+    };
+  }
+  return base;
+}
+
+function getResultDisplay(input) {
+  const isRecord = input && typeof input === 'object' && !Array.isArray(input);
+  const result = isRecord ? input.result : input;
+  const value = normalizeResultValue(result);
+  if (value === 'submitted_unconfirmed') return getSubmittedUnconfirmedDisplay(isRecord ? input : { result });
+  if (RESULT_DISPLAY[value]) return { ...RESULT_DISPLAY[value] };
+  const text = String(result || '').trim() || '未知';
+  return {
+    value,
+    category: value || 'unknown',
+    subcategory: value || 'unknown',
+    text,
+    categoryText: text,
+    cssClass: value || 'unknown'
+  };
+}
+
+function getRecordResultDisplay(record) {
+  const source = record && typeof record === 'object' ? record : {};
+  return getResultDisplay(source);
+}
+
+function resultMatchesFilter(result, filter) {
+  const selected = String(filter || 'all').trim();
+  if (!selected || selected === 'all') return true;
+  const display = getResultDisplay(result);
+  if (selected === display.category || selected === display.value) return true;
+  if (selected === display.subcategory) return true;
+  return false;
+}
+
+function buildResultSummary(records) {
+  const rows = Array.isArray(records) ? records : [];
+  const summary = {
+    total: rows.length,
+    success: 0,
+    skipped: 0,
+    manual: 0,
+    manualRequired: 0,
+    unconfirmedAcceptance: 0,
+    unconfirmedBacklink: 0,
+    unconfirmedTimeout: 0,
+    unconfirmedSubmitted: 0,
+    noCommentBox: 0,
+    fail: 0,
+    successRate: 0
+  };
+  for (const record of rows) {
+    const display = getRecordResultDisplay(record);
+    const category = display.category;
+    if (category === 'success') summary.success++;
+    else if (category === 'skipped') summary.skipped++;
+    else if (category === 'action_required') {
+      summary.manual++;
+      if (display.subcategory === 'manual_required') summary.manualRequired++;
+      else if (display.subcategory === 'unconfirmed_acceptance') summary.unconfirmedAcceptance++;
+      else if (display.subcategory === 'unconfirmed_backlink') summary.unconfirmedBacklink++;
+      else if (display.subcategory === 'unconfirmed_timeout') summary.unconfirmedTimeout++;
+      else summary.unconfirmedSubmitted++;
+    }
+    else if (category === 'no_comment_box') summary.noCommentBox++;
+    else if (category === 'fail') summary.fail++;
+  }
+  summary.successRate = summary.total > 0
+    ? Math.round(((summary.success + summary.skipped) / summary.total) * 100)
+    : 0;
+  return summary;
+}
+
+function buildBatchResultSearchText(record) {
+  const source = record && typeof record === 'object' ? record : {};
+  const display = getRecordResultDisplay(source);
+  const domain = source.url ? getHostForFilename(source.url) : '';
+  return [
+    source.originalIndex != null ? Number(source.originalIndex) + 1 : '',
+    source.url,
+    domain,
+    display.value,
+    display.subcategory,
+    display.text,
+    display.categoryText,
+    source.aiContent,
+    source.errorMessage,
+    source.elapsed != null ? `${source.elapsed}s` : '',
+    source.timestamp ? new Date(source.timestamp).toISOString() : ''
+  ].join(' ').toLowerCase();
+}
+
+function buildArchiveResultSearchText(record) {
+  const source = record && typeof record === 'object' ? record : {};
+  const display = getRecordResultDisplay(source);
+  return [
+    source.originalIndex != null ? Number(source.originalIndex) + 1 : '',
+    source.promotionWebsiteUrl,
+    source.sourceUrl,
+    source.url,
+    source.sourceDomain,
+    display.value,
+    display.subcategory,
+    display.text,
+    display.categoryText,
+    source.aiContent,
+    source.errorMessage,
+    source.batchId,
+    source.matchedHref
+  ].join(' ').toLowerCase();
+}
+
+function filterBatchResultRecords(records, filters) {
+  const source = Array.isArray(records) ? records : [];
+  const options = filters || {};
+  const result = options.result || 'all';
+  const domain = options.domain || 'all';
+  const keyword = String(options.keyword || '').trim().toLowerCase();
+  return source.filter((record) => {
+    if (!resultMatchesFilter(record, result)) return false;
+    if (domain !== 'all' && getHostForFilename(record && record.url) !== domain) return false;
+    if (typeof options.timeBucket === 'function' && !options.timeBucket(record && record.elapsed)) return false;
+    if (keyword && !buildBatchResultSearchText(record).includes(keyword)) return false;
+    return true;
+  });
+}
+
+function filterArchiveResultRecords(records, filters) {
+  const source = Array.isArray(records) ? records : [];
+  const options = filters || {};
+  const websiteKey = options.websiteKey || 'all';
+  const result = options.result || 'all';
+  const keyword = String(options.keyword || '').trim().toLowerCase();
+  return source.filter((record) => {
+    const recordWebsiteKey = getRecordPromotionKey(record);
+    if (websiteKey !== 'all' && recordWebsiteKey !== websiteKey) return false;
+    if (!resultMatchesFilter(record, result)) return false;
+    if (keyword && !buildArchiveResultSearchText(record).includes(keyword)) return false;
+    return true;
+  });
+}
+
 function csvEscape(value) {
   if (value == null) return '';
   const text = String(value);
@@ -43,9 +336,10 @@ function getExportSourceColumnCount(originalRow) {
 }
 
 function getExportRunResult(result) {
-  if (result === 'success' || result === 'success_pending_moderation' || result === 'skipped') return 'OK';
-  if (result === 'manual_required' || result === 'submitted_unconfirmed') return 'MANUAL_REQUIRED';
-  if (result === 'blocked_illegal') return 'BLOCKED';
+  const display = getResultDisplay(result);
+  if (display.category === 'success' || display.category === 'skipped') return 'OK';
+  if (display.category === 'action_required') return 'MANUAL_REQUIRED';
+  if (display.value === 'blocked_illegal') return 'BLOCKED';
   return 'FAIL';
 }
 
@@ -352,9 +646,84 @@ function buildAssistantWarning(input) {
   };
 }
 
+function buildManualReviewTarget(input) {
+  const source = input && typeof input === 'object' ? input : {};
+  const record = source.record && typeof source.record === 'object' ? source.record : {};
+  const resultSource = source.source === 'archive' ? 'archive' : 'current';
+  const rawUrl = resultSource === 'archive'
+    ? (record.sourceUrl || record.url || '')
+    : (record.url || record.sourceUrl || '');
+  const text = String(rawUrl || '').trim();
+  if (!text) {
+    return { ok: false, url: '', source: resultSource, error: 'missing_url' };
+  }
+  try {
+    const parsed = new URL(text);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      return { ok: false, url: text, source: resultSource, error: 'unsupported_protocol' };
+    }
+    return { ok: true, url: parsed.href, source: resultSource };
+  } catch (_) {
+    return { ok: false, url: text, source: resultSource, error: 'invalid_url' };
+  }
+}
+
+function buildManualReviewOpenMessage(input) {
+  const source = input && typeof input === 'object' ? input : {};
+  const record = source.record && typeof source.record === 'object' ? source.record : {};
+  return {
+    type: 'SHOW_PROMOTE_PANEL',
+    tab: source.tab === 'progress' ? 'progress' : 'manual',
+    presetAiContent: String(record.aiContent || ''),
+    presetAiContentSource: 'manual_review'
+  };
+}
+
+function isDuplicatePromotionSubmissionResult(record) {
+  const display = getRecordResultDisplay(record);
+  return display.value === 'success' ||
+    display.value === 'success_pending_moderation' ||
+    display.value === 'submitted_unconfirmed';
+}
+
+function findDuplicatePromotionSubmissionRecord(input) {
+  const source = input && typeof input === 'object' ? input : {};
+  const targetSourceKey = normalizeSubmissionSourceUrlKey(source.url || source.sourceUrl);
+  const targetPromotionKey = normalizePromotionWebsiteKey(source.promotionWebsiteUrl);
+  if (!targetSourceKey || !targetPromotionKey || targetPromotionKey === '__unconfigured__') {
+    return { shouldSkip: false, record: null, reason: '' };
+  }
+
+  const records = Array.isArray(source.records) ? source.records : [];
+  for (const record of records) {
+    if (!record || typeof record !== 'object') continue;
+    if (!isDuplicatePromotionSubmissionResult(record)) continue;
+    const recordSourceKey = normalizeSubmissionSourceUrlKey(record.sourceUrl || record.url);
+    if (recordSourceKey !== targetSourceKey) continue;
+    if (getRecordPromotionKey(record) !== targetPromotionKey) continue;
+    return {
+      shouldSkip: true,
+      record,
+      reason: 'duplicate_promotion_submission'
+    };
+  }
+
+  return { shouldSkip: false, record: null, reason: '' };
+}
+
 const BatchResultsLogic = {
   normalizePromotionWebsiteKey,
+  normalizeSubmissionSourceUrlKey,
+  dedupeCsvSourceUrlItems,
   getRecordPromotionKey,
+  normalizeResultValue,
+  getResultDisplay,
+  resultMatchesFilter,
+  buildResultSummary,
+  buildBatchResultSearchText,
+  buildArchiveResultSearchText,
+  filterBatchResultRecords,
+  filterArchiveResultRecords,
   buildCurrentBatchExportCsv,
   buildArchiveExportCsv,
   deletePromotionWebsiteRecords,
@@ -364,6 +733,10 @@ const BatchResultsLogic = {
   chooseAssistantProgressTab,
   buildServiceStatusSummary,
   buildAssistantWarning,
+  buildManualReviewTarget,
+  buildManualReviewOpenMessage,
+  isDuplicatePromotionSubmissionResult,
+  findDuplicatePromotionSubmissionRecord,
   getExportSourceColumnCount,
   getExportRunResult
 };
