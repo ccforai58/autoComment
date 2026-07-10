@@ -9,6 +9,7 @@
 /node_modules/
 .local-backend.pid
 /output/
+/.worktrees/
 
 # Generated CSV inventory for automatic paid fulfillment.
 /storage/csv-batches/
