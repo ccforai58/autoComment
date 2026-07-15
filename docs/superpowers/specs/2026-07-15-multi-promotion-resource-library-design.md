@@ -23,8 +23,18 @@
 - 自动、半自动、手动模式共用同一套当前推广网站配置。
 - 自动、半自动、手动模式共用同一套提交记录和外链资源库。
 - 外链检测成功后，把对应资源写入正式外链资源库。
-- 资源库导出字段参考 Semrush 导入文件模板，并补充序号、目标域名、目标域名权重占位、目标域名流量占位。
+- 资源库导出字段参考 Semrush 导入文件模板，并补充序号、目标域名、目标域名权重占位、目标域名流量占位、资源发现来源。
 - UI 保持简单、分区清楚、步骤少，避免把配置、提交记录、资源库混在一起。
+
+## URL 字段命名约定
+
+本功能中会同时出现本系统的目标网址和 Semrush CSV 的目标网址，必须明确区分：
+
+- `Target url`：资源库导出中的正式目标网址，始终表示我们的推广网址，也就是 `promotion_projects.target_url`。
+- `Source url`：外链提交地址，也就是产生外链的资源页面。
+- `Discovery target url`：资源发现来源，取自导入 Semrush CSV 文件里的原始 `Target url`。它表示这条 `Source url` 最初是从哪个 Semrush 目标页面或竞品外链记录中发现的，不参与反链检测目标匹配。
+
+实现和 UI 文案中不得把 `Discovery target url` 简写成 `Target url`，避免和我们的推广网址混淆。
 
 ## 非目标
 
@@ -85,6 +95,7 @@
 - `source_url`
 - `source_url_key`
 - `source_domain`
+- `discovery_target_url`：可选，来自 Semrush CSV 原始 `Target url`，用于记录这条资源从哪里发现。
 - `mode`：`batch`、`assistant`、`manual`。
 - `submit_mode`：`manual`、`confirm`、`auto`。
 - `result`：沿用现有成功、待确认、失败、需手动处理等状态。
@@ -129,6 +140,7 @@
 - `target_domain`
 - `target_domain_authority`：第一版占位为空。
 - `target_domain_traffic`：第一版占位为空。
+- `discovery_target_url`：可选，继承自提交记录或 Semrush 导入行的原始 `Target url`。
 - `matched_href`
 - `first_verified_at`
 - `last_verified_at`
@@ -176,6 +188,7 @@
 - 工作台顶部显示当前推广网站、目标域名和关键字摘要。
 - 用户可从工作台跳转到推广网站管理页切换当前项目。
 - 每条 URL 的提交结果写入 `submission_records`。
+- Semrush CSV 导入产生的提交任务需要把原始 `Target url` 写入 `discovery_target_url`，不能覆盖当前推广项目的 `target_url`。
 - 现有前端实时进度、当前批次表格、存档体验保留。
 - 存档筛选改为优先按 `promotion_project_id` 和 `target_domain`。
 
@@ -213,6 +226,7 @@
 - `Target domain traffic`
 - `Source url`
 - `Source domain`
+- `Discovery target url`
 - `Page ascore`
 - `Source title`
 - `External links`
@@ -225,7 +239,7 @@
 - `Description`
 - `H1`
 
-其中 `Target url` 是推广网址，`Source url` 是外链提交地址。目标域名权重和流量第一版导出为空，后续功能补充。
+其中 `Target url` 是我们的推广网址，`Source url` 是外链提交地址，`Discovery target url` 是导入 Semrush CSV 时原始行里的 `Target url`。目标域名权重和流量第一版导出为空，后续功能补充。
 
 ## UI 设计原则
 
@@ -327,6 +341,7 @@
 - 同一 `source_url_key + promotion_project_id` 重复成功只更新。
 - 同一 `source_url_key` 对不同 `promotion_project_id` 可创建多条关系。
 - 资源库导出字段顺序和 `Target url`、`Source url` 语义正确。
+- Semrush CSV 原始 `Target url` 被导出为 `Discovery target url`，不会覆盖我们的推广网址。
 - 旧配置首次迁移为推广项目。
 
 手动验收：
@@ -340,6 +355,7 @@
 - 外链检测成功后，资源库出现对应记录。
 - 同一个 Source url 分别对两个推广网站检测成功后，资源库显示两条关系。
 - 资源库 CSV 导出内容可被表格软件打开且列名正确。
+- 从 Semrush CSV 导入的资源在检测成功后，资源库行能显示原始 `Discovery target url`。
 
 ## 验收标准
 
@@ -350,6 +366,6 @@
 - 所有提交记录写入 MySQL，并绑定推广项目。
 - 外链检测成功后才进入正式外链资源库。
 - 同一 Source url 支持多个推广网站成功关系。
-- 资源库导出符合约定字段，且 `Target url` 和 `Source url` 语义正确。
+- 资源库导出符合约定字段，且 `Target url`、`Source url`、`Discovery target url` 语义正确。
 - UI 分区清楚、状态明确、操作步骤少。
 - 不保存或记录敏感凭据。
