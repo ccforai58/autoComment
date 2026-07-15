@@ -180,6 +180,12 @@
         background-color: #f0fdf4;
       }
 
+      .upload-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 12px;
+      }
+
       .upload-icon {
         font-size: 36px;
         margin-bottom: 8px;
@@ -198,6 +204,35 @@
 
       input[type='file'] {
         display: none;
+      }
+
+      .semrush-config {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 10px;
+        margin-top: 12px;
+      }
+
+      .semrush-config label {
+        display: grid;
+        gap: 5px;
+        font-size: 12px;
+        font-weight: 700;
+        color: #4b5563;
+      }
+
+      .semrush-config input {
+        width: 100%;
+        padding: 7px 9px;
+        border: 1px solid #d1d5db;
+        border-radius: 8px;
+        font-size: 13px;
+      }
+
+      .import-status {
+        margin-top: 10px;
+        font-size: 12px;
+        color: #4b5563;
       }
 
       .file-info {
@@ -845,6 +880,13 @@
         color: #2563eb;
         font-size: 14px;
       }
+
+      @media (max-width: 640px) {
+        .upload-grid,
+        .semrush-config {
+          grid-template-columns: 1fr;
+        }
+      }
     </style>
   </head>
   <body>
@@ -893,12 +935,29 @@
       <!-- 文件上传区 -->
       <div class="card">
         <div class="card-title">上传 CSV 文件</div>
-        <div class="upload-zone" id="uploadZone">
-          <div class="upload-icon">📂</div>
-          <div class="upload-text">拖拽 CSV 文件到此处，或点击选择文件</div>
-          <div class="upload-hint">支持 .csv 文件，建议不超过 5,000 行</div>
-          <input type="file" id="fileInput" accept=".csv" />
+        <div class="upload-grid">
+          <div class="upload-zone" id="uploadZone">
+            <div class="upload-icon" aria-hidden="true">CSV</div>
+            <div class="upload-text">普通 CSV</div>
+            <div class="upload-hint">包含原 URL 的标准任务文件</div>
+            <input type="file" id="fileInput" accept=".csv" />
+          </div>
+          <div class="upload-zone semrush-upload-zone" id="semrushUploadZone">
+            <div class="upload-icon" aria-hidden="true">SEMrush</div>
+            <div class="upload-text">Semrush 外链 CSV</div>
+            <div class="upload-hint">读取 Source url 并过滤低质量来源</div>
+            <input type="file" id="semrushFileInput" accept=".csv" />
+          </div>
         </div>
+        <div class="semrush-config" id="semrushConfig">
+          <label>Page ascore 最低值
+            <input type="number" id="semrushMinAscore" min="0" max="100" value="5" />
+          </label>
+          <label>同域最多保留
+            <input type="number" id="semrushMaxPerDomain" min="1" max="20" value="3" />
+          </label>
+        </div>
+        <div class="import-status" id="semrushImportStatus" aria-live="polite"></div>
 
         <div class="file-info" id="fileInfo">
           <span class="file-name" id="fileName"></span>
@@ -1177,6 +1236,7 @@
     <script src="lib/batch-results-logic.js"></script>
     <script src="extension-config.js"></script>
     <script src="illegal-site-filter.js"></script>
+    <script src="lib/semrush-import-logic.js"></script>
     <script src="batch.js"></script>
   </body>
 </html>

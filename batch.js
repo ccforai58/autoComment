@@ -21,6 +21,45 @@ function sendLocalDebugLog(source, payload) {
   } catch (_) {}
 }
 
+function getSemrushImportLogic() {
+  return window.AutoCommentSemrushImportLogic || null;
+}
+
+function sanitizeSemrushImportValue(value) {
+  const logic = getSemrushImportLogic();
+  const sanitizeUrl = logic && typeof logic.sanitizeUrlForLog === 'function'
+    ? logic.sanitizeUrlForLog
+    : (url) => String(url || '').split(/[?#]/)[0].slice(0, 200);
+  const sanitizeText = logic && typeof logic.sanitizeTextForLog === 'function'
+    ? logic.sanitizeTextForLog
+    : (text) => String(text == null ? '' : text).replace(/https?:\/\/[^\s"'<>`]+/gi, (match) => sanitizeUrl(match));
+
+  if (Array.isArray(value)) return value.slice(0, 50).map((item) => sanitizeSemrushImportValue(item));
+  if (!value || typeof value !== 'object') {
+    if (typeof value === 'string') return sanitizeText(value);
+    return value;
+  }
+
+  if (value instanceof Error) {
+    return {
+      name: value.name,
+      message: sanitizeText(value.message || String(value))
+    };
+  }
+
+  const result = {};
+  for (const [key, child] of Object.entries(value)) {
+    if (typeof child === 'string' && /(url|reason|message|error)/i.test(key)) {
+      result[key] = sanitizeText(child);
+    } else if (/url/i.test(key) && typeof child === 'string') {
+      result[key] = sanitizeUrl(child);
+    } else {
+      result[key] = sanitizeSemrushImportValue(child);
+    }
+  }
+  return result;
+}
+
 function logSubmitFlow(stage, details = {}) {
   const entry = { stage, batchId, ...details };
   console.log('[batch][submit-flow]', entry);
@@ -172,12 +211,18 @@ let skippedIndices = new Set();
 // ==================== section ====================
 const uploadZone = document.getElementById('uploadZone');
 const fileInput = document.getElementById('fileInput');
+const semrushUploadZone = document.getElementById('semrushUploadZone');
+const semrushFileInput = document.getElementById('semrushFileInput');
+const semrushMinAscore = document.getElementById('semrushMinAscore');
+const semrushMaxPerDomain = document.getElementById('semrushMaxPerDomain');
+const semrushImportStatus = document.getElementById('semrushImportStatus');
 const fileInfo = document.getElementById('fileInfo');
 const fileName = document.getElementById('fileName');
 const fileCount = document.getElementById('fileCount');
 const fileRemove = document.getElementById('fileRemove');
 const urlPreview = document.getElementById('urlPreview');
 const urlPreviewBody = document.getElementById('urlPreviewBody');
+const duplicateCountEl = document.getElementById('duplicateCount');
 const startBtn = document.getElementById('startBtn');
 const stopBtn = document.getElementById('stopBtn');
 const progressSection = document.getElementById('progressSection');
@@ -493,6 +538,13 @@ function bindEvents() {
   uploadZone.addEventListener('dragleave', () => uploadZone.classList.remove('drag-over'));
   uploadZone.addEventListener('drop', handleFileDrop);
   fileInput.addEventListener('change', handleFileSelect);
+  if (semrushUploadZone && semrushFileInput) {
+    semrushUploadZone.addEventListener('click', () => semrushFileInput.click());
+    semrushFileInput.addEventListener('change', handleSemrushFileSelect);
+    semrushUploadZone.addEventListener('dragover', handleDragOver);
+    semrushUploadZone.addEventListener('dragleave', handleDragLeave);
+    semrushUploadZone.addEventListener('drop', handleSemrushFileDrop);
+  }
 
   // Text cleanup: previous comment was mojibake.
   fileRemove.addEventListener('click', resetFile);
@@ -585,6 +637,90 @@ function handleFileSelect(e) {
   if (file) processFile(file);
 }
 
+function handleDragOver(e) {
+  e.preventDefault();
+  if (e.currentTarget && e.currentTarget.classList) {
+    e.currentTarget.classList.add('drag-over');
+  }
+}
+
+function handleDragLeave(e) {
+  if (e.currentTarget && e.currentTarget.classList) {
+    e.currentTarget.classList.remove('drag-over');
+  }
+}
+
+function handleSemrushFileSelect(e) {
+  const file = e.target.files[0];
+  if (file) processSemrushFile(file);
+}
+
+function handleSemrushFileDrop(e) {
+  e.preventDefault();
+  if (semrushUploadZone) semrushUploadZone.classList.remove('drag-over');
+  const file = e.dataTransfer.files[0];
+  if (file) processSemrushFile(file);
+}
+
+function logSemrushImport(stage, details = {}) {
+  const entry = sanitizeSemrushImportValue({ stage, ...details });
+  console.info('[batch][semrush-import]', entry);
+  sendLocalDebugLog('semrush-import', entry);
+}
+
+function setSemrushImportStatus(text) {
+  if (semrushImportStatus) semrushImportStatus.textContent = text;
+  logSemrushImport('status', { text });
+}
+
+function getSemrushImportFatalMessage(errorCode) {
+  if (errorCode === 'missing_source_url') {
+    return 'Semrush CSV 缺少 Source url 列，无法导入';
+  }
+  return '';
+}
+
+async function reviewSemrushDomain({ domain, sampleUrl }) {
+  const timeoutMs = 15000;
+  const startedAt = Date.now();
+  const controller = typeof AbortController === 'function' ? new AbortController() : null;
+  const timeoutId = controller
+    ? setTimeout(() => controller.abort(new DOMException('Semrush domain review timeout', 'AbortError')), timeoutMs)
+    : null;
+
+  try {
+    const response = await fetch(`${API_BASE}/semrush-domain-review`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ domain, sampleUrl }),
+      signal: controller ? controller.signal : undefined
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok || payload.success === false) {
+      return {
+        status: 'review_failed',
+        reason: payload && payload.error ? String(payload.error) : `http_${response.status}`,
+        durationMs: Date.now() - startedAt
+      };
+    }
+    return {
+      ...payload,
+      durationMs: Date.now() - startedAt
+    };
+  } catch (error) {
+    if (error && error.name === 'AbortError') {
+      return {
+        status: 'review_failed',
+        reason: 'timeout',
+        durationMs: Date.now() - startedAt
+      };
+    }
+    throw error;
+  } finally {
+    if (timeoutId) clearTimeout(timeoutId);
+  }
+}
+
 function processFile(file) {
   if (!file.name.endsWith('.csv')) {
     alert('请上传 CSV 文件');
@@ -650,7 +786,7 @@ function normalizeEncoding(arrayBuffer) {
   const utf8Text = new TextDecoder('utf-8').decode(bytes);
 
   // Text cleanup: previous comment was mojibake.
-  if (hasGBKSignature && (utf8Text.includes('\uFFFD') || utf8Text.includes('???') || /[\x00-\x08\x0B\x0C\x0E-\x1F]/.test(utf8Text.slice(0, 100)))) {
+  if (hasGBKSignature && (utf8Text.includes('\uFFFD') || utf8Text.includes('\u003f\u003f\u003f') || /[\x00-\x08\x0B\x0C\x0E-\x1F]/.test(utf8Text.slice(0, 100)))) {
     try {
       // Text cleanup: previous comment was mojibake.
       const gbkText = new TextDecoder('gbk').decode(bytes);
@@ -714,6 +850,9 @@ function parseCSV(raw, fileNameParam) {
   const seenSourceUrlKeys = new Set();
   parsedUrls = [];
   urlPreviewBody.innerHTML = '';
+  if (duplicateCountEl) duplicateCountEl.textContent = '';
+  if (semrushImportStatus) semrushImportStatus.textContent = '';
+  if (semrushUploadZone) semrushUploadZone.classList.remove('has-file');
 
   for (let i = 1; i < lines.length; i++) {
     const row = parseCSVLine(lines[i]);
@@ -776,7 +915,7 @@ function parseCSV(raw, fileNameParam) {
   if (illegalCount > 0) fileCount.textContent += `, blocked ${illegalCount}`;
   if (duplicateCount > 0) {
     fileCount.textContent += `, deduped ${duplicateCount} duplicate source URL(s)`;
-    document.getElementById('duplicateCount').textContent = `deduped ${duplicateCount} duplicate source URL(s)`;
+    if (duplicateCountEl) duplicateCountEl.textContent = `deduped ${duplicateCount} duplicate source URL(s)`;
   }
   updateCostHint(Math.max(0, validCount - illegalCount));
   if (validCount > 0) {
@@ -785,6 +924,120 @@ function parseCSV(raw, fileNameParam) {
   }
   updateStatsUI();
   updateUI();
+}
+
+async function processSemrushFile(file) {
+  if (!file.name.endsWith('.csv')) {
+    alert('请上传 CSV 文件');
+    return;
+  }
+
+  try {
+    setSemrushImportStatus('正在解析 CSV...');
+    const raw = await file.arrayBuffer();
+    const text = normalizeEncoding(raw);
+    const parsed = Papa.parse(text, { skipEmptyLines: true });
+    const rows = parsed.data || [];
+    if (rows.length < 2) {
+      alert('Semrush CSV 文件为空或格式无效');
+      return;
+    }
+
+    const logic = getSemrushImportLogic();
+    if (!logic || typeof logic.runSemrushImport !== 'function') {
+      alert('Semrush 导入模块未加载');
+      return;
+    }
+
+    const minPageAscoreValue = Number(semrushMinAscore && semrushMinAscore.value);
+    const maxPerDomainValue = Number(semrushMaxPerDomain && semrushMaxPerDomain.value);
+    const options = {
+      minPageAscore: Number.isFinite(minPageAscoreValue) ? minPageAscoreValue : 5,
+      maxPerDomain: Number.isFinite(maxPerDomainValue) ? maxPerDomainValue : 3
+    };
+
+    logSemrushImport('start', { fileName: file.name, fileSize: file.size, options });
+    setSemrushImportStatus('正在去重和离线筛选...');
+    const result = await logic.runSemrushImport({
+      header: rows[0],
+      rows: rows.slice(1),
+      options,
+      illegalSiteFilter: window.AutoCommentIllegalSiteFilter,
+      reviewDomain: async (input) => {
+        setSemrushImportStatus(`正在联网复查疑似站群：${input.domain}`);
+        return reviewSemrushDomain(input);
+      }
+    });
+
+    const importErrorCode = typeof logic.getSemrushImportErrorCode === 'function'
+      ? logic.getSemrushImportErrorCode(result)
+      : (result && result.errorCode) || '';
+    const fatalMessage = getSemrushImportFatalMessage(importErrorCode);
+    if (fatalMessage) {
+      setSemrushImportStatus('导入失败');
+      logSemrushImport('failed', { errorCode: importErrorCode, message: fatalMessage });
+      alert(fatalMessage);
+      return;
+    }
+
+    parsedUrls = result.submitItems.map((item, index) => ({
+      originalIndex: index,
+      url: item.url,
+      sourceDomain: item.sourceDomain,
+      targetDomain: item.targetDomain,
+      illegalCheck: null,
+      originalRow: item.originalRow,
+      semrushMeta: {
+        targetUrl: item.targetUrl,
+        targetDomain: item.targetDomain,
+        pageAscore: item.pageAscore,
+        externalLinks: item.externalLinks,
+        lastSeen: item.lastSeen
+      }
+    }));
+
+    renderSemrushPreview(result);
+    fileName.textContent = file.name;
+    fileInfo.classList.add('visible');
+    fileInput.value = '';
+    uploadZone.classList.remove('has-file');
+    if (semrushUploadZone) semrushUploadZone.classList.add('has-file');
+    fileCount.textContent = logic.buildSemrushImportSummary(result.stats);
+    updateCostHint(parsedUrls.length);
+    resetRuntimeForNewUpload(parsedUrls.length);
+    clearRuntimeStorageForNewUpload();
+    updateStatsUI();
+    updateUI();
+    setSemrushImportStatus('导入完成');
+    logSemrushImport('complete', {
+      stats: result.stats,
+      diagnostics: Array.isArray(result.diagnostics) ? result.diagnostics.slice(0, 50) : []
+    });
+  } catch (error) {
+    console.warn('[batch][semrush-import] failed', sanitizeSemrushImportValue(error));
+    logSemrushImport('failed', { message: error && error.message ? error.message : String(error) });
+    alert(`Semrush CSV 导入失败：${error && error.message ? error.message : error}`);
+    setSemrushImportStatus('导入失败');
+  } finally {
+    if (semrushFileInput) semrushFileInput.value = '';
+  }
+}
+
+function renderSemrushPreview(result) {
+  urlPreviewBody.innerHTML = '';
+  (result.submitItems || []).forEach((item, index) => {
+    const tr = document.createElement('tr');
+    tr.dataset.url = item.url;
+    const displayDomain = item.targetDomain || item.sourceDomain || '';
+    tr.innerHTML = `<td>${index + 1}</td><td>${escapeHtml(displayDomain)}</td><td>${escapeHtml(item.url)}</td>`;
+    urlPreviewBody.appendChild(tr);
+  });
+  if (duplicateCountEl) {
+    duplicateCountEl.textContent = result.stats.networkReviewRows > 0
+      ? `联网复查失败待确认 ${result.stats.networkReviewRows} 条，未提交`
+      : '';
+  }
+  urlPreview.classList.add('visible');
 }
 
 function normalizeCsvSourceUrlKey(url) {
@@ -862,14 +1115,17 @@ function parseCSVLine(line) {
 
 function resetFile() {
   fileInput.value = '';
+  if (semrushFileInput) semrushFileInput.value = '';
   fileInfo.classList.remove('visible');
   uploadZone.classList.remove('has-file');
+  if (semrushUploadZone) semrushUploadZone.classList.remove('has-file');
   urlPreview.classList.remove('visible');
   urlPreviewBody.innerHTML = '';
   parsedUrls = [];
   startBtn.disabled = true;
   fileCount.textContent = '';
-  document.getElementById('duplicateCount').textContent = '';
+  if (duplicateCountEl) duplicateCountEl.textContent = '';
+  if (semrushImportStatus) semrushImportStatus.textContent = '';
   updateCostHint(0);
 }
 

@@ -26,8 +26,10 @@ const blogRunStatsHandler = require('./api/blog-run-stats');
 const batchRouter = require('./api/batch');
 const csvBatchesRouter = ENABLE_PAYMENT ? require('./api/csv-batches') : null;
 const alipayRouter = ENABLE_PAYMENT ? require('./api/alipay') : null;
+const generateCopyHandler = require('./api/generate-copy');
 
-app.post('/api/generate-copy', require('./api/generate-copy'));
+app.post('/api/generate-copy', generateCopyHandler);
+app.post('/api/generate-copy/cancel', generateCopyHandler.cancel);
 app.post('/api/blog-run-stats', blogRunStatsHandler);
 app.use('/api', require('./api/get-points'));
 app.use('/api', require('./api/deduct-points'));
@@ -35,6 +37,7 @@ app.use('/api', require('./api/refund-points'));
 app.use('/api', batchRouter);
 app.use('/api', require('./api/debug-log'));
 app.use('/api', require('./api/local-status'));
+app.use('/api', require('./api/semrush-domain-review'));
 
 if (ENABLE_PAYMENT) {
   app.use('/api', csvBatchesRouter);

@@ -1,6 +1,7 @@
 const { execute, queryOne } = require('./db');
 const { findBlockedKeyword, loadBlockedKeywords } = require('./blocked-keywords');
-const { generateWithModel } = require('../lib/model-generate');
+const { cancelModelRequest, generateWithModelQueued } = require('../lib/model-generate');
+const { stripGeneratedCopyMarkdownFences } = require('../lib/generated-copy-cleanup');
 const { ensurePromotionAnchor } = require('../lib/promotion-anchor-logic');
 
 const POINTS_COST_PER_GENERATION = 1;
@@ -76,14 +77,30 @@ function getDefaultSkillTemplate() {
   ].join('\n');
 }
 
+function getDefaultSkillTemplateV2() {
+  return [
+    'You are an experienced website marketing and comment copywriter.',
+    'Analyze only the current page content provided by the user. Do not invent features, facts, or claims that are not supported by the page.',
+    '',
+    'Output requirements:',
+    '1. Write a natural comment that fits the current page and softly connects to the promoted website.',
+    '2. Match the main language of the current page. Use English only when the page is English or the language is unclear.',
+    '3. Keep the tone useful, specific, and human. Avoid exaggerated promotional claims.',
+    '4. Keep the comment concise, roughly 80-180 words unless the page language naturally needs shorter wording.',
+    '5. Return only the comment text. Do not wrap it in Markdown fences, code blocks, JSON, labels, explanations, or extra notes.'
+  ].join('\n');
+}
+
 function appendRequiredOutputRules(skillTemplate) {
   return `${skillTemplate.trim()}\n${LINK_HREF_NEWLINE_RULE}`;
 }
 
-function buildUserPrompt({ websiteUrl, title, description, bodyText, usedAnchorTexts }) {
+function buildUserPrompt({ websiteUrl, title, description, bodyText, usedAnchorTexts, pageLanguageHint, pageLanguageEvidence }) {
   const usedAnchors = Array.isArray(usedAnchorTexts)
     ? usedAnchorTexts.map((item) => String(item || '').trim()).filter(Boolean)
     : [];
+  const languageHint = String(pageLanguageHint || '').trim();
+  const languageEvidence = String(pageLanguageEvidence || '').trim();
   const websiteContent = [
     `【网站标题】${title || '(无标题)'}`,
     `【网站 URL】${websiteUrl || '(无URL)'}`,
@@ -93,8 +110,22 @@ function buildUserPrompt({ websiteUrl, title, description, bodyText, usedAnchorT
   ]
     .filter(Boolean)
     .join('\n');
+  const languageInstruction = [
+    'The generated comment language MUST match the main language of the current page.',
+    'Infer the language from html lang, title, description, headings, and body text.',
+    'Do not default to English when clear non-English language evidence is present.',
+    'If the page is Japanese, write Japanese; if Spanish, write Spanish; if Polish, write Polish; if English, write English.',
+    'If uncertain, use English.',
+    'Return plain comment text only; do not use Markdown fences or code blocks.'
+  ].join(' ');
+  const languageContext = [
+    languageHint ? `Page language hint: ${languageHint}` : '',
+    languageEvidence ? `Page language evidence: ${languageEvidence}` : ''
+  ].filter(Boolean).join('\n');
 
   return [
+    languageInstruction,
+    languageContext,
     '下面是当前网站的内容，请根据 Skill 模板的要求，为该网站生成一份推广文案：',
     '',
     websiteContent,
@@ -142,7 +173,7 @@ module.exports = async function handler(req, res) {
   }
 
   const body = req.body || {};
-  const { userId, websiteUrl, title, description, bodyText, skillTemplate, promotionWebsiteUrl, promotionWebsiteContent, usedAnchorTexts } = body;
+  const { userId, websiteUrl, title, description, bodyText, skillTemplate, promotionWebsiteUrl, promotionWebsiteContent, usedAnchorTexts, aiRequestId, pageLanguageHint, pageLanguageEvidence } = body;
 
   if (!userId) {
     return res.status(400).json({ success: false, error: '缺少 userId 参数' });
@@ -172,11 +203,14 @@ module.exports = async function handler(req, res) {
 
     const baseTemplate = skillTemplate && skillTemplate.trim()
       ? skillTemplate.trim()
-      : getDefaultSkillTemplate();
+      : getDefaultSkillTemplateV2();
     const template = appendRequiredOutputRules(baseTemplate);
-    const userPrompt = buildUserPrompt({ websiteUrl, title, description, bodyText, usedAnchorTexts });
-    const generatedText = await generateWithModel(template, userPrompt);
-    const anchored = ensurePromotionAnchor(generatedText, {
+    const userPrompt = buildUserPrompt({ websiteUrl, title, description, bodyText, usedAnchorTexts, pageLanguageHint, pageLanguageEvidence });
+    const generatedText = await generateWithModelQueued(template, userPrompt, {
+      requestId: aiRequestId
+    });
+    const cleanedGeneratedText = stripGeneratedCopyMarkdownFences(generatedText);
+    const anchored = ensurePromotionAnchor(cleanedGeneratedText, {
       promotionUrl: promotionWebsiteUrl || websiteUrl,
       promotionContent: promotionWebsiteContent || '',
       pageTitle: title || '',
@@ -220,7 +254,39 @@ module.exports = async function handler(req, res) {
       remainingPoints: deducted.remainingPoints
     });
   } catch (err) {
+    if (err && (err.code === 'MODEL_REQUEST_CANCELED' || err.name === 'AbortError')) {
+      console.warn('[generate-copy] canceled:', {
+        aiRequestId,
+        reason: err.cancelReason || err.message
+      });
+      return res.status(499).json({ success: false, error: 'AI request canceled', canceled: true });
+    }
     console.error('[generate-copy] error:', err);
     return res.status(500).json({ success: false, error: 'Internal server error', message: err.message });
   }
 };
+
+module.exports.cancel = async function cancelGenerateCopyHandler(req, res) {
+  setCors(res);
+  if (req.method === 'OPTIONS') {
+    return res.status(204).end();
+  }
+  if (req.method !== 'POST') {
+    return res.status(405).json({ success: false, error: 'Method not allowed' });
+  }
+  const body = req.body || {};
+  const aiRequestId = String(body.aiRequestId || body.requestId || '').trim();
+  const reason = String(body.reason || 'client_cancel').trim() || 'client_cancel';
+  if (!aiRequestId) {
+    return res.status(400).json({ success: false, error: 'missing aiRequestId' });
+  }
+  const result = cancelModelRequest(aiRequestId, reason);
+  console.info('[generate-copy] cancel request', {
+    aiRequestId,
+    reason,
+    status: result.status
+  });
+  return res.status(200).json(result);
+};
+
+module.exports.buildUserPrompt = buildUserPrompt;

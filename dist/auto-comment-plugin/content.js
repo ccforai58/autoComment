@@ -1213,7 +1213,7 @@
 
   const API_BASE = (window.AUTO_COMMENT_CONFIG && window.AUTO_COMMENT_CONFIG.API_BASE) || 'http://127.0.0.1:3000/api';
   const QWEN_API_BASE = API_BASE;
-  const BATCH_SCRIPT_BUILD_TAG = 'batch-segmented-link-fill-2026-07-08-01';
+  const BATCH_SCRIPT_BUILD_TAG = 'batch-segmented-link-fill-2026-07-14-ai-cancel-01';
   console.info('[content][config] API_BASE =', API_BASE);
   const WEBSITE_URL_STORAGE_KEY = 'promotion_website_url';
   const WEBSITE_CONTENT_STORAGE_KEY = 'promotion_website_content';
@@ -1224,6 +1224,7 @@
   const DEFAULT_LOCAL_USER_ID = 'local-user';
   const PROMPT_FIELD_VALUES_STORAGE_KEY = 'auto_fill_prompt_field_values';
   const AI_REUSE_STATE_STORAGE_KEY = 'batch_ai_reuse_state_v1';
+  let activeAiRequestId = '';
 
   // ====== 批量任务设置（从 storage.local 读取）======
   const BATCH_SETTINGS_KEY = 'batch_task_settings';
@@ -1243,7 +1244,7 @@
   const BATCH_SUCCESS_DEDUP_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
   const BATCH_SUCCESS_CONFIRMATION_MARKER = 'submit-confirmed-v3';
   const BATCH_PENDING_TASK_TTL_MS = 10 * 60 * 1000;
-  const AI_COPY_REQUEST_TIMEOUT_MS = 45 * 1000;
+  const AI_COPY_REQUEST_TIMEOUT_MS = 180 * 1000;
 
   function safeLowerStringLocal(value) {
     if (value == null) return '';
@@ -5354,6 +5355,71 @@
     return Array.from(new Set(used.map((item) => String(item || '').trim()).filter(Boolean)));
   }
 
+  function createAiRequestId() {
+    const batchId = _batchCtx && _batchCtx.batchId ? _batchCtx.batchId : 'manual';
+    const urlIndex = _batchCtx && Number.isFinite(Number(_batchCtx.urlIndex)) ? _batchCtx.urlIndex : 'na';
+    const rand = Math.random().toString(36).slice(2, 8);
+    return `${batchId}:${urlIndex}:${Date.now()}:${rand}`;
+  }
+
+  function getPageLanguagePayload(title, description) {
+    const htmlLang = document.documentElement && document.documentElement.lang
+      ? document.documentElement.lang
+      : '';
+    const headings = Array.from(document.querySelectorAll('h1, h2'))
+      .slice(0, 6)
+      .map((node) => String(node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim())
+      .filter(Boolean);
+    const evidence = [
+      htmlLang ? `html.lang=${htmlLang}` : '',
+      title ? `title=${String(title).slice(0, 180)}` : '',
+      description ? `description=${String(description).slice(0, 220)}` : '',
+      headings.length ? `headings=${headings.join(' | ').slice(0, 360)}` : ''
+    ].filter(Boolean).join('\n');
+    return {
+      pageLanguageHint: htmlLang || '',
+      pageLanguageEvidence: evidence
+    };
+  }
+
+  function cancelAiRequest(aiRequestId, reason) {
+    const requestId = String(aiRequestId || '').trim();
+    if (!requestId) return Promise.resolve(null);
+    const payload = JSON.stringify({ aiRequestId: requestId, reason: reason || 'client_cancel' });
+    const endpoint = `${QWEN_API_BASE}/generate-copy/cancel`;
+    try {
+      if (navigator && typeof navigator.sendBeacon === 'function') {
+        const blob = new Blob([payload], { type: 'application/json' });
+        navigator.sendBeacon(endpoint, blob);
+        return Promise.resolve({ beacon: true });
+      }
+    } catch (error) {
+      console.warn('[content] AI cancel beacon failed:', error && error.message ? error.message : error);
+    }
+    return fetch(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: payload,
+      keepalive: true
+    }).catch((error) => {
+      console.warn('[content] AI cancel request failed:', error && error.message ? error.message : error);
+      return null;
+    });
+  }
+
+  function cancelActiveAiRequest(reason) {
+    const requestId = activeAiRequestId;
+    activeAiRequestId = '';
+    return cancelAiRequest(requestId, reason);
+  }
+
+  window.addEventListener('pagehide', () => {
+    cancelActiveAiRequest('pagehide');
+  });
+  window.addEventListener('beforeunload', () => {
+    cancelActiveAiRequest('beforeunload');
+  });
+
   async function generatePromotionCopyWithQwen() {
     const QWEN_SKILL_TEMPLATE = await getQwenSkillTemplate();
     const [promotionWebsiteUrl, promotionWebsiteContent, usedAnchorTexts] = await Promise.all([
@@ -5376,6 +5442,7 @@
       document.querySelector('meta[name="description"]') ||
       document.querySelector('meta[name="Description"]');
     const description = descriptionMeta ? descriptionMeta.content || '' : '';
+    const languagePayload = getPageLanguagePayload(title, description);
 
     let bodyText = '';
     if (document.body) {
@@ -5387,15 +5454,22 @@
       }
     }
 
+    const aiRequestId = createAiRequestId();
+    activeAiRequestId = aiRequestId;
     console.info('[content][api] POST /generate-copy', {
+      aiRequestId,
       userId,
       pageUrl: websiteUrl,
       titleLength: title.length,
       bodyTextLength: bodyText.length,
-      usedAnchorCount: usedAnchorTexts.length
+      usedAnchorCount: usedAnchorTexts.length,
+      pageLanguageHint: languagePayload.pageLanguageHint
     });
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), AI_COPY_REQUEST_TIMEOUT_MS);
+    const timeoutId = setTimeout(() => {
+      controller.abort();
+      cancelAiRequest(aiRequestId, 'client_timeout');
+    }, AI_COPY_REQUEST_TIMEOUT_MS);
     let response;
     try {
       response = await fetch(`${QWEN_API_BASE}/generate-copy`, {
@@ -5411,6 +5485,9 @@
           promotionWebsiteUrl,
           promotionWebsiteContent,
           usedAnchorTexts,
+          aiRequestId,
+          pageLanguageHint: languagePayload.pageLanguageHint,
+          pageLanguageEvidence: languagePayload.pageLanguageEvidence,
           skillTemplate: QWEN_SKILL_TEMPLATE
         })
       });
@@ -5421,6 +5498,9 @@
       throw error;
     } finally {
       clearTimeout(timeoutId);
+      if (activeAiRequestId === aiRequestId) {
+        activeAiRequestId = '';
+      }
     }
 
     const data = await response.json();
