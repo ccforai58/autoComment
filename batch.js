@@ -2959,9 +2959,9 @@ async function checkArchiveBacklinkStatus(options = {}) {
     return;
   }
 
-  const checkTargets = filtered
-    .slice(0, 500)
-    .filter((record) => options.force || record.latestBacklinkStatus !== 'checking');
+  const checkTargets = typeof logic.selectBacklinkCheckTargets === 'function'
+    ? logic.selectBacklinkCheckTargets(filtered, { limit: 500 })
+    : filtered.slice(0, 500);
   if (checkTargets.length === 0) {
     alert('当前筛选条件下没有可检测的历史记录。');
     return;
@@ -2986,7 +2986,8 @@ async function checkArchiveBacklinkStatus(options = {}) {
     checkCount: checkTargets.length,
     concurrency: getArchiveBacklinkConcurrencyLocal(),
     retryDelayMs: getArchiveBacklinkRetryDelayMsLocal(),
-    force: options.force === true
+    force: options.force === true,
+    resetPreviousChecking: true
   });
 
   pumpArchiveBacklinkQueue();

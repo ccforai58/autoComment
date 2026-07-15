@@ -559,6 +559,15 @@ function buildBacklinkCheckProgressText(progressInput, stateInput) {
   return `${prefix}：${completed}/${total}（${percent}%） 成功 ${success}，未发现 ${missing}，失败 ${error}，跳过 ${skipped}，检测中 ${checking}`;
 }
 
+function selectBacklinkCheckTargets(records, options) {
+  const source = Array.isArray(records) ? records : [];
+  const settings = options && typeof options === 'object' ? options : {};
+  const limit = Number.isFinite(Number(settings.limit))
+    ? Math.max(0, Math.round(Number(settings.limit)))
+    : 500;
+  return source.slice(0, limit);
+}
+
 function normalizeBacklinkCheckConcurrency(value) {
   if (String(value || '').trim() === '') return 3;
   const number = Number(value);
@@ -910,6 +919,7 @@ const BatchResultsLogic = {
   buildBacklinkCheckProgress,
   buildBacklinkCheckControlState,
   buildBacklinkCheckProgressText,
+  selectBacklinkCheckTargets,
   normalizeBacklinkCheckConcurrency,
   normalizeBacklinkRetryDelayMs,
   deletePromotionWebsiteRecords,

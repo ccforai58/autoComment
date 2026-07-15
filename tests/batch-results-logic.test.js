@@ -21,6 +21,7 @@ const {
   buildBacklinkCheckProgress,
   buildBacklinkCheckControlState,
   buildBacklinkCheckProgressText,
+  selectBacklinkCheckTargets,
   normalizeBacklinkCheckConcurrency,
   normalizeBacklinkRetryDelayMs,
   buildManualReviewTarget,
@@ -239,6 +240,16 @@ test('buildBacklinkCheckProgressText labels idle, running, paused, stopped, and 
   assert.equal(buildBacklinkCheckProgressText(progress, { active: true, paused: true, stopped: false }), '外链检测已暂停：4/10（40%） 成功 1，未发现 2，失败 1，跳过 0，检测中 3');
   assert.equal(buildBacklinkCheckProgressText(progress, { active: false, paused: false, stopped: true }), '外链检测已停止：4/10（40%） 成功 1，未发现 2，失败 1，跳过 0，检测中 3');
   assert.equal(buildBacklinkCheckProgressText({ ...progress, completed: 10, percent: 100, checking: 0 }, { active: false, stopped: false }), '外链检测已完成：10/10（100%） 成功 1，未发现 2，失败 1，跳过 0，检测中 0');
+});
+
+test('selectBacklinkCheckTargets starts a new run from all filtered rows including stale checking rows', () => {
+  const targets = selectBacklinkCheckTargets([
+    { id: 'old-success', latestBacklinkStatus: 'success' },
+    { id: 'stale-checking', latestBacklinkStatus: 'checking' },
+    { id: 'old-missing', latestBacklinkStatus: 'missing' }
+  ], { limit: 2 });
+
+  assert.deepEqual(targets.map((record) => record.id), ['old-success', 'stale-checking']);
 });
 
 test('normalizeBacklinkCheckConcurrency keeps archive check concurrency bounded', () => {
