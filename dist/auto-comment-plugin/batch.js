@@ -2960,8 +2960,8 @@ async function checkArchiveBacklinkStatus(options = {}) {
   }
 
   const checkTargets = typeof logic.selectBacklinkCheckTargets === 'function'
-    ? logic.selectBacklinkCheckTargets(filtered, { limit: 500 })
-    : filtered.slice(0, 500);
+    ? logic.selectBacklinkCheckTargets(filtered)
+    : filtered.slice();
   if (checkTargets.length === 0) {
     alert('当前筛选条件下没有可检测的历史记录。');
     return;

@@ -252,6 +252,15 @@ test('selectBacklinkCheckTargets starts a new run from all filtered rows includi
   assert.deepEqual(targets.map((record) => record.id), ['old-success', 'stale-checking']);
 });
 
+test('selectBacklinkCheckTargets includes all filtered rows by default', () => {
+  const records = Array.from({ length: 667 }, (_, index) => ({ id: `record-${index + 1}` }));
+  const targets = selectBacklinkCheckTargets(records);
+
+  assert.equal(targets.length, 667);
+  assert.equal(targets[0].id, 'record-1');
+  assert.equal(targets[666].id, 'record-667');
+});
+
 test('normalizeBacklinkCheckConcurrency keeps archive check concurrency bounded', () => {
   assert.equal(normalizeBacklinkCheckConcurrency(''), 3);
   assert.equal(normalizeBacklinkCheckConcurrency('0'), 1);
