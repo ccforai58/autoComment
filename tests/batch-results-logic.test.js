@@ -14,7 +14,13 @@ const {
   buildAssistantWarning,
   buildResultSummary,
   filterBatchResultRecords,
+  filterArchiveResultRecords,
   getResultDisplay,
+  mergeBacklinkCheckResults,
+  getLatestBacklinkStatusDisplay,
+  buildBacklinkCheckProgress,
+  normalizeBacklinkCheckConcurrency,
+  normalizeBacklinkRetryDelayMs,
   buildManualReviewTarget,
   buildManualReviewOpenMessage,
   dedupeCsvSourceUrlItems,
@@ -74,6 +80,92 @@ test('buildArchiveExportCsv exports the selected promotion website only', () => 
   assert.equal(lines[1].includes('https://a.test/'), true);
   assert.equal(lines[2].includes('https://b.test/'), true);
   assert.equal(csv.content.includes('https://other-source.test/'), false);
+});
+
+test('mergeBacklinkCheckResults stores latest backlink fields without changing original result', () => {
+  const records = [{
+    id: 'r1',
+    result: 'submitted_unconfirmed',
+    linkVerified: false,
+    matchedHref: '',
+    sourceUrl: 'https://source.test/post'
+  }];
+
+  const merged = mergeBacklinkCheckResults(records, [{
+    id: 'r1',
+    latestBacklinkStatus: 'success',
+    latestBacklinkCheckedAt: '2026-07-13T08:00:00.000Z',
+    latestBacklinkMatchedHref: 'https://promo.test/',
+    latestBacklinkReason: 'matching_anchor_href_found'
+  }]);
+
+  assert.equal(merged[0].result, 'submitted_unconfirmed');
+  assert.equal(merged[0].linkVerified, false);
+  assert.equal(merged[0].matchedHref, '');
+  assert.equal(merged[0].latestBacklinkStatus, 'success');
+  assert.equal(merged[0].latestBacklinkCheckedAt, '2026-07-13T08:00:00.000Z');
+  assert.equal(merged[0].latestBacklinkMatchedHref, 'https://promo.test/');
+  assert.equal(getLatestBacklinkStatusDisplay(merged[0]).text, '成功');
+});
+
+test('buildArchiveExportCsv includes latest backlink check columns', () => {
+  const csv = buildArchiveExportCsv({
+    websiteKey: 'all',
+    records: [{
+      originalIndex: 0,
+      batchId: 'batch-1',
+      promotionWebsiteUrl: 'https://promo.test/',
+      sourceUrl: 'https://source.test/post',
+      result: 'submitted_unconfirmed',
+      latestBacklinkStatus: 'missing',
+      latestBacklinkCheckedAt: '2026-07-13T08:05:00.000Z',
+      latestBacklinkMatchedHref: '',
+      latestBacklinkReason: 'no_matching_anchor_href',
+      timestamp: 10
+    }]
+  });
+
+  const lines = csv.content.split('\n');
+  assert.match(lines[0], /Latest Backlink Status,Latest Backlink Checked At,Latest Backlink Matched Href,Latest Backlink Reason/);
+  assert.match(lines[1], /missing,2026-07-13T08:05:00.000Z,,no_matching_anchor_href/);
+});
+
+test('buildBacklinkCheckProgress counts live backlink check statuses', () => {
+  const progress = buildBacklinkCheckProgress([
+    { id: 'pending' },
+    { id: 'checking', latestBacklinkStatus: 'checking' },
+    { id: 'success', latestBacklinkStatus: 'success' },
+    { id: 'missing', latestBacklinkStatus: 'missing' },
+    { id: 'error', latestBacklinkStatus: 'error' },
+    { id: 'skipped', latestBacklinkStatus: 'skipped' }
+  ]);
+
+  assert.deepEqual(progress, {
+    total: 6,
+    pending: 1,
+    checking: 1,
+    completed: 4,
+    success: 1,
+    missing: 1,
+    error: 1,
+    skipped: 1,
+    percent: 67
+  });
+  assert.equal(getLatestBacklinkStatusDisplay({ latestBacklinkStatus: 'checking' }).text, '检测中');
+});
+
+test('normalizeBacklinkCheckConcurrency keeps archive check concurrency bounded', () => {
+  assert.equal(normalizeBacklinkCheckConcurrency(''), 3);
+  assert.equal(normalizeBacklinkCheckConcurrency('0'), 1);
+  assert.equal(normalizeBacklinkCheckConcurrency('5'), 5);
+  assert.equal(normalizeBacklinkCheckConcurrency('999'), 8);
+});
+
+test('normalizeBacklinkRetryDelayMs keeps archive backlink retry delay bounded', () => {
+  assert.equal(normalizeBacklinkRetryDelayMs(''), 2000);
+  assert.equal(normalizeBacklinkRetryDelayMs('0'), 0);
+  assert.equal(normalizeBacklinkRetryDelayMs('5'), 5000);
+  assert.equal(normalizeBacklinkRetryDelayMs('999'), 10000);
 });
 
 test('dedupeCsvSourceUrlItems keeps the first row for duplicate CSV source URLs', () => {
@@ -163,6 +255,34 @@ test('filterBatchResultRecords matches result groups and visible Chinese labels'
   assert.deepEqual(
     filterBatchResultRecords(records, { keyword: '无评论框' }).map((record) => record.originalIndex),
     [2]
+  );
+});
+
+test('filterArchiveResultRecords filters by latest backlink status', () => {
+  const records = [
+    { originalIndex: 0, result: 'success', latestBacklinkStatus: 'success' },
+    { originalIndex: 1, result: 'success', latestBacklinkStatus: 'missing' },
+    { originalIndex: 2, result: 'success', latestBacklinkStatus: 'error' },
+    { originalIndex: 3, result: 'success', latestBacklinkStatus: 'skipped' },
+    { originalIndex: 4, result: 'success', latestBacklinkStatus: 'checking' },
+    { originalIndex: 5, result: 'success' }
+  ];
+
+  assert.deepEqual(
+    filterArchiveResultRecords(records, { backlinkStatus: 'success' }).map((record) => record.originalIndex),
+    [0]
+  );
+  assert.deepEqual(
+    filterArchiveResultRecords(records, { backlinkStatus: 'checking' }).map((record) => record.originalIndex),
+    [4]
+  );
+  assert.deepEqual(
+    filterArchiveResultRecords(records, { backlinkStatus: 'unchecked' }).map((record) => record.originalIndex),
+    [5]
+  );
+  assert.deepEqual(
+    filterArchiveResultRecords(records, { backlinkStatus: 'all' }).map((record) => record.originalIndex),
+    [0, 1, 2, 3, 4, 5]
   );
 });
 

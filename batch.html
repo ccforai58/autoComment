@@ -668,6 +668,64 @@
         margin-left: 0;
       }
 
+      .archive-query-filter {
+        border-bottom: 0;
+      }
+
+      .archive-tool-strip,
+      .archive-management-bar {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 8px 12px;
+        border-top: 1px solid #e5e7eb;
+        flex-wrap: wrap;
+      }
+
+      .archive-tool-strip {
+        background: #eff6ff;
+        border-left: 3px solid #2563eb;
+      }
+
+      .archive-management-bar {
+        justify-content: space-between;
+        background: #f9fafb;
+        border: 1px solid #e5e7eb;
+        border-radius: 8px;
+        margin-top: 8px;
+      }
+
+      .archive-tool-main {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+
+      .archive-tool-strip select {
+        padding: 5px 10px;
+        border-radius: 6px;
+        border: 1px solid #bfdbfe;
+        font-size: 12px;
+        outline: none;
+        background: #fff;
+      }
+
+      .archive-tool-label {
+        font-size: 12px;
+        color: #374151;
+        font-weight: 600;
+        white-space: nowrap;
+      }
+
+      .archive-tool-strip .stats-count-label {
+        margin-left: 0;
+      }
+
+      .archive-danger-actions {
+        margin-left: auto;
+      }
+
       .stats-table-wrap {
         max-height: 320px;
         overflow-y: auto;
@@ -731,6 +789,8 @@
 
       .archive-summary {
         display: flex;
+        align-items: center;
+        justify-content: space-between;
         gap: 12px;
         flex-wrap: wrap;
         padding: 10px 12px;
@@ -738,6 +798,21 @@
         border-bottom: 1px solid #e5e7eb;
         font-size: 12px;
         color: #4b5563;
+      }
+
+      .archive-summary-stats {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        flex: 1 1 480px;
+        flex-wrap: wrap;
+      }
+
+      .archive-summary-export {
+        margin-left: auto;
+        padding: 6px 10px;
+        font-size: 11px;
+        white-space: nowrap;
       }
 
       .archive-summary strong { color: #111827; }
@@ -1176,7 +1251,7 @@
         </div>
 
         <div class="results-panel" id="archiveResultsPanel">
-        <div class="stats-filter">
+        <div class="stats-filter archive-query-filter">
           <span class="stats-filter-label">推广网站：</span>
           <select id="archiveWebsiteFilter">
             <option value="all">全部推广网站</option>
@@ -1194,15 +1269,46 @@
             <option value="no_comment_box">无评论框</option>
             <option value="fail">失败/已拦截</option>
           </select>
+          <select id="archiveBacklinkStatusFilter">
+            <option value="all">全部外链状态</option>
+            <option value="unchecked">未检测</option>
+            <option value="checking">检测中</option>
+            <option value="success">成功</option>
+            <option value="missing">未发现</option>
+            <option value="error">检查失败</option>
+            <option value="skipped">已跳过</option>
+          </select>
           <input type="text" id="archiveKeyword" placeholder="搜索来源 URL、推广网站、AI 内容或错误" />
-          <div class="stats-filter-actions">
-            <button type="button" class="btn btn-danger" id="deleteArchiveSiteBtn">Delete Site Records</button>
-            <button type="button" class="btn btn-danger" id="deleteArchiveAllBtn">Delete All Records</button>
-          </div>
           <span class="stats-count-label" id="archiveCountLabel">显示 0 / 0 条</span>
         </div>
+        <div class="archive-tool-strip">
+          <div class="archive-tool-main">
+            <span class="archive-tool-label">外链检测：</span>
+            <button type="button" class="btn btn-secondary" id="checkArchiveBacklinksBtn">检查外链状态</button>
+            <select id="archiveBacklinkConcurrency" title="外链检测并发数">
+              <option value="1">并发 1</option>
+              <option value="2">并发 2</option>
+              <option value="3" selected>并发 3</option>
+              <option value="5">并发 5</option>
+              <option value="8">并发 8</option>
+            </select>
+            <select id="archiveBacklinkRetryDelay" title="外链未发现或请求失败后的重试间隔">
+              <option value="0">不等待重试</option>
+              <option value="2" selected>等待 2 秒重试</option>
+              <option value="5">等待 5 秒重试</option>
+              <option value="10">等待 10 秒重试</option>
+            </select>
+            <button type="button" class="btn btn-secondary" id="pauseArchiveBacklinksBtn">暂停</button>
+            <button type="button" class="btn btn-secondary" id="stopArchiveBacklinksBtn">停止</button>
+            <button type="button" class="btn btn-secondary" id="retryArchiveBacklinksBtn">重新检测</button>
+          </div>
+          <span class="stats-count-label" id="archiveBacklinkProgress">外链检测：未开始</span>
+        </div>
         <div class="archive-panel">
-          <div class="archive-summary" id="archiveSummary"></div>
+          <div class="archive-summary">
+            <div class="archive-summary-stats" id="archiveSummary"></div>
+            <button type="button" class="btn btn-secondary archive-summary-export" id="exportArchiveBtn">导出筛选结果</button>
+          </div>
           <div class="stats-table-wrap" id="archiveTableWrap">
             <table class="stats-table">
               <thead>
@@ -1211,6 +1317,8 @@
                   <th>推广网站</th>
                   <th>来源页面</th>
                   <th>结果</th>
+                  <th>外链状态</th>
+                  <th>检测日期</th>
                   <th>错误信息</th>
                   <th>AI 内容</th>
                   <th>批次</th>
@@ -1221,6 +1329,13 @@
             </table>
           </div>
           <div class="archive-empty" id="archiveEmpty">暂无历史归档记录。</div>
+        </div>
+        <div class="archive-management-bar">
+          <span class="archive-tool-label">记录管理：</span>
+          <div class="stats-filter-actions archive-danger-actions">
+            <button type="button" class="btn btn-danger" id="deleteArchiveSiteBtn">Delete Site Records</button>
+            <button type="button" class="btn btn-danger" id="deleteArchiveAllBtn">Delete All Records</button>
+          </div>
         </div>
         </div>
       </div>

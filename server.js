@@ -38,6 +38,7 @@ app.use('/api', batchRouter);
 app.use('/api', require('./api/debug-log'));
 app.use('/api', require('./api/local-status'));
 app.use('/api', require('./api/semrush-domain-review'));
+app.use('/api', require('./api/backlink-check'));
 
 if (ENABLE_PAYMENT) {
   app.use('/api', csvBatchesRouter);

@@ -271,17 +271,37 @@ const statsCountLabel = document.getElementById('statsCountLabel');
 const currentResultsEmpty = document.getElementById('currentResultsEmpty');
 const archiveWebsiteFilter = document.getElementById('archiveWebsiteFilter');
 const archiveResultFilter = document.getElementById('archiveResultFilter');
+const archiveBacklinkStatusFilter = document.getElementById('archiveBacklinkStatusFilter');
 const archiveKeyword = document.getElementById('archiveKeyword');
 const archiveCountLabel = document.getElementById('archiveCountLabel');
 const archiveSummary = document.getElementById('archiveSummary');
 const archiveTableBody = document.getElementById('archiveTableBody');
 const archiveTableWrap = document.getElementById('archiveTableWrap');
 const archiveEmpty = document.getElementById('archiveEmpty');
+const checkArchiveBacklinksBtn = document.getElementById('checkArchiveBacklinksBtn');
+const archiveBacklinkConcurrency = document.getElementById('archiveBacklinkConcurrency');
+const archiveBacklinkRetryDelay = document.getElementById('archiveBacklinkRetryDelay');
+const pauseArchiveBacklinksBtn = document.getElementById('pauseArchiveBacklinksBtn');
+const stopArchiveBacklinksBtn = document.getElementById('stopArchiveBacklinksBtn');
+const retryArchiveBacklinksBtn = document.getElementById('retryArchiveBacklinksBtn');
+const archiveBacklinkProgress = document.getElementById('archiveBacklinkProgress');
+const exportArchiveBtn = document.getElementById('exportArchiveBtn');
 const deleteArchiveSiteBtn = document.getElementById('deleteArchiveSiteBtn');
 const deleteArchiveAllBtn = document.getElementById('deleteArchiveAllBtn');
 let activeResultsView = 'current';
 let archiveHasRecords = false;
 let archiveWebsiteSelectionTouched = false;
+let archiveBacklinkCheckRunning = false;
+let archiveBacklinkCheckState = {
+  active: false,
+  paused: false,
+  stopped: false,
+  queue: [],
+  running: new Map(),
+  records: [],
+  total: 0,
+  startedAt: 0
+};
 
 // Text cleanup: previous comment was mojibake.
 const batchAutoOpenPanel = document.getElementById('batchAutoOpenPanel');
@@ -560,6 +580,11 @@ function bindEvents() {
   stopBtn.addEventListener('click', stopBatch);
   exportBtn.addEventListener('click', exportResults);
   clearBtn.addEventListener('click', clearBatch);
+  if (checkArchiveBacklinksBtn) checkArchiveBacklinksBtn.addEventListener('click', checkArchiveBacklinkStatus);
+  if (pauseArchiveBacklinksBtn) pauseArchiveBacklinksBtn.addEventListener('click', toggleArchiveBacklinkPause);
+  if (stopArchiveBacklinksBtn) stopArchiveBacklinksBtn.addEventListener('click', stopArchiveBacklinkCheck);
+  if (retryArchiveBacklinksBtn) retryArchiveBacklinksBtn.addEventListener('click', () => checkArchiveBacklinkStatus({ force: true }));
+  if (exportArchiveBtn) exportArchiveBtn.addEventListener('click', exportArchiveResults);
   if (deleteArchiveSiteBtn) deleteArchiveSiteBtn.addEventListener('click', deleteSelectedArchiveWebsiteRecords);
   if (deleteArchiveAllBtn) deleteArchiveAllBtn.addEventListener('click', deleteAllArchiveWebsiteRecords);
   if (openSettingsBtn) {
@@ -609,6 +634,7 @@ function bindEvents() {
     });
   }
   if (archiveResultFilter) archiveResultFilter.addEventListener('change', renderArchive);
+  if (archiveBacklinkStatusFilter) archiveBacklinkStatusFilter.addEventListener('change', renderArchive);
   if (archiveKeyword) archiveKeyword.addEventListener('input', debounce(renderArchive, 300));
   window.addEventListener('focus', refreshWorkbenchConfig);
   document.addEventListener('visibilitychange', () => {
@@ -2054,6 +2080,7 @@ async function renderArchive() {
   archiveHasRecords = records.length > 0;
   const selectedWebsite = archiveWebsiteFilter.value || 'all';
   const selectedResult = archiveResultFilter ? archiveResultFilter.value : 'all';
+  const selectedBacklinkStatus = archiveBacklinkStatusFilter ? archiveBacklinkStatusFilter.value : 'all';
   const keyword = archiveKeyword ? archiveKeyword.value.trim().toLowerCase() : '';
 
   const effectiveWebsite = buildArchiveWebsiteOptions(records, selectedWebsite, {
@@ -2063,6 +2090,7 @@ async function renderArchive() {
   const filtered = filterArchiveRecords(records, {
     websiteKey: effectiveWebsite,
     result: selectedResult,
+    backlinkStatus: selectedBacklinkStatus,
     keyword
   });
 
@@ -2097,19 +2125,23 @@ async function renderArchive() {
     const shortBatch = record.batchId ? String(record.batchId).slice(0, 8) : '--';
     const timeStr = record.timestamp ? formatTime(new Date(record.timestamp)) : '--';
     const display = getResultDisplayLocal(record);
+    const latestBacklinkDisplay = getLatestBacklinkStatusDisplayLocal(record);
+    const latestBacklinkTime = record.latestBacklinkCheckedAt ? formatTime(new Date(record.latestBacklinkCheckedAt)) : '--';
 
     tr.innerHTML = `
       <td style="color:#9ca3af;width:40px;text-align:center;">${escapeHtml(csvIndex)}</td>
       <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(websiteLabel)}">${escapeHtml(shortWebsite)}</td>
       <td style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(sourceUrl)}">${escapeHtml(shortSource)}</td>
       <td><span class="result-badge ${display.cssClass}" title="${escapeHtml(display.categoryText)}">${escapeHtml(display.text)}</span></td>
+      <td><span class="result-badge ${latestBacklinkDisplay.cssClass}" title="${escapeHtml(latestBacklinkDisplay.title || record.latestBacklinkReason || '')}">${escapeHtml(latestBacklinkDisplay.text)}</span></td>
+      <td style="font-size:11px;color:#9ca3af;white-space:nowrap;" title="${escapeHtml(record.latestBacklinkCheckedAt || '')}">${escapeHtml(latestBacklinkTime)}</td>
       <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(record.errorMessage || '')}">${escapeHtml(record.errorMessage || '--')}</td>
       <td class="ai-content-cell" title="${escapeHtml(aiText)}">${escapeHtml(aiText || '--')}</td>
       <td style="font-size:11px;color:#9ca3af;white-space:nowrap;" title="${escapeHtml(record.batchId || '')}">${escapeHtml(shortBatch)}</td>
       <td style="font-size:11px;color:#9ca3af;white-space:nowrap;">${timeStr}</td>
     `;
     attachManualReviewTargetCell(tr.children[2], record, 'archive', tr);
-    attachAiContentContextMenu(tr.children[5], record, tr);
+    attachAiContentContextMenu(tr.children[7], record, tr);
     archiveTableBody.appendChild(tr);
   }
 }
@@ -2122,6 +2154,19 @@ function filterArchiveRecords(records, filters) {
   return Array.isArray(records) ? records : [];
 }
 
+function getCurrentArchiveFilters() {
+  return {
+    websiteKey: archiveWebsiteFilter ? (archiveWebsiteFilter.value || 'all') : 'all',
+    result: archiveResultFilter ? (archiveResultFilter.value || 'all') : 'all',
+    backlinkStatus: archiveBacklinkStatusFilter ? (archiveBacklinkStatusFilter.value || 'all') : 'all',
+    keyword: archiveKeyword ? archiveKeyword.value.trim().toLowerCase() : ''
+  };
+}
+
+function getFilteredArchiveRecords(records) {
+  return filterArchiveRecords(records, getCurrentArchiveFilters());
+}
+
 function updateArchiveActionButtons(records, selectedWebsiteKey) {
   const hasRecords = Array.isArray(records) && records.length > 0;
   if (deleteArchiveSiteBtn) {
@@ -2129,6 +2174,12 @@ function updateArchiveActionButtons(records, selectedWebsiteKey) {
   }
   if (deleteArchiveAllBtn) {
     deleteArchiveAllBtn.disabled = !hasRecords;
+  }
+  if (checkArchiveBacklinksBtn) {
+    checkArchiveBacklinksBtn.disabled = !hasRecords || archiveBacklinkCheckRunning;
+  }
+  if (exportArchiveBtn) {
+    exportArchiveBtn.disabled = !hasRecords || archiveBacklinkCheckRunning;
   }
 }
 
@@ -2461,6 +2512,20 @@ function getResultDisplayLocal(resultOrRecord) {
   };
 }
 
+function getLatestBacklinkStatusDisplayLocal(record) {
+  const logic = getBatchResultsLogic();
+  if (logic && typeof logic.getLatestBacklinkStatusDisplay === 'function') {
+    return logic.getLatestBacklinkStatusDisplay(record);
+  }
+  const status = String(record && record.latestBacklinkStatus || '').trim();
+  return {
+    value: status,
+    text: status || '未检测',
+    cssClass: status || 'unknown',
+    title: record && record.latestBacklinkReason || ''
+  };
+}
+
 function getResultSummary(records) {
   const logic = getBatchResultsLogic();
   if (logic && typeof logic.buildResultSummary === 'function') {
@@ -2703,25 +2768,19 @@ async function exportResults() {
 
   if (activeResultsView === 'archive') {
     const records = await getArchiveRecords();
-    const selectedWebsite = archiveWebsiteFilter ? (archiveWebsiteFilter.value || 'all') : 'all';
-    const selectedResult = archiveResultFilter ? (archiveResultFilter.value || 'all') : 'all';
-    const keyword = archiveKeyword ? archiveKeyword.value.trim().toLowerCase() : '';
-    const filtered = filterArchiveRecords(records, {
-      websiteKey: selectedWebsite,
-      result: selectedResult,
-      keyword
-    });
+    const filters = getCurrentArchiveFilters();
+    const filtered = filterArchiveRecords(records, filters);
     if (filtered.length === 0) {
       alert('No archive records to export for the current filter.');
       return;
     }
     const csv = logic.buildArchiveExportCsv({
-      websiteKey: selectedWebsite,
+      websiteKey: filters.websiteKey,
       records: filtered
     });
     downloadCsv(csv.content, csv.filename);
     console.log('[batch][results] exported archive records', {
-      selectedWebsite,
+      selectedWebsite: filters.websiteKey,
       recordCount: csv.recordCount,
       filename: csv.filename
     });
@@ -2746,6 +2805,282 @@ async function exportResults() {
     batchId,
     recordCount: csv.recordCount,
     filename: csv.filename
+  });
+}
+
+async function exportArchiveResults() {
+  const previousView = activeResultsView;
+  activeResultsView = 'archive';
+  try {
+    await exportResults();
+  } finally {
+    activeResultsView = previousView;
+  }
+}
+
+function setArchiveBacklinkCheckRunning(running) {
+  archiveBacklinkCheckRunning = running;
+  if (checkArchiveBacklinksBtn) {
+    checkArchiveBacklinksBtn.disabled = running || !archiveHasRecords;
+    checkArchiveBacklinksBtn.textContent = running ? '检测中...' : '检查外链状态';
+  }
+  if (archiveBacklinkConcurrency) archiveBacklinkConcurrency.disabled = running;
+  if (archiveBacklinkRetryDelay) archiveBacklinkRetryDelay.disabled = running;
+  if (pauseArchiveBacklinksBtn) {
+    pauseArchiveBacklinksBtn.disabled = !running;
+    pauseArchiveBacklinksBtn.textContent = archiveBacklinkCheckState.paused ? '继续' : '暂停';
+  }
+  if (stopArchiveBacklinksBtn) stopArchiveBacklinksBtn.disabled = !running;
+  if (retryArchiveBacklinksBtn) retryArchiveBacklinksBtn.disabled = running || !archiveHasRecords;
+  if (exportArchiveBtn) exportArchiveBtn.disabled = running || !archiveHasRecords;
+}
+
+async function saveArchiveRecords(records) {
+  await new Promise((resolve) => {
+    chrome.storage.local.set({ [BACKLINK_ARCHIVE_KEY]: mergeArchiveRecords(records) }, resolve);
+  });
+}
+
+function getArchiveBacklinkConcurrencyLocal() {
+  const logic = getBatchResultsLogic();
+  if (logic && typeof logic.normalizeBacklinkCheckConcurrency === 'function') {
+    return logic.normalizeBacklinkCheckConcurrency(archiveBacklinkConcurrency ? archiveBacklinkConcurrency.value : '');
+  }
+  const value = Number(archiveBacklinkConcurrency ? archiveBacklinkConcurrency.value : 3);
+  return Math.min(8, Math.max(1, Number.isFinite(value) ? value : 3));
+}
+
+function getArchiveBacklinkRetryDelayMsLocal() {
+  const logic = getBatchResultsLogic();
+  if (logic && typeof logic.normalizeBacklinkRetryDelayMs === 'function') {
+    return logic.normalizeBacklinkRetryDelayMs(archiveBacklinkRetryDelay ? archiveBacklinkRetryDelay.value : '');
+  }
+  const value = Number(archiveBacklinkRetryDelay ? archiveBacklinkRetryDelay.value : 2);
+  return Math.min(10000, Math.max(0, Number.isFinite(value) ? Math.round(value * 1000) : 2000));
+}
+
+function getArchiveBacklinkProgressText(records) {
+  const logic = getBatchResultsLogic();
+  if (!logic || typeof logic.buildBacklinkCheckProgress !== 'function') {
+    return '';
+  }
+  const progress = logic.buildBacklinkCheckProgress(records);
+  return `外链检测：${progress.completed}/${progress.total}（${progress.percent}%） 成功 ${progress.success}，未发现 ${progress.missing}，失败 ${progress.error}，跳过 ${progress.skipped}，检测中 ${progress.checking}`;
+}
+
+function updateArchiveBacklinkProgress(records) {
+  if (!archiveBacklinkProgress) return;
+  const text = getArchiveBacklinkProgressText(records);
+  archiveBacklinkProgress.textContent = text || '外链检测：未开始';
+}
+
+function resetArchiveBacklinkCheckState() {
+  for (const controller of archiveBacklinkCheckState.running.values()) {
+    try { controller.abort(); } catch (_) {}
+  }
+  archiveBacklinkCheckState = {
+    active: false,
+    paused: false,
+    stopped: false,
+    queue: [],
+    running: new Map(),
+    records: [],
+    total: 0,
+    startedAt: 0
+  };
+}
+
+function setArchiveRecordsChecking(records, ids) {
+  const idSet = new Set(ids.map(String));
+  return (Array.isArray(records) ? records : []).map((record) => {
+    if (!record || !idSet.has(String(record.id))) return record;
+    return {
+      ...record,
+      latestBacklinkStatus: 'checking',
+      latestBacklinkCheckedAt: '',
+      latestBacklinkMatchedHref: '',
+      latestBacklinkReason: 'queued_for_backlink_check'
+    };
+  });
+}
+
+function clearArchiveCheckingStatus(records) {
+  return (Array.isArray(records) ? records : []).map((record) => {
+    if (!record || record.latestBacklinkStatus !== 'checking') return record;
+    return {
+      ...record,
+      latestBacklinkStatus: '',
+      latestBacklinkCheckedAt: '',
+      latestBacklinkMatchedHref: '',
+      latestBacklinkReason: ''
+    };
+  });
+}
+
+async function checkArchiveBacklinkStatus(options = {}) {
+  const logic = getBatchResultsLogic();
+  if (!logic || typeof logic.mergeBacklinkCheckResults !== 'function') {
+    alert('外链检查工具未加载，请刷新扩展后重试。');
+    return;
+  }
+
+  if (archiveBacklinkCheckState.active) return;
+  resetArchiveBacklinkCheckState();
+
+  const records = await getArchiveRecords();
+  const filtered = getFilteredArchiveRecords(records);
+  if (filtered.length === 0) {
+    alert('当前筛选条件下没有可检查的历史记录。');
+    return;
+  }
+
+  const checkTargets = filtered
+    .slice(0, 500)
+    .filter((record) => options.force || record.latestBacklinkStatus !== 'checking');
+  if (checkTargets.length === 0) {
+    alert('当前筛选条件下没有可检测的历史记录。');
+    return;
+  }
+
+  archiveBacklinkCheckState = {
+    active: true,
+    paused: false,
+    stopped: false,
+    queue: checkTargets.slice(),
+    running: new Map(),
+    records: setArchiveRecordsChecking(records, checkTargets.map((record) => record.id)),
+    total: checkTargets.length,
+    startedAt: Date.now()
+  };
+  await saveArchiveRecords(archiveBacklinkCheckState.records);
+  await renderArchive();
+  updateArchiveBacklinkProgress(archiveBacklinkCheckState.records);
+  setArchiveBacklinkCheckRunning(true);
+  console.info('[batch][archive-check] start', {
+    filteredCount: filtered.length,
+    checkCount: checkTargets.length,
+    concurrency: getArchiveBacklinkConcurrencyLocal(),
+    retryDelayMs: getArchiveBacklinkRetryDelayMsLocal(),
+    force: options.force === true
+  });
+
+  pumpArchiveBacklinkQueue();
+}
+
+function pumpArchiveBacklinkQueue() {
+  if (!archiveBacklinkCheckState.active || archiveBacklinkCheckState.paused || archiveBacklinkCheckState.stopped) {
+    setArchiveBacklinkCheckRunning(archiveBacklinkCheckState.active && !archiveBacklinkCheckState.stopped);
+    return;
+  }
+
+  const concurrency = getArchiveBacklinkConcurrencyLocal();
+  while (archiveBacklinkCheckState.running.size < concurrency && archiveBacklinkCheckState.queue.length > 0) {
+    const record = archiveBacklinkCheckState.queue.shift();
+    runArchiveBacklinkRecordCheck(record);
+  }
+
+  if (archiveBacklinkCheckState.running.size === 0 && archiveBacklinkCheckState.queue.length === 0) {
+    finishArchiveBacklinkCheck('completed');
+  } else {
+    setArchiveBacklinkCheckRunning(true);
+  }
+}
+
+async function runArchiveBacklinkRecordCheck(record) {
+  const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  archiveBacklinkCheckState.running.set(String(record.id), controller);
+
+  try {
+    const response = await fetch(`${API_BASE}/backlink-checks`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal: controller ? controller.signal : undefined,
+      body: JSON.stringify({
+        retryCount: 1,
+        retryDelayMs: getArchiveBacklinkRetryDelayMsLocal(),
+        records: [{
+          id: record.id,
+          sourceUrl: record.sourceUrl || record.url || '',
+          promotionWebsiteUrl: record.promotionWebsiteUrl || '',
+          previousBacklinkStatus: record.latestBacklinkStatus || ''
+        }]
+      })
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok || !payload.success) {
+      throw new Error(payload.message || payload.error || `HTTP ${response.status}`);
+    }
+
+    const logic = getBatchResultsLogic();
+    archiveBacklinkCheckState.records = logic.mergeBacklinkCheckResults(
+      archiveBacklinkCheckState.records,
+      payload.results || []
+    );
+    await saveArchiveRecords(archiveBacklinkCheckState.records);
+    await renderArchive();
+    updateArchiveBacklinkProgress(archiveBacklinkCheckState.records);
+    console.info('[batch][archive-check] complete', {
+      id: record.id,
+      checkedCount: (payload.results || []).length
+    });
+  } catch (error) {
+    if (archiveBacklinkCheckState.stopped && error && error.name === 'AbortError') {
+      return;
+    }
+    const fallback = {
+      id: record.id,
+      latestBacklinkStatus: 'error',
+      latestBacklinkCheckedAt: new Date().toISOString(),
+      latestBacklinkMatchedHref: '',
+      latestBacklinkReason: error && error.message ? error.message : 'unknown_error'
+    };
+    const logic = getBatchResultsLogic();
+    archiveBacklinkCheckState.records = logic.mergeBacklinkCheckResults(archiveBacklinkCheckState.records, [fallback]);
+    await saveArchiveRecords(archiveBacklinkCheckState.records);
+    await renderArchive();
+    updateArchiveBacklinkProgress(archiveBacklinkCheckState.records);
+    console.warn('[batch][archive-check] record failed:', {
+      id: record.id,
+      error: fallback.latestBacklinkReason
+    });
+  } finally {
+    archiveBacklinkCheckState.running.delete(String(record.id));
+    pumpArchiveBacklinkQueue();
+  }
+}
+
+function toggleArchiveBacklinkPause() {
+  if (!archiveBacklinkCheckState.active) return;
+  archiveBacklinkCheckState.paused = !archiveBacklinkCheckState.paused;
+  setArchiveBacklinkCheckRunning(true);
+  if (!archiveBacklinkCheckState.paused) pumpArchiveBacklinkQueue();
+}
+
+async function stopArchiveBacklinkCheck() {
+  if (!archiveBacklinkCheckState.active) return;
+  archiveBacklinkCheckState.stopped = true;
+  archiveBacklinkCheckState.paused = false;
+  for (const controller of archiveBacklinkCheckState.running.values()) {
+    try { controller.abort(); } catch (_) {}
+  }
+  archiveBacklinkCheckState.queue = [];
+  archiveBacklinkCheckState.records = clearArchiveCheckingStatus(archiveBacklinkCheckState.records);
+  await saveArchiveRecords(archiveBacklinkCheckState.records);
+  await renderArchive();
+  finishArchiveBacklinkCheck('stopped');
+}
+
+function finishArchiveBacklinkCheck(reason) {
+  archiveBacklinkCheckState.active = false;
+  archiveBacklinkCheckState.paused = false;
+  archiveBacklinkCheckState.stopped = reason === 'stopped';
+  setArchiveBacklinkCheckRunning(false);
+  updateArchiveBacklinkProgress(archiveBacklinkCheckState.records);
+  updateArchiveActionButtons(archiveBacklinkCheckState.records, getCurrentArchiveFilters().websiteKey);
+  console.info('[batch][archive-check] finished', {
+    reason,
+    total: archiveBacklinkCheckState.total,
+    elapsedMs: Date.now() - archiveBacklinkCheckState.startedAt
   });
 }
 
