@@ -19,6 +19,8 @@ const {
   mergeBacklinkCheckResults,
   getLatestBacklinkStatusDisplay,
   buildBacklinkCheckProgress,
+  buildBacklinkCheckControlState,
+  buildBacklinkCheckProgressText,
   normalizeBacklinkCheckConcurrency,
   normalizeBacklinkRetryDelayMs,
   buildManualReviewTarget,
@@ -152,6 +154,91 @@ test('buildBacklinkCheckProgress counts live backlink check statuses', () => {
     percent: 67
   });
   assert.equal(getLatestBacklinkStatusDisplay({ latestBacklinkStatus: 'checking' }).text, '检测中');
+});
+
+test('buildBacklinkCheckControlState maps archive backlink task states to button states', () => {
+  assert.deepEqual(buildBacklinkCheckControlState({
+    hasRecords: true,
+    active: false,
+    paused: false,
+    stopped: false
+  }), {
+    startDisabled: false,
+    startLabel: '开始检测',
+    pauseDisabled: true,
+    pauseLabel: '暂停',
+    stopDisabled: true,
+    retryDisabled: false,
+    controlsDisabled: false,
+    exportDisabled: false
+  });
+
+  assert.deepEqual(buildBacklinkCheckControlState({
+    hasRecords: true,
+    active: true,
+    paused: false,
+    stopped: false
+  }), {
+    startDisabled: true,
+    startLabel: '检测中...',
+    pauseDisabled: false,
+    pauseLabel: '暂停',
+    stopDisabled: false,
+    retryDisabled: true,
+    controlsDisabled: true,
+    exportDisabled: true
+  });
+
+  assert.deepEqual(buildBacklinkCheckControlState({
+    hasRecords: true,
+    active: true,
+    paused: true,
+    stopped: false
+  }), {
+    startDisabled: true,
+    startLabel: '已暂停',
+    pauseDisabled: false,
+    pauseLabel: '继续检测',
+    stopDisabled: false,
+    retryDisabled: true,
+    controlsDisabled: true,
+    exportDisabled: true
+  });
+
+  assert.deepEqual(buildBacklinkCheckControlState({
+    hasRecords: false,
+    active: false,
+    paused: false,
+    stopped: true
+  }), {
+    startDisabled: true,
+    startLabel: '开始检测',
+    pauseDisabled: true,
+    pauseLabel: '暂停',
+    stopDisabled: true,
+    retryDisabled: true,
+    controlsDisabled: false,
+    exportDisabled: true
+  });
+});
+
+test('buildBacklinkCheckProgressText labels idle, running, paused, stopped, and completed states', () => {
+  const progress = {
+    total: 10,
+    completed: 4,
+    percent: 40,
+    success: 1,
+    missing: 2,
+    error: 1,
+    skipped: 0,
+    checking: 3
+  };
+
+  assert.equal(buildBacklinkCheckProgressText({ total: 0 }, { active: false, stopped: false }), '外链检测：未开始');
+  assert.equal(buildBacklinkCheckProgressText(progress, { active: true, paused: false, stopped: false }), '外链检测中：4/10（40%） 成功 1，未发现 2，失败 1，跳过 0，检测中 3');
+  assert.equal(buildBacklinkCheckProgressText(progress, { active: true, paused: true, stopped: false }), '外链检测已暂停：4/10（40%） 成功 1，未发现 2，失败 1，跳过 0，检测中 3');
+  assert.equal(buildBacklinkCheckProgressText(progress, { active: false, paused: false, stopped: true }), '外链检测已停止：4/10（40%） 成功 1，未发现 2，失败 1，跳过 0，检测中 3');
+  assert.equal(buildBacklinkCheckProgressText({ ...progress, completed: 10, percent: 100, checking: 0 }, { active: false, stopped: false }), '外链检测已完成：10/10（100%） 成功 1，未发现 2，失败 1，跳过 0，检测中 0');
 });
 
 test('normalizeBacklinkCheckConcurrency keeps archive check concurrency bounded', () => {

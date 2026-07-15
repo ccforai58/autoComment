@@ -2820,19 +2820,37 @@ async function exportArchiveResults() {
 
 function setArchiveBacklinkCheckRunning(running) {
   archiveBacklinkCheckRunning = running;
+  const logic = getBatchResultsLogic();
+  const controlState = logic && typeof logic.buildBacklinkCheckControlState === 'function'
+    ? logic.buildBacklinkCheckControlState({
+      hasRecords: archiveHasRecords,
+      active: archiveBacklinkCheckState.active,
+      paused: archiveBacklinkCheckState.paused,
+      stopped: archiveBacklinkCheckState.stopped
+    })
+    : {
+      startDisabled: running || !archiveHasRecords,
+      startLabel: running ? '检测中...' : '开始检测',
+      pauseDisabled: !running,
+      pauseLabel: archiveBacklinkCheckState.paused ? '继续检测' : '暂停',
+      stopDisabled: !running,
+      retryDisabled: running || !archiveHasRecords,
+      controlsDisabled: running,
+      exportDisabled: running || !archiveHasRecords
+    };
   if (checkArchiveBacklinksBtn) {
-    checkArchiveBacklinksBtn.disabled = running || !archiveHasRecords;
-    checkArchiveBacklinksBtn.textContent = running ? '检测中...' : '检查外链状态';
+    checkArchiveBacklinksBtn.disabled = controlState.startDisabled;
+    checkArchiveBacklinksBtn.textContent = controlState.startLabel;
   }
-  if (archiveBacklinkConcurrency) archiveBacklinkConcurrency.disabled = running;
-  if (archiveBacklinkRetryDelay) archiveBacklinkRetryDelay.disabled = running;
+  if (archiveBacklinkConcurrency) archiveBacklinkConcurrency.disabled = controlState.controlsDisabled;
+  if (archiveBacklinkRetryDelay) archiveBacklinkRetryDelay.disabled = controlState.controlsDisabled;
   if (pauseArchiveBacklinksBtn) {
-    pauseArchiveBacklinksBtn.disabled = !running;
-    pauseArchiveBacklinksBtn.textContent = archiveBacklinkCheckState.paused ? '继续' : '暂停';
+    pauseArchiveBacklinksBtn.disabled = controlState.pauseDisabled;
+    pauseArchiveBacklinksBtn.textContent = controlState.pauseLabel;
   }
-  if (stopArchiveBacklinksBtn) stopArchiveBacklinksBtn.disabled = !running;
-  if (retryArchiveBacklinksBtn) retryArchiveBacklinksBtn.disabled = running || !archiveHasRecords;
-  if (exportArchiveBtn) exportArchiveBtn.disabled = running || !archiveHasRecords;
+  if (stopArchiveBacklinksBtn) stopArchiveBacklinksBtn.disabled = controlState.stopDisabled;
+  if (retryArchiveBacklinksBtn) retryArchiveBacklinksBtn.disabled = controlState.retryDisabled;
+  if (exportArchiveBtn) exportArchiveBtn.disabled = controlState.exportDisabled;
 }
 
 async function saveArchiveRecords(records) {
@@ -2865,6 +2883,13 @@ function getArchiveBacklinkProgressText(records) {
     return '';
   }
   const progress = logic.buildBacklinkCheckProgress(records);
+  if (typeof logic.buildBacklinkCheckProgressText === 'function') {
+    return logic.buildBacklinkCheckProgressText(progress, {
+      active: archiveBacklinkCheckState.active,
+      paused: archiveBacklinkCheckState.paused,
+      stopped: archiveBacklinkCheckState.stopped
+    });
+  }
   return `外链检测：${progress.completed}/${progress.total}（${progress.percent}%） 成功 ${progress.success}，未发现 ${progress.missing}，失败 ${progress.error}，跳过 ${progress.skipped}，检测中 ${progress.checking}`;
 }
 
@@ -3053,6 +3078,13 @@ function toggleArchiveBacklinkPause() {
   if (!archiveBacklinkCheckState.active) return;
   archiveBacklinkCheckState.paused = !archiveBacklinkCheckState.paused;
   setArchiveBacklinkCheckRunning(true);
+  updateArchiveBacklinkProgress(archiveBacklinkCheckState.records);
+  console.info('[batch][archive-check] state', {
+    action: archiveBacklinkCheckState.paused ? 'pause' : 'resume',
+    total: archiveBacklinkCheckState.total,
+    queue: archiveBacklinkCheckState.queue.length,
+    running: archiveBacklinkCheckState.running.size
+  });
   if (!archiveBacklinkCheckState.paused) pumpArchiveBacklinkQueue();
 }
 
@@ -3067,6 +3099,12 @@ async function stopArchiveBacklinkCheck() {
   archiveBacklinkCheckState.records = clearArchiveCheckingStatus(archiveBacklinkCheckState.records);
   await saveArchiveRecords(archiveBacklinkCheckState.records);
   await renderArchive();
+  console.info('[batch][archive-check] state', {
+    action: 'stop',
+    total: archiveBacklinkCheckState.total,
+    queue: 0,
+    running: archiveBacklinkCheckState.running.size
+  });
   finishArchiveBacklinkCheck('stopped');
 }
 
