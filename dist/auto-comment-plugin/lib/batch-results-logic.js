@@ -261,6 +261,7 @@ function buildBatchResultSearchText(record) {
 function buildArchiveResultSearchText(record) {
   const source = record && typeof record === 'object' ? record : {};
   const display = getRecordResultDisplay(source);
+  const latestBacklinkDisplay = getLatestBacklinkStatusDisplay(source);
   return [
     source.originalIndex != null ? Number(source.originalIndex) + 1 : '',
     source.promotionWebsiteUrl,
@@ -274,7 +275,12 @@ function buildArchiveResultSearchText(record) {
     source.aiContent,
     source.errorMessage,
     source.batchId,
-    source.matchedHref
+    source.matchedHref,
+    source.latestBacklinkStatus,
+    latestBacklinkDisplay.text,
+    source.latestBacklinkReason,
+    source.latestBacklinkMatchedHref,
+    source.latestBacklinkCheckedAt
   ].join(' ').toLowerCase();
 }
 
@@ -298,11 +304,20 @@ function filterArchiveResultRecords(records, filters) {
   const options = filters || {};
   const websiteKey = options.websiteKey || 'all';
   const result = options.result || 'all';
+  const backlinkStatus = options.backlinkStatus || 'all';
   const keyword = String(options.keyword || '').trim().toLowerCase();
   return source.filter((record) => {
     const recordWebsiteKey = getRecordPromotionKey(record);
     if (websiteKey !== 'all' && recordWebsiteKey !== websiteKey) return false;
     if (!resultMatchesFilter(record, result)) return false;
+    if (backlinkStatus !== 'all') {
+      const latestStatus = record && record.latestBacklinkStatus ? String(record.latestBacklinkStatus) : '';
+      if (backlinkStatus === 'unchecked') {
+        if (latestStatus) return false;
+      } else if (latestStatus !== backlinkStatus) {
+        return false;
+      }
+    }
     if (keyword && !buildArchiveResultSearchText(record).includes(keyword)) return false;
     return true;
   });
@@ -402,6 +417,124 @@ function filterArchiveRecordsForExport(records, websiteKey) {
   }));
 }
 
+const LATEST_BACKLINK_STATUS_DISPLAY = {
+  success: {
+    text: '成功',
+    cssClass: 'success',
+    title: '最新检查：网页源码中存在指向推广网站的链接'
+  },
+  missing: {
+    text: '未发现',
+    cssClass: 'fail',
+    title: '最新检查：网页源码中未发现匹配的推广链接'
+  },
+  error: {
+    text: '检查失败',
+    cssClass: 'manual_required',
+    title: '最新检查：抓取或解析页面失败'
+  },
+  skipped: {
+    text: '已跳过',
+    cssClass: 'skipped',
+    title: '最新检查：缺少来源 URL 或推广网站'
+  },
+  checking: {
+    text: '检测中',
+    cssClass: 'submitted_unconfirmed',
+    title: '正在检查网页源码中的推广链接'
+  }
+};
+
+function getLatestBacklinkStatusDisplay(record) {
+  const status = String(record && record.latestBacklinkStatus || '').trim();
+  if (LATEST_BACKLINK_STATUS_DISPLAY[status]) {
+    return { ...LATEST_BACKLINK_STATUS_DISPLAY[status], value: status };
+  }
+  return {
+    value: '',
+    text: '未检测',
+    cssClass: 'unknown',
+    title: '尚未执行最新外链检查'
+  };
+}
+
+function mergeBacklinkCheckResults(records, checkResults) {
+  const sourceRecords = Array.isArray(records) ? records : [];
+  const resultById = new Map();
+  for (const item of Array.isArray(checkResults) ? checkResults : []) {
+    if (!item || item.id == null) continue;
+    resultById.set(String(item.id), item);
+  }
+
+  return sourceRecords.map((record) => {
+    if (!record || record.id == null) return record;
+    const check = resultById.get(String(record.id));
+    if (!check) return record;
+    return {
+      ...record,
+      latestBacklinkStatus: check.latestBacklinkStatus || '',
+      latestBacklinkCheckedAt: check.latestBacklinkCheckedAt || '',
+      latestBacklinkMatchedHref: check.latestBacklinkMatchedHref || '',
+      latestBacklinkReason: check.latestBacklinkReason || ''
+    };
+  });
+}
+
+function buildBacklinkCheckProgress(records) {
+  const rows = Array.isArray(records) ? records : [];
+  const progress = {
+    total: rows.length,
+    pending: 0,
+    checking: 0,
+    completed: 0,
+    success: 0,
+    missing: 0,
+    error: 0,
+    skipped: 0,
+    percent: 0
+  };
+
+  for (const record of rows) {
+    const status = String(record && record.latestBacklinkStatus || '').trim();
+    if (status === 'checking') {
+      progress.checking++;
+    } else if (status === 'success') {
+      progress.success++;
+      progress.completed++;
+    } else if (status === 'missing') {
+      progress.missing++;
+      progress.completed++;
+    } else if (status === 'error') {
+      progress.error++;
+      progress.completed++;
+    } else if (status === 'skipped') {
+      progress.skipped++;
+      progress.completed++;
+    } else {
+      progress.pending++;
+    }
+  }
+
+  progress.percent = progress.total > 0
+    ? Math.round((progress.completed / progress.total) * 100)
+    : 0;
+  return progress;
+}
+
+function normalizeBacklinkCheckConcurrency(value) {
+  if (String(value || '').trim() === '') return 3;
+  const number = Number(value);
+  if (!Number.isFinite(number) || number <= 0) return number === 0 ? 1 : 3;
+  return Math.min(8, Math.max(1, Math.round(number)));
+}
+
+function normalizeBacklinkRetryDelayMs(value) {
+  if (String(value || '').trim() === '') return 2000;
+  const number = Number(value);
+  if (!Number.isFinite(number) || number < 0) return 2000;
+  return Math.min(10000, Math.max(0, Math.round(number * 1000)));
+}
+
 function buildArchiveExportCsv(input) {
   const source = input && typeof input === 'object' ? input : {};
   const websiteKey = source.websiteKey || 'all';
@@ -416,6 +549,10 @@ function buildArchiveExportCsv(input) {
     'Error Message',
     'Matched Href',
     'Link Verified',
+    'Latest Backlink Status',
+    'Latest Backlink Checked At',
+    'Latest Backlink Matched Href',
+    'Latest Backlink Reason',
     'AI Content',
     'Timestamp'
   ];
@@ -429,6 +566,10 @@ function buildArchiveExportCsv(input) {
     record.errorMessage || '',
     record.matchedHref || '',
     record.linkVerified === true ? 'TRUE' : (record.linkVerified === false ? 'FALSE' : ''),
+    record.latestBacklinkStatus || '',
+    record.latestBacklinkCheckedAt || '',
+    record.latestBacklinkMatchedHref || '',
+    record.latestBacklinkReason || '',
     record.aiContent || '',
     record.timestamp ? new Date(record.timestamp).toISOString() : ''
   ].map(csvEscape).join(','));
@@ -726,6 +867,11 @@ const BatchResultsLogic = {
   filterArchiveResultRecords,
   buildCurrentBatchExportCsv,
   buildArchiveExportCsv,
+  mergeBacklinkCheckResults,
+  getLatestBacklinkStatusDisplay,
+  buildBacklinkCheckProgress,
+  normalizeBacklinkCheckConcurrency,
+  normalizeBacklinkRetryDelayMs,
   deletePromotionWebsiteRecords,
   deleteAllPromotionWebsiteRecords,
   removeCurrentBatchReportedState,
