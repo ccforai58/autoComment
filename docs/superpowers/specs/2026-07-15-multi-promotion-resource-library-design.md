@@ -36,6 +36,8 @@
 
 实现和 UI 文案中不得把 `Discovery target url` 简写成 `Target url`，避免和我们的推广网址混淆。
 
+同一个 `Source url` 可能从多个 Semrush CSV 原始 `Target url` 中被发现，因此资源页本身需要保存发现来源列表。正式导出行上的 `Discovery target url` 优先使用对应成功关系的来源；如果成功关系没有记录，则回退到资源页的首次发现来源。
+
 ## 非目标
 
 - 不新增云端账号、浏览器实例管理或远程调度中心。
@@ -118,6 +120,9 @@
 - `source_url`
 - `source_url_key`：唯一。
 - `source_domain`
+- `first_discovery_target_url`：第一次发现该资源页时，Semrush CSV 原始行里的 `Target url`。
+- `last_discovery_target_url`：最近一次导入或更新该资源页时，Semrush CSV 原始行里的 `Target url`。
+- `discovery_target_urls_json`：该资源页所有去重后的发现来源列表。
 - `source_title`
 - `resource_type`
 - `quality_label`
@@ -155,6 +160,13 @@
 - `verified_backlinks(source_url_key, promotion_project_id)` 唯一。
 
 这样同一个 `Source url` 可以对应多个不同推广网站；同一个 `Source url` 对同一个推广网站重复检测成功时，只更新 `last_verified_at` 和检测字段，不新增重复关系。
+
+重复导入规则：
+
+- 如果 `source_url_key` 不存在，新增 `resource_pages`，并设置首次和最近发现来源。
+- 如果 `source_url_key` 已存在，不停止导入；更新 `last_discovery_target_url`，并把新的 `Discovery target url` 去重加入 `discovery_target_urls_json`。
+- 如果 `source_url_key + promotion_project_id` 已经验证成功过，不新增重复 `verified_backlinks`，只更新 `last_verified_at`、检测状态和来源信息。
+- 如果同一个 `source_url_key` 对另一个推广网站检测成功，新增新的 `verified_backlinks` 关系。
 
 ## 页面抓取与自动填充
 
@@ -239,7 +251,7 @@
 - `Description`
 - `H1`
 
-其中 `Target url` 是我们的推广网址，`Source url` 是外链提交地址，`Discovery target url` 是导入 Semrush CSV 时原始行里的 `Target url`。目标域名权重和流量第一版导出为空，后续功能补充。
+其中 `Target url` 是我们的推广网址，`Source url` 是外链提交地址，`Discovery target url` 是导入 Semrush CSV 时原始行里的 `Target url`。导出 `Discovery target url` 时，优先取 `verified_backlinks.discovery_target_url`；如果为空，则取 `resource_pages.first_discovery_target_url`。目标域名权重和流量第一版导出为空，后续功能补充。
 
 ## UI 设计原则
 
@@ -325,6 +337,7 @@
 - 提交记录保存失败：前端显示失败并写诊断日志，不静默吞掉。
 - 检测成功但资源库同步失败：提交记录保留成功检测状态，并标记 `resource_library_sync_status = failed`，允许后续重试。
 - 重复成功关系：更新已有关系，不新增重复行。
+- 重复资源页导入：不停止导入，更新该资源页的最近发现来源和发现来源列表。
 - 同一资源页对其他推广网站成功：新增新的 `verified_backlinks` 关系。
 
 ## 测试计划
@@ -342,6 +355,7 @@
 - 同一 `source_url_key` 对不同 `promotion_project_id` 可创建多条关系。
 - 资源库导出字段顺序和 `Target url`、`Source url` 语义正确。
 - Semrush CSV 原始 `Target url` 被导出为 `Discovery target url`，不会覆盖我们的推广网址。
+- 重复导入同一个 `Source url` 时不会停止导入，并会维护 `first_discovery_target_url`、`last_discovery_target_url` 和 `discovery_target_urls_json`。
 - 旧配置首次迁移为推广项目。
 
 手动验收：
@@ -356,6 +370,7 @@
 - 同一个 Source url 分别对两个推广网站检测成功后，资源库显示两条关系。
 - 资源库 CSV 导出内容可被表格软件打开且列名正确。
 - 从 Semrush CSV 导入的资源在检测成功后，资源库行能显示原始 `Discovery target url`。
+- 重复导入同一个 Source url 且 Semrush 原始 Target url 不同时，资源页能保留多个发现来源。
 
 ## 验收标准
 
@@ -367,5 +382,6 @@
 - 外链检测成功后才进入正式外链资源库。
 - 同一 Source url 支持多个推广网站成功关系。
 - 资源库导出符合约定字段，且 `Target url`、`Source url`、`Discovery target url` 语义正确。
+- 重复外链资源导入采用更新策略，不中断导入任务。
 - UI 分区清楚、状态明确、操作步骤少。
 - 不保存或记录敏感凭据。
