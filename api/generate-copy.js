@@ -11,8 +11,11 @@ const LINK_HREF_NEWLINE_RULE = [
   '【链接格式要求】',
   'You MUST include the promoted website exactly once as an HTML anchor tag, not as a bare URL.',
   'The anchor text MUST be a natural contextual phrase that fits the current page and promoted website.',
+  'When promoted website keywords are provided, the anchor text MUST be rooted in one of those keywords and must be 4 words or fewer; shorter is better.',
+  'The full comment and the anchor text must read as one natural sentence or thought, not as a detached keyword insert.',
   'Do NOT use the URL, domain, "click here", "website", or generic repeated text as anchor text.',
   'Avoid anchor texts already used in this batch if they are provided in the user prompt.',
+  'Do NOT use anchor texts listed as overused in the user prompt.',
   'If you output any HTML link, the href attribute value MUST contain a real line break immediately before the closing double quote.',
   'Correct example:',
   '<a href="https://example.com/',
@@ -95,9 +98,15 @@ function appendRequiredOutputRules(skillTemplate) {
   return `${skillTemplate.trim()}\n${LINK_HREF_NEWLINE_RULE}`;
 }
 
-function buildUserPrompt({ websiteUrl, title, description, bodyText, usedAnchorTexts, pageLanguageHint, pageLanguageEvidence }) {
+function buildUserPrompt({ websiteUrl, title, description, bodyText, promotionWebsiteUrl, promotionWebsiteContent, usedAnchorTexts, usedAnchorTextStats, pageLanguageHint, pageLanguageEvidence }) {
   const usedAnchors = Array.isArray(usedAnchorTexts)
     ? usedAnchorTexts.map((item) => String(item || '').trim()).filter(Boolean)
+    : [];
+  const overusedAnchors = Array.isArray(usedAnchorTextStats)
+    ? usedAnchorTextStats
+        .filter((item) => item && Number(item.count) >= 30)
+        .map((item) => String(item.text || '').trim())
+        .filter(Boolean)
     : [];
   const languageHint = String(pageLanguageHint || '').trim();
   const languageEvidence = String(pageLanguageEvidence || '').trim();
@@ -126,6 +135,9 @@ function buildUserPrompt({ websiteUrl, title, description, bodyText, usedAnchorT
   return [
     languageInstruction,
     languageContext,
+    promotionWebsiteUrl ? `Promoted website URL: ${promotionWebsiteUrl}` : '',
+    promotionWebsiteContent ? `Promoted website profile:\n${promotionWebsiteContent}` : '',
+    overusedAnchors.length ? `Overused anchor texts in the last 2 days. Do not use them: ${overusedAnchors.join(' | ')}` : '',
     '下面是当前网站的内容，请根据 Skill 模板的要求，为该网站生成一份推广文案：',
     '',
     websiteContent,
@@ -173,7 +185,7 @@ module.exports = async function handler(req, res) {
   }
 
   const body = req.body || {};
-  const { userId, websiteUrl, title, description, bodyText, skillTemplate, promotionWebsiteUrl, promotionWebsiteContent, usedAnchorTexts, aiRequestId, pageLanguageHint, pageLanguageEvidence } = body;
+  const { userId, websiteUrl, title, description, bodyText, skillTemplate, promotionWebsiteUrl, promotionWebsiteContent, usedAnchorTexts, usedAnchorTextStats, aiRequestId, pageLanguageHint, pageLanguageEvidence } = body;
 
   if (!userId) {
     return res.status(400).json({ success: false, error: '缺少 userId 参数' });
@@ -205,7 +217,18 @@ module.exports = async function handler(req, res) {
       ? skillTemplate.trim()
       : getDefaultSkillTemplateV2();
     const template = appendRequiredOutputRules(baseTemplate);
-    const userPrompt = buildUserPrompt({ websiteUrl, title, description, bodyText, usedAnchorTexts, pageLanguageHint, pageLanguageEvidence });
+    const userPrompt = buildUserPrompt({
+      websiteUrl,
+      title,
+      description,
+      bodyText,
+      promotionWebsiteUrl,
+      promotionWebsiteContent,
+      usedAnchorTexts,
+      usedAnchorTextStats,
+      pageLanguageHint,
+      pageLanguageEvidence
+    });
     const generatedText = await generateWithModelQueued(template, userPrompt, {
       requestId: aiRequestId
     });
@@ -214,7 +237,14 @@ module.exports = async function handler(req, res) {
       promotionUrl: promotionWebsiteUrl || websiteUrl,
       promotionContent: promotionWebsiteContent || '',
       pageTitle: title || '',
-      usedAnchorTexts
+      pageDescription: description || '',
+      usedAnchorTexts,
+      blockedAnchorTexts: Array.isArray(usedAnchorTextStats)
+        ? usedAnchorTextStats
+            .filter((item) => item && Number(item.count) >= 30)
+            .map((item) => String(item.text || '').trim())
+            .filter(Boolean)
+        : []
     });
     if (anchored.changed) {
       console.log('[generate-copy] promotion anchor normalized', {

@@ -55,6 +55,38 @@ test('buildAnchorCandidates avoids generic and duplicate anchor text', () => {
   assert.equal(candidates.some((candidate) => /nameintoflowers\.com|https?:\/\//i.test(candidate)), false);
 });
 
+test('buildAnchorCandidates requires anchor roots from promotion keywords when provided', () => {
+  const candidates = buildAnchorCandidates({
+    promotionUrl: 'https://ainail.design/',
+    promotionKeywords: ['AI nail design', 'nail art generator'],
+    promotionContent: 'Title: AI Nail Design\nDescription: Create nail art ideas from prompts.',
+    pageTitle: 'Beauty salon booking tips',
+    pageDescription: 'Ideas for salon owners and beauty creators.',
+    usedAnchorTexts: ['ai nail design']
+  });
+
+  assert.equal(candidates.includes('ai nail design'), false);
+  assert.equal(candidates.some((candidate) => /^nail\b|\bnail\b/i.test(candidate)), true);
+  assert.equal(candidates.some((candidate) => /salon booking tips/i.test(candidate)), false);
+  assert.equal(candidates.every((candidate) => candidate.split(/\s+/).length <= 4), true);
+});
+
+test('ensurePromotionAnchor rewrites off-topic model anchor to keyword-rooted phrase', () => {
+  const result = ensurePromotionAnchor(
+    'This is relevant to <a href="https://ainail.design/">salon booking tips</a>.',
+    {
+      promotionUrl: 'https://ainail.design/',
+      promotionKeywords: ['AI nail design', 'nail art generator'],
+      promotionContent: 'Description: AI nail design ideas and nail art generator workflows.',
+      usedAnchorTexts: ['ai nail design']
+    }
+  );
+
+  assert.equal(result.changed, true);
+  assert.match(result.anchorText, /nail/i);
+  assert.doesNotMatch(result.anchorText, /salon booking tips/i);
+});
+
 test('normalizeAnchorText rejects URLs, domains, and generic anchors', () => {
   assert.equal(normalizeAnchorText('https://example.com'), '');
   assert.equal(normalizeAnchorText('example.com'), '');

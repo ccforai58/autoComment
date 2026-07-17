@@ -1556,6 +1556,45 @@
     };
   }
 
+  function detectPromotionSourceHitLocal(html, promotionUrl) {
+    const source = String(html || '');
+    const promotion = normalizePromotionTargetLocal(promotionUrl);
+    const linkVerification = verifyBacklinkInHtmlLocal(source, promotionUrl);
+    if (linkVerification.linkVerified) {
+      return {
+        hit: true,
+        reason: 'matching_anchor_href_found',
+        matchedHref: linkVerification.matchedHref || '',
+        promotionHost: linkVerification.promotionHost || promotion.hostname || '',
+        sourceMatched: false
+      };
+    }
+    if (!promotion.valid || !promotion.hostname) {
+      return {
+        hit: false,
+        reason: linkVerification.reason || 'invalid_promotion_url',
+        matchedHref: '',
+        promotionHost: promotion.hostname || '',
+        sourceMatched: false
+      };
+    }
+    const lower = source.toLowerCase();
+    const variants = [
+      promotion.normalizedUrl,
+      promotion.normalizedUrl.replace(/^https?:\/\//i, ''),
+      promotion.normalizedUrl.replace(/\/$/, ''),
+      promotion.hostname
+    ].filter(Boolean).map((item) => String(item).toLowerCase());
+    const matchedVariant = variants.find((item) => item && lower.includes(item));
+    return {
+      hit: !!matchedVariant,
+      reason: matchedVariant ? 'promotion_url_found_in_source' : linkVerification.reason || 'no_source_hit',
+      matchedHref: linkVerification.matchedHref || '',
+      promotionHost: promotion.hostname,
+      sourceMatched: !!matchedVariant
+    };
+  }
+
   function logBatchSubmit(stage, details = {}) {
     const ctx = _batchCtx || {};
     const entry = {
@@ -5550,9 +5589,12 @@
       return { isBatch: false };
     }
     const total = Math.max(0, Number(snapshot.totalCount || 0));
-    const completed = Math.min(total, Math.max(0, Array.isArray(snapshot.localResults)
-      ? snapshot.localResults.length
-      : Number(snapshot.completedCount || 0)));
+    const completedSource = Number.isFinite(Number(snapshot.localResultCount))
+      ? Number(snapshot.localResultCount)
+      : (Number.isFinite(Number(snapshot.completedCount))
+        ? Number(snapshot.completedCount)
+        : (Array.isArray(snapshot.localResults) ? snapshot.localResults.length : 0));
+    const completed = Math.min(total, Math.max(0, completedSource));
     const success = Math.max(0, Number(snapshot.successCount || 0));
     const currentRaw = Number(snapshot.currentIndex || 0);
     const current = total > 0 ? Math.min(total, Math.max(1, currentRaw)) : 0;
@@ -6628,6 +6670,29 @@
         return;
       }
       console.log('[content] 2/6 检查是否已处理过...');
+      const promotionWebsiteForSourceCheck = await getWebsiteUrl();
+      const sourceHit = detectPromotionSourceHitLocal(
+        document.documentElement ? document.documentElement.outerHTML : '',
+        promotionWebsiteForSourceCheck
+      );
+      logBatchSubmit('page.source_hit_check', {
+        hit: !!sourceHit.hit,
+        reason: sourceHit.reason || '',
+        promotionHost: sourceHit.promotionHost || '',
+        matchedHref: sourceHit.matchedHref || '',
+        sourceMatched: !!sourceHit.sourceMatched
+      });
+      if (sourceHit.hit) {
+        await reportTerminalBatchResultAndClose(
+          batchId,
+          urlIndex,
+          url,
+          'source_hit',
+          null,
+          'source_contains_promotion_link'
+        );
+        return;
+      }
       const existingResult = await checkExistingBatchResult(batchId, url, urlIndex);
       if (existingResult) {
         console.log('[content] 该URL已处理过，跳过AI生成，直接上报:', existingResult);
@@ -7449,16 +7514,19 @@
     sendBeaconReport(batchId, urlIndex, result, aiContent || null, errorMessage || null);
 
     if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.sendMessage) {
+      const promotionWebsiteUrl = await getWebsiteUrl();
       await new Promise((resolve) => {
-        chrome.runtime.sendMessage({
-          type: 'BATCH_HANDLE_CONFIRM',
+        chrome.runtime.sendMessage(buildBatchConfirmPayloadLocal({
           batchId,
           urlIndex,
           url: url || '',
           aiContent: aiContent || '',
           result,
+          promotionWebsiteUrl,
+          promotionWebsiteKey: normalizePromotionWebsiteKey(promotionWebsiteUrl),
+          copyPromotionWebsiteKey: normalizePromotionWebsiteKey(promotionWebsiteUrl),
           errorMessage: errorMessage || null
-        }).then(resolve).catch(resolve);
+        })).then(resolve).catch(resolve);
       });
     }
 

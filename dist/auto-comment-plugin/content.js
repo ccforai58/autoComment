@@ -1214,9 +1214,17 @@
   const API_BASE = (window.AUTO_COMMENT_CONFIG && window.AUTO_COMMENT_CONFIG.API_BASE) || 'http://127.0.0.1:3000/api';
   const QWEN_API_BASE = API_BASE;
   const BATCH_SCRIPT_BUILD_TAG = 'batch-segmented-link-fill-2026-07-14-ai-cancel-01';
+  const AUTO_COMMENT_LOG_LEVEL = (window.AUTO_COMMENT_CONFIG && window.AUTO_COMMENT_CONFIG.LOG_LEVEL) || 'essential';
+  const AUTO_COMMENT_VERBOSE_LOGS = AUTO_COMMENT_LOG_LEVEL === 'debug';
+  if (!AUTO_COMMENT_VERBOSE_LOGS && typeof console !== 'undefined' && !console.__autoCommentReleaseLogFiltered) {
+    console.__autoCommentReleaseLogFiltered = true;
+    console.log = () => {};
+    console.info = () => {};
+  }
   console.info('[content][config] API_BASE =', API_BASE);
   const WEBSITE_URL_STORAGE_KEY = 'promotion_website_url';
   const WEBSITE_CONTENT_STORAGE_KEY = 'promotion_website_content';
+  const CURRENT_PROMOTION_PROJECT_ID_KEY = 'current_promotion_project_id';
   const USER_NAME_STORAGE_KEY = 'auto_fill_user_name';
   const USER_EMAIL_STORAGE_KEY = 'auto_fill_user_email';
   const USER_PASSWORD_STORAGE_KEY = 'auto_fill_user_password';
@@ -1225,6 +1233,11 @@
   const PROMPT_FIELD_VALUES_STORAGE_KEY = 'auto_fill_prompt_field_values';
   const AI_REUSE_STATE_STORAGE_KEY = 'batch_ai_reuse_state_v1';
   let activeAiRequestId = '';
+  let currentPromotionProjectCache = {
+    project: null,
+    projectId: '',
+    loadedAt: 0
+  };
 
   // ====== 批量任务设置（从 storage.local 读取）======
   const BATCH_SETTINGS_KEY = 'batch_task_settings';
@@ -1556,6 +1569,45 @@
     };
   }
 
+  function detectPromotionSourceHitLocal(html, promotionUrl) {
+    const source = String(html || '');
+    const promotion = normalizePromotionTargetLocal(promotionUrl);
+    const linkVerification = verifyBacklinkInHtmlLocal(source, promotionUrl);
+    if (linkVerification.linkVerified) {
+      return {
+        hit: true,
+        reason: 'matching_anchor_href_found',
+        matchedHref: linkVerification.matchedHref || '',
+        promotionHost: linkVerification.promotionHost || promotion.hostname || '',
+        sourceMatched: false
+      };
+    }
+    if (!promotion.valid || !promotion.hostname) {
+      return {
+        hit: false,
+        reason: linkVerification.reason || 'invalid_promotion_url',
+        matchedHref: '',
+        promotionHost: promotion.hostname || '',
+        sourceMatched: false
+      };
+    }
+    const lower = source.toLowerCase();
+    const variants = [
+      promotion.normalizedUrl,
+      promotion.normalizedUrl.replace(/^https?:\/\//i, ''),
+      promotion.normalizedUrl.replace(/\/$/, ''),
+      promotion.hostname
+    ].filter(Boolean).map((item) => String(item).toLowerCase());
+    const matchedVariant = variants.find((item) => item && lower.includes(item));
+    return {
+      hit: !!matchedVariant,
+      reason: matchedVariant ? 'promotion_url_found_in_source' : linkVerification.reason || 'no_source_hit',
+      matchedHref: linkVerification.matchedHref || '',
+      promotionHost: promotion.hostname,
+      sourceMatched: !!matchedVariant
+    };
+  }
+
   function logBatchSubmit(stage, details = {}) {
     const ctx = _batchCtx || {};
     const entry = {
@@ -1571,6 +1623,7 @@
   }
 
   function sendLocalDebugLog(source, payload) {
+    if (!AUTO_COMMENT_VERBOSE_LOGS) return;
     try {
       const body = JSON.stringify({
         source,
@@ -1718,6 +1771,115 @@
   }
 
   // 从 chrome.storage.sync 中异步获取推广网站地址
+  function getLinkAssistantRuntimeLogic() {
+    return window.AutoCommentLinkAssistantRuntimeLogic || null;
+  }
+
+  function getBatchPromotionProject() {
+    return _batchCtx && _batchCtx.promotionProject ? _batchCtx.promotionProject : null;
+  }
+
+  function sendChromeMessage(message) {
+    return new Promise((resolve, reject) => {
+      if (typeof chrome === 'undefined' || !chrome.runtime || typeof chrome.runtime.sendMessage !== 'function') {
+        reject(new Error('chrome_runtime_unavailable'));
+        return;
+      }
+      try {
+        chrome.runtime.sendMessage(message, (response) => {
+          if (chrome.runtime && chrome.runtime.lastError) {
+            reject(new Error(chrome.runtime.lastError.message || 'chrome_message_failed'));
+            return;
+          }
+          resolve(response);
+        });
+      } catch (error) {
+        reject(error);
+      }
+    });
+  }
+
+  async function linkAssistantApiRequest(path) {
+    const bridged = await sendChromeMessage({
+      type: 'LINK_ASSISTANT_API_REQUEST',
+      apiBase: API_BASE,
+      path,
+      options: {
+        method: 'GET',
+        headers: { Accept: 'application/json' }
+      }
+    });
+    if (!bridged || bridged.success === false) {
+      throw new Error((bridged && bridged.error) || 'LINK_ASSISTANT_API_REQUEST_FAILED');
+    }
+    const payload = bridged.json != null ? bridged.json : (bridged.text ? JSON.parse(bridged.text) : {});
+    if (!bridged.ok || (payload && payload.success === false)) {
+      throw new Error((payload && (payload.message || payload.error)) || `Request failed: ${bridged.status}`);
+    }
+    return payload;
+  }
+
+  async function getCurrentPromotionProjectId() {
+    if (typeof chrome === 'undefined' || !chrome.storage || !chrome.storage.local) return '';
+    const data = await new Promise((resolve) => {
+      chrome.storage.local.get([CURRENT_PROMOTION_PROJECT_ID_KEY], (result) => resolve(result || {}));
+    });
+    return data[CURRENT_PROMOTION_PROJECT_ID_KEY] ? String(data[CURRENT_PROMOTION_PROJECT_ID_KEY]) : '';
+  }
+
+  async function loadCurrentPromotionProject() {
+    const batchProject = getBatchPromotionProject();
+    if (batchProject && batchProject.targetUrl) return batchProject;
+
+    const currentPromotionProjectId = await getCurrentPromotionProjectId();
+    if (!currentPromotionProjectId) return null;
+    const now = Date.now();
+    if (
+      currentPromotionProjectCache.project &&
+      currentPromotionProjectCache.projectId === currentPromotionProjectId &&
+      now - currentPromotionProjectCache.loadedAt < 15000
+    ) {
+      return currentPromotionProjectCache.project;
+    }
+
+    const logic = getLinkAssistantRuntimeLogic();
+    if (!logic || typeof logic.normalizeCurrentProjectResponse !== 'function') return null;
+    try {
+      const response = await linkAssistantApiRequest('/link-assistant/projects');
+      const normalized = logic.normalizeCurrentProjectResponse({ currentPromotionProjectId, response });
+      currentPromotionProjectCache = {
+        project: normalized.project || null,
+        projectId: currentPromotionProjectId,
+        loadedAt: now
+      };
+      if (normalized.project) {
+        console.info('[content][link-assistant] current project loaded', {
+          projectId: normalized.project.id,
+          targetDomain: normalized.project.targetDomain || ''
+        });
+      }
+      return normalized.project || null;
+    } catch (error) {
+      console.warn('[content][link-assistant] current project load failed:', {
+        message: error && error.message ? error.message : String(error)
+      });
+      return null;
+    }
+  }
+
+  async function getPromotionCopyInputsFromProject(legacyUrl, legacyContent) {
+    const project = await loadCurrentPromotionProject();
+    const logic = getLinkAssistantRuntimeLogic();
+    if (!project || !logic || typeof logic.selectPromotionCopyInputs !== 'function') {
+      return {
+        promotionWebsiteUrl: legacyUrl,
+        promotionWebsiteContent: legacyContent,
+        usedProjectKeywords: []
+      };
+    }
+    return logic.selectPromotionCopyInputs({ project, legacyUrl, legacyContent });
+  }
+
   function getWebsiteUrl() {
     return new Promise((resolve) => {
       if (typeof chrome === 'undefined' || !chrome.storage || !chrome.storage.sync) {
@@ -1740,7 +1902,10 @@
           'website url',
           'url'
         ]);
-        resolve(savedUrl || legacyUrl);
+        const fallbackUrl = savedUrl || legacyUrl;
+        getPromotionCopyInputsFromProject(fallbackUrl, '').then((inputs) => {
+          resolve(inputs.promotionWebsiteUrl || fallbackUrl);
+        }).catch(() => resolve(fallbackUrl));
       });
     });
   }
@@ -1767,7 +1932,12 @@
           'site content',
           'description'
         ]);
-        resolve(savedContent || legacyContent);
+        const fallbackContent = savedContent || legacyContent;
+        getWebsiteUrl().then((legacyUrl) => (
+          getPromotionCopyInputsFromProject(legacyUrl, fallbackContent)
+        )).then((inputs) => {
+          resolve(inputs.promotionWebsiteContent || fallbackContent);
+        }).catch(() => resolve(fallbackContent));
       });
     });
   }
@@ -1798,7 +1968,13 @@
           if (!email) email = DEFAULT_EMAIL;
           if (!password) password = DEFAULT_PASSWORD;
 
-          resolve({ name, email, password });
+          loadCurrentPromotionProject().then((project) => {
+            resolve({
+              name: project && project.commentAuthor ? project.commentAuthor : name,
+              email: project && project.contactEmail ? project.contactEmail : email,
+              password
+            });
+          }).catch(() => resolve({ name, email, password }));
         }
       );
     });
@@ -2080,8 +2256,18 @@
   let _batchCtx = null; // { batchId, urlIndex, url }
   let runningBatchTaskKey = null;
 
-  function setBatchContext(batchId, urlIndex, url) {
-    _batchCtx = { batchId, urlIndex, url };
+  function setBatchContext(batchId, urlIndex, url, context = {}) {
+    _batchCtx = {
+      batchId,
+      urlIndex,
+      url,
+      promotionProject: context.promotionProject || null,
+      promotionProjectId: context.promotionProjectId || null,
+      targetUrl: context.targetUrl || '',
+      targetDomain: context.targetDomain || '',
+      discoveryTargetUrl: context.discoveryTargetUrl || '',
+      semrushMeta: context.semrushMeta || null
+    };
     activateQwenProgressTabForBatch();
   }
 
@@ -5355,6 +5541,36 @@
     return Array.from(new Set(used.map((item) => String(item || '').trim()).filter(Boolean)));
   }
 
+  function buildRecentAnchorTextStatsLocal(records, promotionWebsiteUrl, now = Date.now(), windowMs = 48 * 60 * 60 * 1000) {
+    const source = Array.isArray(records) ? records : [];
+    const targetKey = normalizePromotionWebsiteKey(promotionWebsiteUrl);
+    const counts = new Map();
+    for (const record of source) {
+      if (!record || typeof record !== 'object') continue;
+      if (targetKey && normalizePromotionWebsiteKey(record.promotionWebsiteUrl) !== targetKey) continue;
+      const timestamp = typeof record.timestamp === 'number' ? record.timestamp : Date.parse(String(record.timestamp || record.createdAt || ''));
+      if (!timestamp || now - timestamp > windowMs || timestamp > now + 60000) continue;
+      const anchors = [];
+      if (record.anchorText) anchors.push(record.anchorText);
+      anchors.push(...extractAnchorTextsFromCopy(record.aiContent));
+      for (const anchor of anchors) {
+        const text = String(anchor || '').replace(/\s+/g, ' ').trim();
+        if (!text) continue;
+        const key = text.toLowerCase();
+        const current = counts.get(key) || { text, count: 0 };
+        current.count += 1;
+        counts.set(key, current);
+      }
+    }
+    return Array.from(counts.values()).sort((a, b) => b.count - a.count || a.text.localeCompare(b.text));
+  }
+
+  async function getRecentAnchorTextStatsForPromotion(promotionWebsiteUrl) {
+    if (typeof chrome === 'undefined' || !chrome.storage || !chrome.storage.local) return [];
+    const data = await new Promise((resolve) => chrome.storage.local.get(['batchResults'], resolve));
+    return buildRecentAnchorTextStatsLocal(data && data.batchResults, promotionWebsiteUrl);
+  }
+
   function createAiRequestId() {
     const batchId = _batchCtx && _batchCtx.batchId ? _batchCtx.batchId : 'manual';
     const urlIndex = _batchCtx && Number.isFinite(Number(_batchCtx.urlIndex)) ? _batchCtx.urlIndex : 'na';
@@ -5427,6 +5643,7 @@
       getWebsiteContent(),
       getUsedAnchorTextsForCurrentBatch()
     ]);
+    const usedAnchorTextStats = await getRecentAnchorTextStatsForPromotion(promotionWebsiteUrl);
 
     // 检查用户ID是否配置
     const userId = await getUserId();
@@ -5463,6 +5680,7 @@
       titleLength: title.length,
       bodyTextLength: bodyText.length,
       usedAnchorCount: usedAnchorTexts.length,
+      recentAnchorTextCount: usedAnchorTextStats.length,
       pageLanguageHint: languagePayload.pageLanguageHint
     });
     const controller = new AbortController();
@@ -5485,6 +5703,7 @@
           promotionWebsiteUrl,
           promotionWebsiteContent,
           usedAnchorTexts,
+          usedAnchorTextStats,
           aiRequestId,
           pageLanguageHint: languagePayload.pageLanguageHint,
           pageLanguageEvidence: languagePayload.pageLanguageEvidence,
@@ -5550,9 +5769,12 @@
       return { isBatch: false };
     }
     const total = Math.max(0, Number(snapshot.totalCount || 0));
-    const completed = Math.min(total, Math.max(0, Array.isArray(snapshot.localResults)
-      ? snapshot.localResults.length
-      : Number(snapshot.completedCount || 0)));
+    const completedSource = Number.isFinite(Number(snapshot.localResultCount))
+      ? Number(snapshot.localResultCount)
+      : (Number.isFinite(Number(snapshot.completedCount))
+        ? Number(snapshot.completedCount)
+        : (Array.isArray(snapshot.localResults) ? snapshot.localResults.length : 0));
+    const completed = Math.min(total, Math.max(0, completedSource));
     const success = Math.max(0, Number(snapshot.successCount || 0));
     const currentRaw = Number(snapshot.currentIndex || 0);
     const current = total > 0 ? Math.min(total, Math.max(1, currentRaw)) : 0;
@@ -6518,7 +6740,7 @@
           _sendResponse({ ok: true, accepted: true, duplicate: true, urlIndex: message.urlIndex });
           return;
         }
-        setBatchContext(message.batchId, message.urlIndex, message.url);
+        setBatchContext(message.batchId, message.urlIndex, message.url, message);
         _sendResponse({ ok: true, accepted: true, urlIndex: message.urlIndex });
         handleBatchTask(message.batchId, message.urlIndex, message.url)
           .then(() => {
@@ -6628,6 +6850,29 @@
         return;
       }
       console.log('[content] 2/6 检查是否已处理过...');
+      const promotionWebsiteForSourceCheck = await getWebsiteUrl();
+      const sourceHit = detectPromotionSourceHitLocal(
+        document.documentElement ? document.documentElement.outerHTML : '',
+        promotionWebsiteForSourceCheck
+      );
+      logBatchSubmit('page.source_hit_check', {
+        hit: !!sourceHit.hit,
+        reason: sourceHit.reason || '',
+        promotionHost: sourceHit.promotionHost || '',
+        matchedHref: sourceHit.matchedHref || '',
+        sourceMatched: !!sourceHit.sourceMatched
+      });
+      if (sourceHit.hit) {
+        await reportTerminalBatchResultAndClose(
+          batchId,
+          urlIndex,
+          url,
+          'source_hit',
+          null,
+          'source_contains_promotion_link'
+        );
+        return;
+      }
       const existingResult = await checkExistingBatchResult(batchId, url, urlIndex);
       if (existingResult) {
         console.log('[content] 该URL已处理过，跳过AI生成，直接上报:', existingResult);
@@ -7449,16 +7694,19 @@
     sendBeaconReport(batchId, urlIndex, result, aiContent || null, errorMessage || null);
 
     if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.sendMessage) {
+      const promotionWebsiteUrl = await getWebsiteUrl();
       await new Promise((resolve) => {
-        chrome.runtime.sendMessage({
-          type: 'BATCH_HANDLE_CONFIRM',
+        chrome.runtime.sendMessage(buildBatchConfirmPayloadLocal({
           batchId,
           urlIndex,
           url: url || '',
           aiContent: aiContent || '',
           result,
+          promotionWebsiteUrl,
+          promotionWebsiteKey: normalizePromotionWebsiteKey(promotionWebsiteUrl),
+          copyPromotionWebsiteKey: normalizePromotionWebsiteKey(promotionWebsiteUrl),
           errorMessage: errorMessage || null
-        }).then(resolve).catch(resolve);
+        })).then(resolve).catch(resolve);
       });
     }
 

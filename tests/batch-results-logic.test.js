@@ -8,6 +8,7 @@ const {
   deletePromotionWebsiteRecords,
   deleteAllPromotionWebsiteRecords,
   removeCurrentBatchReportedState,
+  selectCurrentBatchStorageKeysForRemoval,
   buildCompactBatchProgress,
   chooseAssistantProgressTab,
   buildServiceStatusSummary,
@@ -17,6 +18,7 @@ const {
   filterArchiveResultRecords,
   getResultDisplay,
   mergeBacklinkCheckResults,
+  selectBacklinkProgressRecords,
   getLatestBacklinkStatusDisplay,
   buildBacklinkCheckProgress,
   buildBacklinkCheckControlState,
@@ -27,23 +29,102 @@ const {
   buildManualReviewTarget,
   buildManualReviewOpenMessage,
   dedupeCsvSourceUrlItems,
+  formatDateTimeForDisplay,
   findDuplicatePromotionSubmissionRecord
 } = require('../lib/batch-results-logic');
 
-test('buildCurrentBatchExportCsv keeps original CSV order and appends run result', () => {
+test('formatDateTimeForDisplay includes date and time in local display format', () => {
+  assert.equal(formatDateTimeForDisplay(new Date(2026, 6, 17, 9, 8, 7)), '2026-07-17 09:08:07');
+  assert.equal(formatDateTimeForDisplay(null), '--');
+});
+
+test('buildCurrentBatchExportCsv exports a stable current batch result report', () => {
   const csv = buildCurrentBatchExportCsv({
     batchId: 'batch-abc',
     results: [
-      { originalIndex: 1, result: 'fail', originalRow: ['20', 'https://b.test/', 'b.test'] },
-      { originalIndex: 0, result: 'success', originalRow: ['10', 'https://a.test/', 'a.test'] }
+      {
+        originalIndex: 1,
+        promotionWebsiteUrl: 'https://promo.test/',
+        promotionProjectId: 7,
+        url: 'https://b.test/',
+        sourceDomain: 'b.test',
+        discoveryTargetUrl: 'https://discover.test/page',
+        result: 'fail',
+        errorMessage: 'content timeout',
+        aiContent: 'copy, with comma',
+        timestamp: new Date(2026, 6, 17, 9, 8, 7).getTime(),
+        elapsed: 12,
+        linkVerified: false,
+        matchedHref: '',
+        semrushMeta: { pageAscore: 20 }
+      },
+      {
+        originalIndex: 0,
+        targetUrl: 'https://promo.test/',
+        url: 'https://a.test/',
+        sourceDomain: 'a.test',
+        result: 'success',
+        errorMessage: '',
+        aiContent: 'good copy',
+        timestamp: new Date(2026, 6, 17, 9, 0, 0).getTime(),
+        elapsed: 8,
+        linkVerified: true,
+        matchedHref: 'https://promo.test/'
+      }
     ]
   });
 
   const lines = csv.content.split('\n');
   assert.equal(csv.filename, 'batch-results-current-batch-abc.csv');
-  assert.match(lines[0], /^Page AS,Original URL,URL Domain,Run Result$/);
-  assert.equal(lines[1], '10,https://a.test/,a.test,OK');
-  assert.equal(lines[2], '20,https://b.test/,b.test,FAIL');
+  assert.equal(
+    lines[0],
+    '#,Promotion website,Promotion project ID,Source url,Source domain,Discovery target url,Page ascore,Result,Result label,Error info,AI content,Submitted at,Elapsed seconds,Backlink verified,Matched href,Batch ID'
+  );
+  assert.equal(lines[1], '1,https://promo.test/,,https://a.test/,a.test,,,success,成功,,good copy,2026-07-17 09:00:00,8,true,https://promo.test/,batch-abc');
+  assert.equal(lines[2], '2,https://promo.test/,7,https://b.test/,b.test,https://discover.test/page,20,fail,失败,content timeout,"copy, with comma",2026-07-17 09:08:07,12,false,,batch-abc');
+  assert.equal(csv.recordCount, 2);
+});
+
+test('selectCurrentBatchStorageKeysForRemoval only removes storage owned by current batch', () => {
+  const keys = selectCurrentBatchStorageKeysForRemoval({
+    batchId: 'batch-a',
+    promotionKey: normalizePromotionWebsiteKey('https://promo-a.test/'),
+    storageData: {
+      batchLocalResults: { batchId: 'batch-a', results: [] },
+      batch_runtime_state_v1: {
+        batchId: 'batch-b',
+        currentPromotionWebsiteKey: normalizePromotionWebsiteKey('https://promo-b.test/')
+      },
+      batch_pending_task: { batchId: 'batch-b', urlIndex: 3 },
+      batchCtx: { batchId: 'batch-a', urlIndex: 1 },
+      batchSubmitCtx: {
+        batchId: 'batch-b',
+        promotionWebsiteKey: normalizePromotionWebsiteKey('https://promo-b.test/')
+      }
+    }
+  });
+
+  assert.deepEqual(keys.sort(), ['batchCtx', 'batchLocalResults'].sort());
+});
+
+test('selectCurrentBatchStorageKeysForRemoval can remove current promotion legacy snapshot by owner', () => {
+  const keys = selectCurrentBatchStorageKeysForRemoval({
+    batchId: 'batch-a',
+    promotionKey: normalizePromotionWebsiteKey('https://promo-a.test/'),
+    storageData: {
+      batch_runtime_state_v1: {
+        batchId: 'batch-a',
+        currentPromotionWebsiteKey: normalizePromotionWebsiteKey('https://promo-a.test/')
+      },
+      batch_pending_task: { batchId: 'batch-a', urlIndex: 2 },
+      batchSubmitCtx: {
+        batchId: 'batch-a',
+        promotionWebsiteKey: normalizePromotionWebsiteKey('https://promo-a.test/')
+      }
+    }
+  });
+
+  assert.deepEqual(keys.sort(), ['batchSubmitCtx', 'batch_pending_task', 'batch_runtime_state_v1'].sort());
 });
 
 test('chooseAssistantProgressTab switches to progress only before user tab choice', () => {
@@ -83,6 +164,76 @@ test('buildArchiveExportCsv exports the selected promotion website only', () => 
   assert.equal(lines[1].includes('https://a.test/'), true);
   assert.equal(lines[2].includes('https://b.test/'), true);
   assert.equal(csv.content.includes('https://other-source.test/'), false);
+});
+
+test('archive backlink checks target only the selected promotion website and filters', () => {
+  const websiteKey = normalizePromotionWebsiteKey('https://promo.test/');
+  const filtered = filterArchiveResultRecords([
+    {
+      id: 'target-success',
+      promotionWebsiteUrl: 'https://promo.test/',
+      sourceUrl: 'https://source-a.test/post',
+      result: 'success',
+      latestBacklinkStatus: ''
+    },
+    {
+      id: 'target-fail',
+      promotionWebsiteUrl: 'https://promo.test/',
+      sourceUrl: 'https://source-b.test/post',
+      result: 'fail',
+      latestBacklinkStatus: ''
+    },
+    {
+      id: 'other-success',
+      promotionWebsiteUrl: 'https://other.test/',
+      sourceUrl: 'https://source-c.test/post',
+      result: 'success',
+      latestBacklinkStatus: ''
+    }
+  ], {
+    websiteKey,
+    result: 'success',
+    backlinkStatus: 'unchecked',
+    keyword: ''
+  });
+
+  assert.deepEqual(filtered.map((record) => record.id), ['target-success']);
+  assert.deepEqual(selectBacklinkCheckTargets(filtered).map((record) => record.id), ['target-success']);
+});
+
+test('historical hard-stop skips across promotion websites are still archived for the current promotion', () => {
+  const result = findDuplicatePromotionSubmissionRecord({
+    promotionWebsiteUrl: 'https://current-promo.test/',
+    url: 'https://source.test/post',
+    records: [
+      {
+        promotionWebsiteUrl: 'https://other-promo.test/',
+        sourceUrl: 'https://source.test/post',
+        result: 'no_comment_box',
+        errorMessage: 'No comment form found'
+      }
+    ]
+  });
+
+  assert.equal(result.shouldSkip, true);
+  assert.equal(result.reason, 'historical_no_comment_box');
+  assert.equal(result.result, 'skipped');
+  assert.equal(result.suppressArchive, false);
+});
+
+test('selectBacklinkProgressRecords keeps progress scoped to checked record ids', () => {
+  const records = [
+    { id: 'a', latestBacklinkStatus: 'success' },
+    { id: 'b', latestBacklinkStatus: 'missing' },
+    { id: 'c', latestBacklinkStatus: 'error' }
+  ];
+
+  const scoped = selectBacklinkProgressRecords(records, ['a', 'c']);
+
+  assert.deepEqual(scoped.map((record) => record.id), ['a', 'c']);
+  assert.equal(buildBacklinkCheckProgress(scoped).total, 2);
+  assert.equal(buildBacklinkCheckProgress(scoped).success, 1);
+  assert.equal(buildBacklinkCheckProgress(scoped).error, 1);
 });
 
 test('mergeBacklinkCheckResults stores latest backlink fields without changing original result', () => {
@@ -430,6 +581,25 @@ test('getResultDisplay splits submitted_unconfirmed into understandable sub stat
   }).subcategory, 'unconfirmed_timeout');
 });
 
+test('getResultDisplay labels historical hard-stop skipped records by reason', () => {
+  assert.deepEqual(getResultDisplay({
+    result: 'skipped',
+    errorMessage: 'historical_no_comment_box'
+  }), {
+    value: 'skipped',
+    category: 'skipped',
+    subcategory: 'historical_no_comment_box',
+    text: '\u65e0\u8bc4\u8bba\u6846\uff0c\u8df3\u8fc7',
+    categoryText: '\u5df2\u8df3\u8fc7',
+    cssClass: 'skipped'
+  });
+
+  assert.equal(getResultDisplay({
+    result: 'skipped',
+    errorMessage: 'historical_page_unavailable'
+  }).text, '\u8bbf\u95ee\u4e0d\u5230\uff0c\u8df3\u8fc7');
+});
+
 test('buildManualReviewTarget extracts a browser-openable target page URL', () => {
   assert.deepEqual(buildManualReviewTarget({
     record: { url: 'https://target.test/post' },
@@ -514,6 +684,46 @@ test('findDuplicatePromotionSubmissionRecord treats success and moderation succe
   }
 });
 
+test('findDuplicatePromotionSubmissionRecord skips historical hard-stop source records for the same promotion website', () => {
+  const records = [
+    { sourceUrl: 'https://target.test/no-comments', promotionWebsiteUrl: 'https://promo.test/', result: 'no_comment_box' },
+    { sourceUrl: 'https://target.test/unavailable', promotionWebsiteUrl: 'https://promo.test/', result: 'fail', errorMessage: 'net::ERR_NAME_NOT_RESOLVED' },
+    { sourceUrl: 'https://target.test/illegal', promotionWebsiteUrl: 'https://promo.test/', result: 'blocked_illegal' },
+    { sourceUrl: 'https://target.test/manual', promotionWebsiteUrl: 'https://other.test/', result: 'manual_required' }
+  ];
+
+  assert.equal(findDuplicatePromotionSubmissionRecord({
+    records,
+    url: 'https://target.test/no-comments',
+    promotionWebsiteUrl: 'https://promo.test/'
+  }).reason, 'historical_no_comment_box');
+
+  assert.equal(findDuplicatePromotionSubmissionRecord({
+    records,
+    url: 'https://target.test/unavailable/',
+    promotionWebsiteUrl: 'https://promo.test/'
+  }).reason, 'historical_page_unavailable');
+
+  assert.equal(findDuplicatePromotionSubmissionRecord({
+    records,
+    url: 'https://target.test/illegal',
+    promotionWebsiteUrl: 'https://promo.test/'
+  }).reason, 'historical_blocked_illegal');
+
+  assert.equal(findDuplicatePromotionSubmissionRecord({
+    records,
+    url: 'https://target.test/manual',
+    promotionWebsiteUrl: 'https://promo.test/'
+  }).shouldSkip, false);
+});
+
+test('getResultDisplay supports source hit skip state', () => {
+  const display = getResultDisplay('source_hit');
+  assert.equal(display.value, 'source_hit');
+  assert.equal(display.category, 'skipped');
+  assert.equal(display.text, '\u6e90\u7801\u5df2\u547d\u4e2d');
+});
+
 test('deletePromotionWebsiteRecords removes archive and runtime records for one promotion website', () => {
   const websiteKey = normalizePromotionWebsiteKey('https://promo.test/');
   const result = deletePromotionWebsiteRecords({
@@ -590,6 +800,24 @@ test('buildCompactBatchProgress summarizes running batch and estimates finish ti
     etaText: '约 2 分钟后',
     stageText: '正在处理当前页面'
   });
+});
+
+test('buildCompactBatchProgress uses total local result count when recent results are truncated', () => {
+  const result = buildCompactBatchProgress({
+    snapshot: {
+      status: 'running',
+      totalCount: 500,
+      currentIndex: 121,
+      successCount: 80,
+      localResultCount: 120,
+      localResults: Array.from({ length: 100 }, () => ({})),
+      batchStartedAt: 1000
+    },
+    now: 121000
+  });
+
+  assert.equal(result.completed, 120);
+  assert.equal(result.percent, 24);
 });
 
 test('buildCompactBatchProgress keeps empty and completed states simple', () => {

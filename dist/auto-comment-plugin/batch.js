@@ -4,13 +4,28 @@
 const API_BASE = (window.AUTO_COMMENT_CONFIG && window.AUTO_COMMENT_CONFIG.API_BASE) || 'http://127.0.0.1:3000/api';
 const BLOG_RUN_STATS_ENDPOINT = `${API_BASE}/blog-run-stats`;
 console.info('[batch][config] API_BASE =', API_BASE);
+const AUTO_COMMENT_LOG_LEVEL = (window.AUTO_COMMENT_CONFIG && window.AUTO_COMMENT_CONFIG.LOG_LEVEL) || 'essential';
+const AUTO_COMMENT_VERBOSE_LOGS = AUTO_COMMENT_LOG_LEVEL === 'debug';
+if (!AUTO_COMMENT_VERBOSE_LOGS && typeof console !== 'undefined' && !console.__autoCommentReleaseLogFiltered) {
+  console.__autoCommentReleaseLogFiltered = true;
+  console.log = () => {};
+  console.info = () => {};
+}
 const POLL_INTERVAL = 3000;
 const TIMEOUT_CHECK_INTERVAL = 5000;
 const TIMEOUT_STORAGE_KEY = 'batch_timeout_seconds';
 const SUBMIT_CONTEXT_CONFIRMATION_GRACE_SECONDS = 8;
 const AI_REUSE_STATE_STORAGE_KEY = 'batch_ai_reuse_state_v1';
+const BATCH_RUNTIME_PERSIST_DELAY_MS = 1200;
+const RENDER_STATS_THROTTLE_MS = 300;
+
+let batchRuntimePersistTimer = null;
+let pendingBatchRuntimeSnapshot = null;
+let renderStatsTimer = null;
+let renderStatsLastAt = 0;
 
 function sendLocalDebugLog(source, payload) {
+  if (!AUTO_COMMENT_VERBOSE_LOGS) return;
   try {
     fetch(`${API_BASE}/debug-log`, {
       method: 'POST',
@@ -23,6 +38,10 @@ function sendLocalDebugLog(source, payload) {
 
 function getSemrushImportLogic() {
   return window.AutoCommentSemrushImportLogic || null;
+}
+
+function getLinkAssistantRuntimeLogic() {
+  return window.AutoCommentLinkAssistantRuntimeLogic || null;
 }
 
 function sanitizeSemrushImportValue(value) {
@@ -64,6 +83,70 @@ function logSubmitFlow(stage, details = {}) {
   const entry = { stage, batchId, ...details };
   console.log('[batch][submit-flow]', entry);
   sendLocalDebugLog('batch', entry);
+}
+
+function getBatchPerformanceTiming(urlIndex) {
+  const key = String(urlIndex);
+  let timing = batchPerformanceTimings.get(key);
+  if (!timing) {
+    timing = {
+      urlIndex,
+      startedAt: Date.now(),
+      lastAt: 0,
+      marks: {},
+      counters: {}
+    };
+    batchPerformanceTimings.set(key, timing);
+  }
+  return timing;
+}
+
+function markBatchPerformanceStage(perfStage, details = {}) {
+  const urlIndex = details.urlIndex;
+  if (urlIndex === undefined || urlIndex === null) return null;
+  const now = Date.now();
+  const timing = getBatchPerformanceTiming(urlIndex);
+  if (perfStage === 'open_prepare') timing.startedAt = now;
+  const previousAt = timing.lastAt || timing.startedAt || now;
+  timing.lastAt = now;
+  timing.marks[perfStage] = now;
+  if (perfStage === 'content_ping_retry') {
+    timing.counters.pingRetries = Number(details.retries || 0);
+  }
+  const entry = {
+    perfStage,
+    urlIndex,
+    elapsedMs: Math.max(0, now - (timing.startedAt || now)),
+    sincePreviousMs: Math.max(0, now - previousAt),
+    activeTabCount,
+    currentIndex,
+    totalCount,
+    ...details
+  };
+  logSubmitFlow('batch.perf.stage', entry);
+  return entry;
+}
+
+function getBatchPerformanceSummary(urlIndex, extra = {}) {
+  const timing = batchPerformanceTimings.get(String(urlIndex));
+  const marks = timing && timing.marks ? timing.marks : {};
+  const diff = (from, to) => marks[from] && marks[to] ? Math.max(0, marks[to] - marks[from]) : null;
+  const totalMs = timing && timing.startedAt ? Math.max(0, Date.now() - timing.startedAt) : null;
+  return {
+    urlIndex,
+    totalMs,
+    openToTabCreatedMs: diff('open_prepare', 'tab_create_done'),
+    tabCreatedToContentReadyMs: diff('tab_create_done', 'content_ping_ready'),
+    contentReadyToAcceptedMs: diff('content_ping_ready', 'message_accepted'),
+    acceptedToConfirmMs: diff('message_accepted', 'confirm_received'),
+    confirmToResultMs: diff('confirm_received', 'result_recorded'),
+    pingRetries: timing && timing.counters ? Number(timing.counters.pingRetries || 0) : 0,
+    ...extra
+  };
+}
+
+function logBatchPerformanceSummary(urlIndex, extra = {}) {
+  logSubmitFlow('batch.perf.summary', getBatchPerformanceSummary(urlIndex, extra));
 }
 
 function computeBatchTimeoutLimit({ configuredSeconds }) {
@@ -117,7 +200,21 @@ function getSubmitVerificationGraceSecondsLocal(evidence) {
   return SUBMIT_CONTEXT_CONFIRMATION_GRACE_SECONDS;
 }
 
+function shouldRestoreBatchRuntimeAfterPromotionChangeLocal({ changes, areaName, status: currentStatus }) {
+  if (areaName !== 'local') return false;
+  if (currentStatus === 'running') return false;
+  const change = changes && changes[CURRENT_PROMOTION_PROJECT_ID_KEY];
+  if (!change || typeof change !== 'object') return false;
+  return String(change.oldValue || '') !== String(change.newValue || '');
+}
+
 function resetRuntimeForNewUpload(parsedUrlCount) {
+  cancelBatchRuntimePersistTimer();
+  if (renderStatsTimer) {
+    clearTimeout(renderStatsTimer);
+    renderStatsTimer = null;
+  }
+  renderStatsLastAt = 0;
   batchId = null;
   status = 'idle';
   activeTabCount = 0;
@@ -125,6 +222,7 @@ function resetRuntimeForNewUpload(parsedUrlCount) {
   initialPoints = parseInt(pointsBalance.textContent || '0', 10) || 0;
   currentPromotionWebsiteUrl = '';
   totalCount = Number(parsedUrlCount || 0);
+  currentResultsCurrentPage = 1;
   batchStartedAt = 0;
   successCount = 0;
   failCount = 0;
@@ -136,6 +234,7 @@ function resetRuntimeForNewUpload(parsedUrlCount) {
   localResults = [];
   activeTabs.clear();
   activeTabsByIndex.clear();
+  batchPerformanceTimings.clear();
   tabsPendingConfirm.clear();
   tabsWaitingClose.clear();
   skippedIndices.clear();
@@ -147,6 +246,69 @@ function resetRuntimeForNewUpload(parsedUrlCount) {
   }
   stopTimeoutChecker();
   setStatus('idle');
+}
+
+function resetRuntimeViewForPromotionSwitch() {
+  batchId = null;
+  status = 'idle';
+  totalCount = 0;
+  batchStartedAt = 0;
+  currentIndex = 0;
+  parsedUrls = [];
+  localResults = [];
+  currentResultsCurrentPage = 1;
+  successCount = 0;
+  failCount = 0;
+  skippedCount = 0;
+  noCommentBoxCount = 0;
+  manualRequiredCount = 0;
+  blockedIllegalCount = 0;
+  pendingCount = 0;
+  activeTabCount = 0;
+  activeTabs.clear();
+  activeTabsByIndex.clear();
+  batchPerformanceTimings.clear();
+  tabsPendingConfirm.clear();
+  tabsWaitingClose.clear();
+  skippedIndices.clear();
+  isOpeningTab = false;
+  isTerminated = false;
+  if (pollTimer) {
+    clearTimeout(pollTimer);
+    pollTimer = null;
+  }
+  stopTimeoutChecker();
+  if (fileInput) fileInput.value = '';
+  if (semrushFileInput) semrushFileInput.value = '';
+  if (fileInfo) fileInfo.classList.remove('visible');
+  if (uploadZone) uploadZone.classList.remove('has-file');
+  if (semrushUploadZone) semrushUploadZone.classList.remove('has-file');
+  if (urlPreview) urlPreview.classList.remove('visible');
+  if (urlPreviewBody) urlPreviewBody.innerHTML = '';
+  if (fileCount) fileCount.textContent = '';
+  if (duplicateCountEl) duplicateCountEl.textContent = '';
+  if (semrushImportStatus) semrushImportStatus.textContent = '';
+  if (statsTableBody) statsTableBody.innerHTML = '';
+  if (filterDomain) filterDomain.innerHTML = '<option value="all">全部域名</option>';
+  if (filterResult) filterResult.value = 'all';
+  if (filterTimeRange) filterTimeRange.value = 'all';
+  if (filterKeyword) filterKeyword.value = '';
+  updateCostHint(0);
+  renderStats();
+  setStatus('idle');
+  updateUI();
+}
+
+async function restoreRuntimeForActivePromotionChange() {
+  if (status === 'running') {
+    console.info('[batch][runtime] ignored promotion change while running', { batchId });
+    return;
+  }
+  resetRuntimeViewForPromotionSwitch();
+  await refreshSetupSummary();
+  await renderArchive();
+  await restoreBatchRuntimeState();
+  updateUI();
 }
 
 function clearRuntimeStorageForNewUpload() {
@@ -174,6 +336,7 @@ let activeTabCount = 0;
 let currentIndex = 0;
 let initialPoints = 0;
 let currentPromotionWebsiteUrl = '';
+let currentPromotionProject = null;
 
 // Text cleanup: previous comment was mojibake.
 let totalCount = 0;
@@ -195,6 +358,7 @@ let pollTimer = null;
 // Text cleanup: previous comment was mojibake.
 let activeTabs = new Map();
 let activeTabsByIndex = new Map();  // urlIndex -> { urlIndex, startTime }
+let batchPerformanceTimings = new Map();
 
 // Text cleanup: previous comment was mojibake.
 let timeoutCheckTimer = null;
@@ -213,6 +377,7 @@ const uploadZone = document.getElementById('uploadZone');
 const fileInput = document.getElementById('fileInput');
 const semrushUploadZone = document.getElementById('semrushUploadZone');
 const semrushFileInput = document.getElementById('semrushFileInput');
+const semrushConfig = document.getElementById('semrushConfig');
 const semrushMinAscore = document.getElementById('semrushMinAscore');
 const semrushMaxPerDomain = document.getElementById('semrushMaxPerDomain');
 const semrushImportStatus = document.getElementById('semrushImportStatus');
@@ -243,6 +408,7 @@ const costHint = document.getElementById('costHint');
 const statusBadge = document.getElementById('statusBadge');
 const timeoutInput = document.getElementById('timeoutInput');
 const openSettingsBtn = document.getElementById('openSettingsBtn');
+const openResourceLibraryBtn = document.getElementById('openResourceLibraryBtn');
 const refreshSetupBtn = document.getElementById('refreshSetupBtn');
 const setupWebsiteValue = document.getElementById('setupWebsiteValue');
 const setupIdentityValue = document.getElementById('setupIdentityValue');
@@ -268,12 +434,18 @@ const filterKeyword = document.getElementById('filterKeyword');
 const statsTableBody = document.getElementById('statsTableBody');
 const statsTableWrap = document.getElementById('statsTableWrap');
 const statsCountLabel = document.getElementById('statsCountLabel');
+const currentPageSizeSelect = document.getElementById('currentPageSize');
+const currentPageJumpSelect = document.getElementById('currentPageJump');
+const currentPageInfo = document.getElementById('currentPageInfo');
 const currentResultsEmpty = document.getElementById('currentResultsEmpty');
 const archiveWebsiteFilter = document.getElementById('archiveWebsiteFilter');
 const archiveResultFilter = document.getElementById('archiveResultFilter');
 const archiveBacklinkStatusFilter = document.getElementById('archiveBacklinkStatusFilter');
 const archiveKeyword = document.getElementById('archiveKeyword');
 const archiveCountLabel = document.getElementById('archiveCountLabel');
+const archivePageSizeSelect = document.getElementById('archivePageSize');
+const archivePageJumpSelect = document.getElementById('archivePageJump');
+const archivePageInfo = document.getElementById('archivePageInfo');
 const archiveSummary = document.getElementById('archiveSummary');
 const archiveTableBody = document.getElementById('archiveTableBody');
 const archiveTableWrap = document.getElementById('archiveTableWrap');
@@ -289,9 +461,13 @@ const exportArchiveBtn = document.getElementById('exportArchiveBtn');
 const deleteArchiveSiteBtn = document.getElementById('deleteArchiveSiteBtn');
 const deleteArchiveAllBtn = document.getElementById('deleteArchiveAllBtn');
 let activeResultsView = 'current';
+let currentResultsCurrentPage = 1;
+let currentResultsPageSize = 200;
 let archiveHasRecords = false;
 let archiveWebsiteSelectionTouched = false;
 let archiveBacklinkCheckRunning = false;
+let archiveCurrentPage = 1;
+let archivePageSize = 50;
 let archiveBacklinkCheckState = {
   active: false,
   paused: false,
@@ -299,6 +475,7 @@ let archiveBacklinkCheckState = {
   queue: [],
   running: new Map(),
   records: [],
+  targetIds: [],
   total: 0,
   startedAt: 0
 };
@@ -313,8 +490,11 @@ const BATCH_SETTINGS_KEY = 'batch_task_settings';
 const BATCH_URLS_KEY = 'batch_task_urls';
 const BATCH_PENDING_TASK_KEY = 'batch_pending_task';
 const BATCH_RUNTIME_STATE_KEY = 'batch_runtime_state_v1';
+const BATCH_RUNTIME_STATE_BY_PROMOTION_KEY = 'batch_runtime_state_by_promotion_v1';
 const WEBSITE_URL_STORAGE_KEY = 'promotion_website_url';
+const WEBSITE_CONTENT_STORAGE_KEY = 'promotion_website_content';
 const PROMPT_FIELD_VALUES_STORAGE_KEY = 'auto_fill_prompt_field_values';
+const CURRENT_PROMOTION_PROJECT_ID_KEY = 'current_promotion_project_id';
 const BACKLINK_ARCHIVE_KEY = 'backlink_submission_archive';
 const BACKLINK_ARCHIVE_LIMIT = 5000;
 
@@ -356,6 +536,10 @@ async function saveBatchCheckboxSettings() {
 document.addEventListener('DOMContentLoaded', init);
 
 async function init() {
+  logSubmitFlow('batch-script-loaded', {
+    syncDebugVersion: 'archive-resource-sync-2026-07-15-v2',
+    apiBase: API_BASE
+  });
   await loadUserId();
   await loadPoints();
   await refreshSetupSummary();
@@ -408,7 +592,127 @@ async function getPromotionWebsiteUrlFromSettings() {
   });
 }
 
+async function getPromotionWebsiteContentFromSettings() {
+  return new Promise((resolve) => {
+    chrome.storage.sync.get([WEBSITE_CONTENT_STORAGE_KEY, PROMPT_FIELD_VALUES_STORAGE_KEY], (data) => {
+      const savedContent = data && typeof data[WEBSITE_CONTENT_STORAGE_KEY] === 'string'
+        ? data[WEBSITE_CONTENT_STORAGE_KEY].trim()
+        : '';
+      const legacyContent = pickLegacyPromptValue(data && data[PROMPT_FIELD_VALUES_STORAGE_KEY], [
+        'website content',
+        'site content',
+        'description'
+      ]);
+      resolve(savedContent || legacyContent || '');
+    });
+  });
+}
+
+function linkAssistantApiJson(path, options = {}) {
+  return fetch(`${API_BASE}${path}`, {
+    method: options.method || 'GET',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(options.headers || {})
+    },
+    body: options.body ? JSON.stringify(options.body) : undefined
+  }).then(async (response) => {
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok || payload.success === false) {
+      const error = new Error(payload.message || payload.error || `HTTP ${response.status}`);
+      error.status = response.status;
+      error.payload = payload;
+      throw error;
+    }
+    return payload;
+  });
+}
+
+async function getCurrentPromotionProjectId() {
+  return new Promise((resolve) => {
+    chrome.storage.local.get([CURRENT_PROMOTION_PROJECT_ID_KEY], (data) => {
+      resolve(data && data[CURRENT_PROMOTION_PROJECT_ID_KEY] ? String(data[CURRENT_PROMOTION_PROJECT_ID_KEY]) : '');
+    });
+  });
+}
+
+async function setCurrentPromotionProjectId(projectId) {
+  return new Promise((resolve) => {
+    chrome.storage.local.set({ [CURRENT_PROMOTION_PROJECT_ID_KEY]: projectId ? String(projectId) : '' }, resolve);
+  });
+}
+
+async function createPromotionProjectFromLegacySettings() {
+  const legacyUrl = await getPromotionWebsiteUrlFromSettings();
+  if (!legacyUrl) return null;
+  const legacyContent = await getPromotionWebsiteContentFromSettings();
+  const payload = await linkAssistantApiJson('/link-assistant/projects', {
+    method: 'POST',
+    body: {
+      targetUrl: legacyUrl,
+      metaDescription: legacyContent,
+      defaultSubmitMode: 'auto'
+    }
+  });
+  const project = payload.project || null;
+  if (project && project.id) {
+    await setCurrentPromotionProjectId(project.id);
+    console.info('[batch][link-assistant] migrated legacy promotion website', {
+      projectId: project.id,
+      targetDomain: project.targetDomain || ''
+    });
+  }
+  return project;
+}
+
+async function loadCurrentPromotionProject(options = {}) {
+  const logic = getLinkAssistantRuntimeLogic();
+  const currentPromotionProjectId = await getCurrentPromotionProjectId();
+  try {
+    const response = await linkAssistantApiJson('/link-assistant/projects');
+    const normalized = logic && typeof logic.normalizeCurrentProjectResponse === 'function'
+      ? logic.normalizeCurrentProjectResponse({ currentPromotionProjectId, response })
+      : { project: null, missingReason: currentPromotionProjectId ? 'runtime_logic_unavailable' : 'missing_current_promotion_project_id' };
+    if (normalized.project) {
+      currentPromotionProject = normalized.project;
+      currentPromotionWebsiteUrl = normalized.project.targetUrl || '';
+      return currentPromotionProject;
+    }
+    if (options.createFromLegacy) {
+      const migratedProject = await createPromotionProjectFromLegacySettings();
+      if (migratedProject) {
+        currentPromotionProject = migratedProject;
+        currentPromotionWebsiteUrl = migratedProject.targetUrl || '';
+        return currentPromotionProject;
+      }
+    }
+    currentPromotionProject = null;
+    currentPromotionWebsiteUrl = '';
+    console.info('[batch][link-assistant] no active promotion project', {
+      reason: normalized.missingReason || 'unknown'
+    });
+    return null;
+  } catch (error) {
+    console.warn('[batch][link-assistant] load current project failed:', {
+      message: error && error.message ? error.message : String(error)
+    });
+    if (options.createFromLegacy) {
+      currentPromotionWebsiteUrl = await getPromotionWebsiteUrlFromSettings();
+    }
+    return null;
+  }
+}
+
+function cancelBatchRuntimePersistTimer() {
+  if (batchRuntimePersistTimer) {
+    clearTimeout(batchRuntimePersistTimer);
+    batchRuntimePersistTimer = null;
+  }
+  pendingBatchRuntimeSnapshot = null;
+}
+
 async function getSetupSummaryFromSettings() {
+  const activeProject = await loadCurrentPromotionProject({ createFromLegacy: false }).catch(() => null);
   return new Promise((resolve) => {
     chrome.storage.sync.get([
       WEBSITE_URL_STORAGE_KEY,
@@ -434,7 +738,12 @@ async function getSetupSummaryFromSettings() {
       const userIdValue = data && typeof data.auto_comment_user_id === 'string'
         ? data.auto_comment_user_id.trim()
         : 'local-user';
-      resolve({ promotionUrl, userName, userEmail, userId: userIdValue || 'local-user' });
+      resolve({
+        promotionUrl: activeProject && activeProject.targetUrl ? activeProject.targetUrl : promotionUrl,
+        userName: activeProject && activeProject.commentAuthor ? activeProject.commentAuthor : userName,
+        userEmail: activeProject && activeProject.contactEmail ? activeProject.contactEmail : userEmail,
+        userId: userIdValue || 'local-user'
+      });
     });
   });
 }
@@ -452,8 +761,8 @@ async function refreshSetupSummary() {
   const identity = [setup.userName, setup.userEmail].filter(Boolean).join(' / ');
   const missing = [];
   if (!setup.promotionUrl) missing.push('推广网站');
-  if (!setup.userName) missing.push('姓名');
-  if (!setup.userEmail) missing.push('邮箱');
+  if (!setup.userName) missing.push('评论作者');
+  if (!setup.userEmail) missing.push('联系邮箱');
 
   setSetupValue(setupWebsiteValue, setup.promotionUrl, '未配置');
   setSetupValue(setupIdentityValue, identity, '未配置');
@@ -564,6 +873,17 @@ function bindEvents() {
     semrushUploadZone.addEventListener('dragover', handleDragOver);
     semrushUploadZone.addEventListener('dragleave', handleDragLeave);
     semrushUploadZone.addEventListener('drop', handleSemrushFileDrop);
+    if (semrushConfig) {
+      ['click', 'mousedown', 'mouseup', 'dblclick'].forEach((eventName) => {
+        semrushConfig.addEventListener(eventName, (event) => event.stopPropagation());
+      });
+    }
+    [semrushMinAscore, semrushMaxPerDomain].forEach((input) => {
+      if (!input) return;
+      ['click', 'mousedown', 'mouseup', 'dblclick'].forEach((eventName) => {
+        input.addEventListener(eventName, (event) => event.stopPropagation());
+      });
+    });
   }
 
   // Text cleanup: previous comment was mojibake.
@@ -589,7 +909,12 @@ function bindEvents() {
   if (deleteArchiveAllBtn) deleteArchiveAllBtn.addEventListener('click', deleteAllArchiveWebsiteRecords);
   if (openSettingsBtn) {
     openSettingsBtn.addEventListener('click', () => {
-      chrome.tabs.create({ url: chrome.runtime.getURL('options.html') });
+      chrome.tabs.create({ url: chrome.runtime.getURL('link-assistant-settings.html') });
+    });
+  }
+  if (openResourceLibraryBtn) {
+    openResourceLibraryBtn.addEventListener('click', () => {
+      chrome.tabs.create({ url: chrome.runtime.getURL('resource-library.html') });
     });
   }
   if (refreshSetupBtn) {
@@ -597,6 +922,16 @@ function bindEvents() {
       refreshSetupSummary();
       refreshServiceStatus();
       loadPoints();
+    });
+  }
+  if (chrome.storage && chrome.storage.onChanged) {
+    chrome.storage.onChanged.addListener((changes, areaName) => {
+      if (!shouldRestoreBatchRuntimeAfterPromotionChangeLocal({ changes, areaName, status })) return;
+      restoreRuntimeForActivePromotionChange().catch((error) => {
+        console.warn('[batch][runtime] restore after promotion change failed:', {
+          message: error && error.message ? error.message : String(error)
+        });
+      });
     });
   }
 
@@ -621,21 +956,77 @@ function bindEvents() {
   });
 
   // Text cleanup: previous comment was mojibake.
-  filterResult.addEventListener('change', renderStats);
-  filterDomain.addEventListener('change', renderStats);
-  filterTimeRange.addEventListener('change', renderStats);
-  filterKeyword.addEventListener('input', debounce(renderStats, 300));
+  filterResult.addEventListener('change', () => {
+    currentResultsCurrentPage = 1;
+    renderStats();
+  });
+  filterDomain.addEventListener('change', () => {
+    currentResultsCurrentPage = 1;
+    renderStats();
+  });
+  filterTimeRange.addEventListener('change', () => {
+    currentResultsCurrentPage = 1;
+    renderStats();
+  });
+  filterKeyword.addEventListener('input', debounce(() => {
+    currentResultsCurrentPage = 1;
+    renderStats();
+  }, 300));
   if (resultsCurrentTab) resultsCurrentTab.addEventListener('click', () => setResultsView('current'));
   if (resultsArchiveTab) resultsArchiveTab.addEventListener('click', () => setResultsView('archive'));
+  if (currentPageSizeSelect) {
+    currentPageSizeSelect.addEventListener('change', () => {
+      const nextSize = Number(currentPageSizeSelect.value);
+      currentResultsPageSize = Number.isFinite(nextSize) && nextSize > 0 ? nextSize : 200;
+      currentResultsCurrentPage = 1;
+      renderStats();
+    });
+  }
+  if (currentPageJumpSelect) {
+    currentPageJumpSelect.addEventListener('change', () => {
+      const nextPage = Number(currentPageJumpSelect.value);
+      if (Number.isFinite(nextPage) && nextPage > 0) {
+        currentResultsCurrentPage = nextPage;
+        renderStats();
+      }
+    });
+  }
   if (archiveWebsiteFilter) {
     archiveWebsiteFilter.addEventListener('change', () => {
       archiveWebsiteSelectionTouched = true;
+      archiveCurrentPage = 1;
       renderArchive();
     });
   }
-  if (archiveResultFilter) archiveResultFilter.addEventListener('change', renderArchive);
-  if (archiveBacklinkStatusFilter) archiveBacklinkStatusFilter.addEventListener('change', renderArchive);
-  if (archiveKeyword) archiveKeyword.addEventListener('input', debounce(renderArchive, 300));
+  if (archiveResultFilter) archiveResultFilter.addEventListener('change', () => {
+    archiveCurrentPage = 1;
+    renderArchive();
+  });
+  if (archiveBacklinkStatusFilter) archiveBacklinkStatusFilter.addEventListener('change', () => {
+    archiveCurrentPage = 1;
+    renderArchive();
+  });
+  if (archiveKeyword) archiveKeyword.addEventListener('input', debounce(() => {
+    archiveCurrentPage = 1;
+    renderArchive();
+  }, 300));
+  if (archivePageSizeSelect) {
+    archivePageSizeSelect.addEventListener('change', () => {
+      const nextSize = Number(archivePageSizeSelect.value);
+      archivePageSize = Number.isFinite(nextSize) && nextSize > 0 ? nextSize : 50;
+      archiveCurrentPage = 1;
+      renderArchive();
+    });
+  }
+  if (archivePageJumpSelect) {
+    archivePageJumpSelect.addEventListener('change', () => {
+      const nextPage = Number(archivePageJumpSelect.value);
+      if (Number.isFinite(nextPage) && nextPage > 0) {
+        archiveCurrentPage = nextPage;
+        renderArchive();
+      }
+    });
+  }
   window.addEventListener('focus', refreshWorkbenchConfig);
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible') {
@@ -1006,6 +1397,7 @@ async function processSemrushFile(file) {
       return;
     }
 
+    const semrushHeaders = Array.isArray(rows[0]) ? rows[0].map((value) => String(value == null ? '' : value)) : [];
     parsedUrls = result.submitItems.map((item, index) => ({
       originalIndex: index,
       url: item.url,
@@ -1013,12 +1405,16 @@ async function processSemrushFile(file) {
       targetDomain: item.targetDomain,
       illegalCheck: null,
       originalRow: item.originalRow,
+      semrushHeaders,
+      semrushRow: item.originalRow,
       semrushMeta: {
         targetUrl: item.targetUrl,
         targetDomain: item.targetDomain,
         pageAscore: item.pageAscore,
         externalLinks: item.externalLinks,
-        lastSeen: item.lastSeen
+        lastSeen: item.lastSeen,
+        semrushHeaders,
+        semrushRow: item.originalRow
       }
     }));
 
@@ -1181,7 +1577,13 @@ async function startBatch() {
   // Text cleanup: previous comment was mojibake.
   await saveBatchTaskSettings();
 
-  currentPromotionWebsiteUrl = await getPromotionWebsiteUrlFromSettings();
+  currentPromotionProject = await loadCurrentPromotionProject({ createFromLegacy: true });
+  if (!currentPromotionProject || !currentPromotionProject.targetUrl) {
+    alert('请先在“推广网站设置”里保存并选择当前推广网站。一个浏览器一次只推广一个网站。');
+    chrome.tabs.create({ url: chrome.runtime.getURL('link-assistant-settings.html') });
+    return;
+  }
+  currentPromotionWebsiteUrl = currentPromotionProject.targetUrl;
   initialPoints = parseInt(pointsBalance.textContent || '0', 10);
   batchId = generateUUID();
   totalCount = parsedUrls.length;
@@ -1200,7 +1602,7 @@ async function startBatch() {
   setStatus('running');
   updateUI();
   updateStatsUI();
-  persistBatchRuntimeState();
+  persistBatchRuntimeState({ immediate: true });
 
   // Text cleanup: previous comment was mojibake.
   openNextTabSync();
@@ -1265,6 +1667,7 @@ async function stopBatch() {
   const tabIds = activeEntries.map(([tabId]) => tabId);
   activeTabs.clear();
   activeTabsByIndex.clear();
+  batchPerformanceTimings.clear();
   tabsPendingConfirm.clear();
   tabsWaitingClose.clear();
   for (const tabId of tabIds) {
@@ -1279,7 +1682,7 @@ async function stopBatch() {
   // Text cleanup: previous comment was mojibake.
   updateStatsUI();
   updateUI();
-  persistBatchRuntimeState();
+  persistBatchRuntimeState({ immediate: true });
 
   // Text cleanup: previous comment was mojibake.
   console.log(`[batch] Manually stopped. Kept ${localResults.length} result(s), success ${successCount}, fail ${failCount}, skipped ${terminatedCount} pending item(s).`);
@@ -1297,6 +1700,10 @@ async function resumeBatch() {
   // Text cleanup: previous comment was mojibake.
   isTerminated = false;
   isOpeningTab = false;
+  currentPromotionProject = await loadCurrentPromotionProject({ createFromLegacy: false });
+  if (currentPromotionProject && currentPromotionProject.targetUrl) {
+    currentPromotionWebsiteUrl = currentPromotionProject.targetUrl;
+  }
 
   // Text cleanup: previous comment was mojibake.
   const processedCount = getProcessedCount();
@@ -1316,7 +1723,7 @@ async function resumeBatch() {
 
   setStatus('running');
   updateUI();
-  persistBatchRuntimeState();
+  persistBatchRuntimeState({ immediate: true });
 
   // Text cleanup: previous comment was mojibake.
   console.log('[batch] message');
@@ -1360,6 +1767,11 @@ async function openNextTab() {
   const item = parsedUrls[urlIndex];
   const { url, sourceDomain } = item;
   console.log('[openNextTab] opening tab', { urlIndex, url });
+  markBatchPerformanceStage('open_prepare', {
+    urlIndex,
+    url,
+    queueRemaining: Math.max(0, totalCount - currentIndex - 1)
+  });
   logSubmitFlow('batch.open_prepare', {
     urlIndex,
     url,
@@ -1368,7 +1780,13 @@ async function openNextTab() {
   });
   currentIndex++;
 
+  markBatchPerformanceStage('duplicate_check_start', { urlIndex });
   const duplicateSubmission = await findExistingPromotionSubmissionForUrl(url);
+  markBatchPerformanceStage('duplicate_check_done', {
+    urlIndex,
+    shouldSkip: !!duplicateSubmission.shouldSkip,
+    reason: duplicateSubmission.reason || ''
+  });
   if (duplicateSubmission.shouldSkip) {
     console.info('[batch] skip duplicate promotion submission', {
       urlIndex,
@@ -1385,11 +1803,11 @@ async function openNextTab() {
     });
     handleTabResult(
       urlIndex,
-      'skipped',
+      duplicateSubmission.result || 'skipped',
       duplicateSubmission.record && duplicateSubmission.record.aiContent,
-      'duplicate_promotion_submission',
+      duplicateSubmission.reason || 'duplicate_promotion_submission',
       0,
-      { suppressArchive: true }
+      { suppressArchive: duplicateSubmission.suppressArchive !== false }
     );
     if (status === 'running' && currentIndex < totalCount) {
       setTimeout(openNextTabSync, 0);
@@ -1400,6 +1818,11 @@ async function openNextTab() {
   }
 
   const illegalCheck = item.illegalCheck || evaluateIllegalSiteForBatchItem(url, sourceDomain);
+  markBatchPerformanceStage('illegal_check_done', {
+    urlIndex,
+    blocked: !!illegalCheck.blocked,
+    reason: illegalCheck.reason || ''
+  });
   if (illegalCheck.blocked) {
     console.warn('[batch] message', { urlIndex, url, illegalCheck });
     item.illegalCheck = illegalCheck;
@@ -1421,6 +1844,10 @@ async function openNextTab() {
         createdAt: Date.now()
       }
     }, () => {
+      markBatchPerformanceStage('pending_task_saved', {
+        urlIndex,
+        storageError: chrome.runtime.lastError ? chrome.runtime.lastError.message : ''
+      });
       logSubmitFlow('batch.pending_task_saved', {
         urlIndex,
         url,
@@ -1428,6 +1855,7 @@ async function openNextTab() {
       });
     });
 
+    markBatchPerformanceStage('tab_create_request', { urlIndex });
     chrome.tabs.create({ url, active: true }, (tab) => {
       const createError = chrome.runtime.lastError ? chrome.runtime.lastError.message : '';
       if (createError || !tab || !tab.id) {
@@ -1444,6 +1872,10 @@ async function openNextTab() {
         }
         return;
       }
+      markBatchPerformanceStage('tab_create_done', {
+        urlIndex,
+        tabId: tab.id
+      });
       logSubmitFlow('batch.tab_create_done', {
         urlIndex,
         url,
@@ -1476,6 +1908,12 @@ async function openNextTab() {
           });
 
           console.log('[batch] message', { tabId, urlIndex, activeTabCount, status });
+          markBatchPerformanceStage('tab_removed', {
+            urlIndex,
+            tabId,
+            hadResult: localResults.some((r) => r.originalIndex === urlIndex),
+            activeTabCount
+          });
 
           // Text cleanup: previous comment was mojibake.
           if (!localResults.some((r) => r.originalIndex === urlIndex)) {
@@ -1508,8 +1946,14 @@ async function openNextTab() {
           console.log('[batch] message', { tabId, status, isTerminated });
           return;
         }
+        if (retries === 0) {
+          markBatchPerformanceStage('content_ping_start', { urlIndex, tabId });
+        } else if (retries === 1 || retries % 5 === 0) {
+          markBatchPerformanceStage('content_ping_retry', { urlIndex, tabId, retries });
+        }
         if (retries > 20) {
           console.warn('[batch] content.js ready timeout, giving up:', tabId);
+          markBatchPerformanceStage('content_ping_timeout', { urlIndex, tabId, retries });
           if (!localResults.some((r) => r.originalIndex === urlIndex)) {
             handleTabResult(urlIndex, 'fail', null, 'content.js ready timeout; page may be unavailable or extension injection is blocked');
           }
@@ -1519,14 +1963,27 @@ async function openNextTab() {
           return;
         }
         chrome.tabs.sendMessage(tabId, { type: 'PING' }).then(() => {
+          markBatchPerformanceStage('content_ping_ready', { urlIndex, tabId, retries });
           // Text cleanup: previous comment was mojibake.
           console.log('[batch] message', tab.id, { batchId, urlIndex, url, time: new Date().toISOString() });
+          markBatchPerformanceStage('message_send_start', { urlIndex, tabId });
           chrome.tabs.sendMessage(tab.id, {
             type: 'BATCH_HANDLE',
             batchId,
             urlIndex,
-            url
+            url,
+            promotionProject: currentPromotionProject,
+            promotionProjectId: currentPromotionProject && currentPromotionProject.id,
+            targetUrl: currentPromotionProject && currentPromotionProject.targetUrl,
+            targetDomain: currentPromotionProject && currentPromotionProject.targetDomain,
+            semrushMeta: item.semrushMeta || null,
+            discoveryTargetUrl: item.semrushMeta && item.semrushMeta.targetUrl ? item.semrushMeta.targetUrl : ''
           }).then((response) => {
+            markBatchPerformanceStage(response && response.ok ? 'message_accepted' : 'message_rejected', {
+              urlIndex,
+              tabId: tab.id,
+              responseOk: !!(response && response.ok)
+            });
             console.log('[batch] message', response, 'tabId:', tab.id, 'tabsPendingConfirm:', [...tabsPendingConfirm.keys()], 'time:', new Date().toISOString());
             if (response && response.ok) {
               if (localResults.some((r) => r.originalIndex === urlIndex) || !activeTabs.has(tab.id)) {
@@ -1545,6 +2002,11 @@ async function openNextTab() {
               console.warn('[batch] message', response);
             }
           }).catch((err) => {
+            markBatchPerformanceStage('message_send_failed', {
+              urlIndex,
+              tabId: tab.id,
+              message: err && err.message ? err.message : String(err)
+            });
             console.warn('[batch] message', err.message || err, 'tabId:', tab.id);
             // Text cleanup: previous comment was mojibake.
             if (!localResults.some((r) => r.originalIndex === urlIndex)) {
@@ -1594,7 +2056,12 @@ function handleTabResult(urlIndex, result, aiContent, errorMessage, forcedElapse
     originalIndex: urlIndex,
     url: item.url,
     sourceDomain: item.sourceDomain || '',
+    promotionProjectId: currentPromotionProject && currentPromotionProject.id ? currentPromotionProject.id : null,
+    targetUrl: currentPromotionProject && currentPromotionProject.targetUrl ? currentPromotionProject.targetUrl : currentPromotionWebsiteUrl || '',
+    targetDomain: currentPromotionProject && currentPromotionProject.targetDomain ? currentPromotionProject.targetDomain : '',
     promotionWebsiteUrl: currentPromotionWebsiteUrl || '',
+    discoveryTargetUrl: item.semrushMeta && item.semrushMeta.targetUrl ? item.semrushMeta.targetUrl : '',
+    semrushMeta: item.semrushMeta || null,
     result: result,
     aiContent: aiContent || null,
     errorMessage: errorMessage || null,
@@ -1602,17 +2069,33 @@ function handleTabResult(urlIndex, result, aiContent, errorMessage, forcedElapse
     matchedHref: options.matchedHref || '',
     timestamp: Date.now(),
     elapsed,
-    originalRow: item.originalRow || null
+    originalRow: item.originalRow || null,
+    semrushHeaders: item.semrushHeaders || null,
+    semrushRow: item.semrushRow || item.originalRow || null
   };
 
   localResults.push(resultEntry);
+  markBatchPerformanceStage('result_recorded', {
+    urlIndex,
+    result,
+    elapsedSeconds: elapsed,
+    aiContentLength: aiContent ? aiContent.length : 0,
+    hasErrorMessage: !!errorMessage
+  });
+  logBatchPerformanceSummary(urlIndex, {
+    result,
+    elapsedSeconds: elapsed,
+    sourceDomain: resultEntry.sourceDomain || '',
+    targetDomain: resultEntry.targetDomain || '',
+    errorMessage: errorMessage || ''
+  });
 
   reportBlogRunStatsIfNeeded(item, result);
 
   if (result === 'success' || result === 'success_pending_moderation') {
     successCount++;
     highlightPreviewRow(urlIndex, 'success');
-  } else if (result === 'skipped') {
+  } else if (result === 'skipped' || result === 'source_hit') {
     skippedCount++;
     skippedIndices.add(urlIndex);
     highlightPreviewRow(urlIndex, 'skipped');
@@ -1738,6 +2221,13 @@ function parseIntegerForStats(value) {
 // Text cleanup: previous comment was mojibake.
 function handleTabConfirmed(urlIndex, result, aiContent, errorMessage, evidence = {}) {
   console.log('[batch] handleTabConfirmed >>>', { urlIndex, result, aiContentLen: aiContent ? aiContent.length : 0, errorMessage, tabsPendingConfirmBefore: [...tabsPendingConfirm.entries()] });
+  markBatchPerformanceStage('confirm_received', {
+    urlIndex,
+    result,
+    aiContentLength: aiContent ? aiContent.length : 0,
+    evidenceResult: evidence.classifiedResult || evidence.result || '',
+    evidenceReason: evidence.reason || ''
+  });
   logSubmitFlow('confirmed', {
     urlIndex,
     result,
@@ -1827,6 +2317,8 @@ function saveLocalResults() {
 }
 
 function buildBatchRuntimeSnapshot() {
+  const promotionWebsiteKey = normalizePromotionWebsiteKey(currentPromotionWebsiteUrl || '');
+  const recentLocalResults = localResults.slice(-100);
   return {
     batchId,
     status,
@@ -1834,8 +2326,11 @@ function buildBatchRuntimeSnapshot() {
     batchStartedAt,
     currentIndex,
     parsedUrls,
-    localResults,
+    localResults: recentLocalResults,
+    localResultCount: localResults.length,
     currentPromotionWebsiteUrl,
+    currentPromotionWebsiteKey: promotionWebsiteKey,
+    currentPromotionProjectId: currentPromotionProject && currentPromotionProject.id ? currentPromotionProject.id : null,
     successCount,
     failCount,
     skippedCount,
@@ -1847,16 +2342,68 @@ function buildBatchRuntimeSnapshot() {
   };
 }
 
-function persistBatchRuntimeState() {
+function persistBatchRuntimeState(options = {}) {
   const snapshot = buildBatchRuntimeSnapshot();
-  chrome.storage.local.set({ [BATCH_RUNTIME_STATE_KEY]: snapshot }, () => {
-    console.log('[batch][runtime] saved', {
-      batchId: snapshot.batchId,
-      status: snapshot.status,
-      currentIndex: snapshot.currentIndex,
-      resultCount: snapshot.localResults.length
+  pendingBatchRuntimeSnapshot = snapshot;
+  if (options.immediate) {
+    cancelBatchRuntimePersistTimer();
+    writeBatchRuntimeSnapshot(snapshot);
+    return;
+  }
+  if (batchRuntimePersistTimer) return;
+  batchRuntimePersistTimer = setTimeout(() => {
+    batchRuntimePersistTimer = null;
+    const nextSnapshot = pendingBatchRuntimeSnapshot || snapshot;
+    pendingBatchRuntimeSnapshot = null;
+    writeBatchRuntimeSnapshot(nextSnapshot);
+  }, BATCH_RUNTIME_PERSIST_DELAY_MS);
+}
+
+function writeBatchRuntimeSnapshot(snapshot) {
+  const promotionKey = snapshot.currentPromotionWebsiteKey || normalizePromotionWebsiteKey(snapshot.currentPromotionWebsiteUrl || '');
+  chrome.storage.local.get([BATCH_RUNTIME_STATE_BY_PROMOTION_KEY], (data) => {
+    const snapshotsByPromotion = data && data[BATCH_RUNTIME_STATE_BY_PROMOTION_KEY] && typeof data[BATCH_RUNTIME_STATE_BY_PROMOTION_KEY] === 'object'
+      ? data[BATCH_RUNTIME_STATE_BY_PROMOTION_KEY]
+      : {};
+    if (promotionKey && promotionKey !== '__unconfigured__') {
+      snapshotsByPromotion[promotionKey] = snapshot;
+    }
+    chrome.storage.local.set({
+      [BATCH_RUNTIME_STATE_KEY]: snapshot,
+      [BATCH_RUNTIME_STATE_BY_PROMOTION_KEY]: snapshotsByPromotion
+    }, () => {
+      console.log('[batch][runtime] saved', {
+        batchId: snapshot.batchId,
+        status: snapshot.status,
+        promotionKey,
+        currentIndex: snapshot.currentIndex,
+        resultCount: snapshot.localResultCount || snapshot.localResults.length
+      });
     });
   });
+}
+
+function isFreshBatchRuntimeSnapshot(snapshot, now = Date.now(), maxAgeMs = 24 * 60 * 60 * 1000) {
+  if (!snapshot || typeof snapshot !== 'object') return false;
+  if (!snapshot.batchId || !Array.isArray(snapshot.parsedUrls)) return false;
+  const updatedAt = Number(snapshot.updatedAt || 0);
+  return !!updatedAt && now - updatedAt <= maxAgeMs;
+}
+
+function selectBatchRuntimeSnapshotForCurrentPromotion({ legacySnapshot, snapshotsByPromotion, currentPromotionWebsiteUrl }) {
+  const currentKey = normalizePromotionWebsiteKey(currentPromotionWebsiteUrl || '');
+  const map = snapshotsByPromotion && typeof snapshotsByPromotion === 'object' ? snapshotsByPromotion : {};
+  if (currentKey && currentKey !== '__unconfigured__' && isFreshBatchRuntimeSnapshot(map[currentKey])) {
+    return { snapshot: map[currentKey], reason: 'promotion_snapshot' };
+  }
+  if (isFreshBatchRuntimeSnapshot(legacySnapshot)) {
+    const legacyKey = normalizePromotionWebsiteKey(legacySnapshot.currentPromotionWebsiteUrl || '');
+    if (!currentKey || currentKey === '__unconfigured__' || legacyKey === currentKey) {
+      return { snapshot: legacySnapshot, reason: 'legacy_snapshot' };
+    }
+    return { snapshot: null, reason: 'promotion_mismatch' };
+  }
+  return { snapshot: null, reason: currentKey && currentKey !== '__unconfigured__' ? 'missing_promotion_snapshot' : 'missing_current_promotion' };
 }
 
 function renderParsedUrlPreviewFromState() {
@@ -1881,10 +2428,22 @@ function renderParsedUrlPreviewFromState() {
 }
 
 async function restoreBatchRuntimeState() {
-  const data = await new Promise((resolve) => chrome.storage.local.get([BATCH_RUNTIME_STATE_KEY], resolve));
-  const snapshot = data[BATCH_RUNTIME_STATE_KEY];
-  if (!snapshot || !snapshot.batchId || !Array.isArray(snapshot.parsedUrls)) return false;
-  if (Date.now() - Number(snapshot.updatedAt || 0) > 24 * 60 * 60 * 1000) return false;
+  await loadCurrentPromotionProject({ createFromLegacy: false }).catch(() => null);
+  const activePromotionWebsiteUrl = currentPromotionWebsiteUrl || '';
+  const data = await new Promise((resolve) => chrome.storage.local.get([BATCH_RUNTIME_STATE_KEY, BATCH_RUNTIME_STATE_BY_PROMOTION_KEY], resolve));
+  const selection = selectBatchRuntimeSnapshotForCurrentPromotion({
+    legacySnapshot: data[BATCH_RUNTIME_STATE_KEY],
+    snapshotsByPromotion: data[BATCH_RUNTIME_STATE_BY_PROMOTION_KEY],
+    currentPromotionWebsiteUrl: activePromotionWebsiteUrl
+  });
+  const snapshot = selection.snapshot;
+  if (!snapshot) {
+    console.info('[batch][runtime] skipped restore', {
+      reason: selection.reason,
+      activePromotionKey: normalizePromotionWebsiteKey(activePromotionWebsiteUrl || '')
+    });
+    return false;
+  }
 
   batchId = snapshot.batchId;
   status = snapshot.status === 'running' ? 'terminated' : (snapshot.status || 'terminated');
@@ -1903,6 +2462,7 @@ async function restoreBatchRuntimeState() {
   pendingCount = Math.max(0, totalCount - getProcessedCount());
   activeTabs.clear();
   activeTabsByIndex.clear();
+  batchPerformanceTimings.clear();
   tabsPendingConfirm.clear();
   tabsWaitingClose.clear();
   activeTabCount = 0;
@@ -1917,23 +2477,52 @@ async function restoreBatchRuntimeState() {
   console.log('[batch][runtime] restored', {
     batchId,
     status,
+    reason: selection.reason,
+    promotionKey: normalizePromotionWebsiteKey(currentPromotionWebsiteUrl || ''),
     totalCount,
-    resultCount: localResults.length
+    resultCount: localResults.length,
+    persistedResultCount: snapshot.localResultCount || localResults.length
   });
   return true;
 }
 
 async function saveArchiveRecord(resultEntry) {
   if (!resultEntry) return;
+  let backendSubmissionId = resultEntry.backendSubmissionId || null;
+  if (!backendSubmissionId) {
+    try {
+      const payload = buildLinkAssistantSubmissionPayload(resultEntry);
+      if (payload) {
+        const saved = await linkAssistantApiJson('/link-assistant/submissions', {
+          method: 'POST',
+          body: payload
+        });
+        backendSubmissionId = saved.submissionId || saved.id || null;
+      }
+    } catch (error) {
+      console.warn('[batch][link-assistant] submission sync failed:', {
+        sourceHost: resultEntry.sourceDomain || extractDomain(resultEntry.url || ''),
+        message: error && error.message ? error.message : String(error)
+      });
+    }
+  }
   const promotionWebsiteUrl = resultEntry.promotionWebsiteUrl || currentPromotionWebsiteUrl || '';
   const archiveEntry = {
     id: `${batchId || 'batch'}:${resultEntry.originalIndex}:${resultEntry.timestamp || Date.now()}`,
     batchId: batchId || '',
     originalIndex: resultEntry.originalIndex,
+    backendSubmissionId,
+    promotionProjectId: resultEntry.promotionProjectId || (currentPromotionProject && currentPromotionProject.id) || null,
+    targetUrl: resultEntry.targetUrl || promotionWebsiteUrl,
+    targetDomain: resultEntry.targetDomain || (currentPromotionProject && currentPromotionProject.targetDomain) || '',
     promotionWebsiteUrl,
     promotionWebsiteKey: normalizePromotionWebsiteKey(promotionWebsiteUrl),
     sourceUrl: resultEntry.url || '',
     sourceDomain: resultEntry.sourceDomain || extractDomain(resultEntry.url || ''),
+    discoveryTargetUrl: resultEntry.discoveryTargetUrl || '',
+    semrushMeta: resultEntry.semrushMeta || null,
+    semrushHeaders: resultEntry.semrushHeaders || null,
+    semrushRow: resultEntry.semrushRow || resultEntry.originalRow || null,
     result: resultEntry.result || 'fail',
     aiContent: resultEntry.aiContent || null,
     errorMessage: resultEntry.errorMessage || null,
@@ -1959,10 +2548,58 @@ async function saveArchiveRecord(resultEntry) {
       if (records.length > BACKLINK_ARCHIVE_LIMIT) {
         records.length = BACKLINK_ARCHIVE_LIMIT;
       }
-      chrome.storage.local.set({ [BACKLINK_ARCHIVE_KEY]: records }, resolve);
+      writeLocalArchiveRecords(records).then(resolve);
     });
   });
   await renderArchive();
+}
+
+function writeLocalArchiveRecords(records) {
+  const safeRecords = mergeArchiveRecords(records).slice(0, BACKLINK_ARCHIVE_LIMIT);
+  return new Promise((resolve) => {
+    const attemptWrite = (nextRecords, attempt) => {
+      chrome.storage.local.set({ [BACKLINK_ARCHIVE_KEY]: nextRecords }, () => {
+        const error = chrome.runtime && chrome.runtime.lastError;
+        if (!error) {
+          resolve({ ok: true, records: nextRecords, trimmed: attempt > 0 });
+          return;
+        }
+        if (nextRecords.length > 500) {
+          const nextLimit = Math.max(500, Math.floor(nextRecords.length * 0.7));
+          console.warn('[batch][archive] local cache write quota fallback:', {
+            message: error.message || String(error),
+            from: nextRecords.length,
+            to: nextLimit
+          });
+          attemptWrite(nextRecords.slice(0, nextLimit), attempt + 1);
+          return;
+        }
+        console.warn('[batch][archive] local cache write failed:', {
+          message: error.message || String(error),
+          recordCount: nextRecords.length
+        });
+        resolve({ ok: false, records: nextRecords, error });
+      });
+    };
+    attemptWrite(safeRecords, 0);
+  });
+}
+
+function buildLinkAssistantSubmissionPayload(resultEntry) {
+  const logic = getLinkAssistantRuntimeLogic();
+  if (!logic || typeof logic.buildSubmissionPayload !== 'function') return null;
+  const project = currentPromotionProject || {
+    id: resultEntry.promotionProjectId,
+    targetUrl: resultEntry.targetUrl || resultEntry.promotionWebsiteUrl,
+    targetDomain: resultEntry.targetDomain || ''
+  };
+  const payload = logic.buildSubmissionPayload({
+    project,
+    resultEntry,
+    semrushMeta: resultEntry.semrushMeta || null
+  });
+  if (!payload || !payload.targetUrl || !payload.sourceUrl) return null;
+  return payload;
 }
 
 function normalizePromotionWebsiteKey(url) {
@@ -2087,59 +2724,74 @@ async function renderArchive() {
     preferLatest: !archiveWebsiteSelectionTouched
   });
 
-  const filtered = filterArchiveRecords(records, {
+  const filteredRaw = filterArchiveRecords(records, {
     websiteKey: effectiveWebsite,
     result: selectedResult,
     backlinkStatus: selectedBacklinkStatus,
     keyword
   });
+  const filtered = mergeArchiveRecords(filteredRaw);
+  const pageSize = getArchivePageSizeLocal();
+  const sortedRecords = sortArchiveRecordsForDisplay(filtered);
+  const totalPages = sortedRecords.length > 0 ? Math.max(1, Math.ceil(sortedRecords.length / pageSize)) : 0;
+  archiveCurrentPage = totalPages > 0 ? Math.min(Math.max(1, archiveCurrentPage), totalPages) : 1;
+  const startIndex = totalPages > 0 ? (archiveCurrentPage - 1) * pageSize : 0;
+  const pageRecords = totalPages > 0 ? sortedRecords.slice(startIndex, startIndex + pageSize) : [];
 
+  console.info('[batch][archive] render deduped records', {
+    totalRecords: records.length,
+    filteredRawCount: filteredRaw.length,
+    filteredDedupedCount: filtered.length,
+    pageRows: pageRecords.length
+  });
   renderArchiveSummary(filtered, records.length);
   if (activeResultsView === 'archive') {
     renderSummaryCounts(filtered);
   }
   updateResultsVisibility();
-  if (archiveCountLabel) {
-    archiveCountLabel.textContent = `显示 ${filtered.length} / ${records.length} 条`;
-  }
   updateArchiveActionButtons(records, effectiveWebsite);
+  updateArchivePaginationUI({
+    filteredCount: filtered.length,
+    totalPages,
+    currentPage: archiveCurrentPage,
+    pageSize
+  });
 
   archiveTableBody.innerHTML = '';
   if (archiveEmpty) {
-    archiveEmpty.style.display = filtered.length === 0 ? 'block' : 'none';
+    archiveEmpty.style.display = pageRecords.length === 0 ? 'block' : 'none';
   }
   if (archiveTableWrap) {
-    archiveTableWrap.style.display = filtered.length === 0 ? 'none' : 'block';
+    archiveTableWrap.style.display = pageRecords.length === 0 ? 'none' : 'block';
   }
 
-  const displayRecords = sortArchiveRecordsForDisplay(filtered);
-  for (const record of displayRecords.slice(0, 500)) {
-    const tr = document.createElement('tr');
-    tr.className = `url-${record.result}`;
-    const csvIndex = Number.isFinite(Number(record.originalIndex)) ? Number(record.originalIndex) + 1 : '--';
+	  for (const [pageRecordIndex, record] of pageRecords.entries()) {
+	    const tr = document.createElement('tr');
+	    tr.className = `url-${record.result}`;
+	    const csvIndex = Number.isFinite(Number(record.originalIndex)) ? Number(record.originalIndex) + 1 : '--';
+	    const displayIndex = startIndex + pageRecordIndex + 1;
     const websiteLabel = record.promotionWebsiteUrl || 'Unconfigured promotion website';
     const shortWebsite = websiteLabel.length > 34 ? websiteLabel.substring(0, 31) + '...' : websiteLabel;
     const sourceUrl = record.sourceUrl || '';
     const shortSource = sourceUrl.length > 46 ? sourceUrl.substring(0, 43) + '...' : sourceUrl;
     const aiText = record.aiContent || '';
     const shortBatch = record.batchId ? String(record.batchId).slice(0, 8) : '--';
-    const timeStr = record.timestamp ? formatTime(new Date(record.timestamp)) : '--';
-    const display = getResultDisplayLocal(record);
-    const latestBacklinkDisplay = getLatestBacklinkStatusDisplayLocal(record);
-    const latestBacklinkTime = record.latestBacklinkCheckedAt ? formatTime(new Date(record.latestBacklinkCheckedAt)) : '--';
+	    const display = getResultDisplayLocal(record);
+	    const latestBacklinkDisplay = getLatestBacklinkStatusDisplayLocal(record);
+	    const archiveDisplayTimeSource = record.latestBacklinkCheckedAt || record.timestamp || '';
+	    const latestBacklinkTime = archiveDisplayTimeSource ? formatTime(new Date(archiveDisplayTimeSource)) : '--';
 
     tr.innerHTML = `
-      <td style="color:#9ca3af;width:40px;text-align:center;">${escapeHtml(csvIndex)}</td>
+	      <td style="color:#9ca3af;width:40px;text-align:center;" title="CSV 原始序号：${escapeHtml(csvIndex)}">${escapeHtml(displayIndex)}</td>
       <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(websiteLabel)}">${escapeHtml(shortWebsite)}</td>
       <td style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(sourceUrl)}">${escapeHtml(shortSource)}</td>
       <td><span class="result-badge ${display.cssClass}" title="${escapeHtml(display.categoryText)}">${escapeHtml(display.text)}</span></td>
       <td><span class="result-badge ${latestBacklinkDisplay.cssClass}" title="${escapeHtml(latestBacklinkDisplay.title || record.latestBacklinkReason || '')}">${escapeHtml(latestBacklinkDisplay.text)}</span></td>
-      <td style="font-size:11px;color:#9ca3af;white-space:nowrap;" title="${escapeHtml(record.latestBacklinkCheckedAt || '')}">${escapeHtml(latestBacklinkTime)}</td>
+	      <td style="font-size:11px;color:#9ca3af;white-space:nowrap;" title="${escapeHtml(record.latestBacklinkCheckedAt || record.timestamp || '')}">${escapeHtml(latestBacklinkTime)}</td>
       <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(record.errorMessage || '')}">${escapeHtml(record.errorMessage || '--')}</td>
-      <td class="ai-content-cell" title="${escapeHtml(aiText)}">${escapeHtml(aiText || '--')}</td>
-      <td style="font-size:11px;color:#9ca3af;white-space:nowrap;" title="${escapeHtml(record.batchId || '')}">${escapeHtml(shortBatch)}</td>
-      <td style="font-size:11px;color:#9ca3af;white-space:nowrap;">${timeStr}</td>
-    `;
+	      <td class="ai-content-cell" title="${escapeHtml(aiText)}">${escapeHtml(aiText || '--')}</td>
+	      <td style="font-size:11px;color:#9ca3af;white-space:nowrap;" title="${escapeHtml(record.batchId || '')}">${escapeHtml(shortBatch)}</td>
+	    `;
     attachManualReviewTargetCell(tr.children[2], record, 'archive', tr);
     attachAiContentContextMenu(tr.children[7], record, tr);
     archiveTableBody.appendChild(tr);
@@ -2163,8 +2815,47 @@ function getCurrentArchiveFilters() {
   };
 }
 
+function getArchivePageSizeLocal() {
+  const value = Number(archivePageSizeSelect ? archivePageSizeSelect.value : archivePageSize);
+  return Number.isFinite(value) && value > 0 ? value : 50;
+}
+
+function buildArchivePageOptions(totalPages, currentPage) {
+  if (!archivePageJumpSelect) return;
+  if (totalPages <= 0) {
+    archivePageJumpSelect.innerHTML = '<option value="1">第 1 页</option>';
+    archivePageJumpSelect.value = '1';
+    archivePageJumpSelect.disabled = true;
+    return;
+  }
+  const options = [];
+  for (let i = 1; i <= totalPages; i++) {
+    options.push(`<option value="${i}">第 ${i} 页</option>`);
+  }
+  archivePageJumpSelect.innerHTML = options.join('');
+  archivePageJumpSelect.disabled = false;
+  archivePageJumpSelect.value = String(Math.min(Math.max(1, currentPage), totalPages));
+}
+
+function updateArchivePaginationUI({ filteredCount, totalPages, currentPage, pageSize }) {
+  if (archivePageInfo) {
+    archivePageInfo.textContent = totalPages > 0 ? `共 ${totalPages} 页` : '共 0 页';
+  }
+  if (archiveCountLabel) {
+    const start = filteredCount > 0 ? ((currentPage - 1) * pageSize) + 1 : 0;
+    const end = filteredCount > 0 ? Math.min(filteredCount, currentPage * pageSize) : 0;
+    archiveCountLabel.textContent = filteredCount > 0
+      ? `显示 ${start}-${end} / ${filteredCount} 条`
+      : '显示 0 / 0 条';
+  }
+  if (archivePageSizeSelect) {
+    archivePageSizeSelect.value = String(pageSize);
+  }
+  buildArchivePageOptions(totalPages, currentPage);
+}
+
 function getFilteredArchiveRecords(records) {
-  return filterArchiveRecords(records, getCurrentArchiveFilters());
+  return mergeArchiveRecords(filterArchiveRecords(records, getCurrentArchiveFilters()));
 }
 
 function updateArchiveActionButtons(records, selectedWebsiteKey) {
@@ -2259,6 +2950,7 @@ async function onAllCompleted() {
   const tabIds = Array.from(activeTabs.keys());
   activeTabs.clear();
   activeTabsByIndex.clear();
+  batchPerformanceTimings.clear();
   activeTabCount = 0;
   for (const tabId of tabIds) {
     try {
@@ -2371,6 +3063,12 @@ async function checkTimeouts() {
       chrome.storage.local.remove('batchSubmitCtx', () => {});
     }
     logSubmitFlow(stage || 'timeout', {
+      urlIndex,
+      tabId,
+      isAccepted,
+      timeoutSeconds: effectiveTimeoutSeconds
+    });
+    markBatchPerformanceStage(stage || 'timeout', {
       urlIndex,
       tabId,
       isAccepted,
@@ -2535,7 +3233,7 @@ function getResultSummary(records) {
   return {
     total: rows.length,
     success: rows.filter((r) => r.result === 'success' || r.result === 'success_pending_moderation').length,
-    skipped: rows.filter((r) => r.result === 'skipped').length,
+    skipped: rows.filter((r) => r.result === 'skipped' || r.result === 'source_hit').length,
     manual: rows.filter((r) => r.result === 'manual_required' || r.result === 'submitted_unconfirmed').length,
     manualRequired: rows.filter((r) => r.result === 'manual_required').length,
     unconfirmedAcceptance: 0,
@@ -2544,7 +3242,7 @@ function getResultSummary(records) {
     unconfirmedSubmitted: rows.filter((r) => r.result === 'submitted_unconfirmed').length,
     noCommentBox: rows.filter((r) => r.result === 'no_comment_box').length,
     fail: rows.filter((r) => r.result === 'fail' || r.result === 'blocked_illegal').length,
-    successRate: rows.length > 0 ? Math.round((rows.filter((r) => r.result === 'success' || r.result === 'success_pending_moderation' || r.result === 'skipped').length / rows.length) * 100) : 0
+    successRate: rows.length > 0 ? Math.round((rows.filter((r) => r.result === 'success' || r.result === 'success_pending_moderation' || r.result === 'skipped' || r.result === 'source_hit').length / rows.length) * 100) : 0
   };
 }
 
@@ -2854,9 +3552,7 @@ function setArchiveBacklinkCheckRunning(running) {
 }
 
 async function saveArchiveRecords(records) {
-  await new Promise((resolve) => {
-    chrome.storage.local.set({ [BACKLINK_ARCHIVE_KEY]: mergeArchiveRecords(records) }, resolve);
-  });
+  await writeLocalArchiveRecords(records);
 }
 
 function getArchiveBacklinkConcurrencyLocal() {
@@ -2882,7 +3578,10 @@ function getArchiveBacklinkProgressText(records) {
   if (!logic || typeof logic.buildBacklinkCheckProgress !== 'function') {
     return '';
   }
-  const progress = logic.buildBacklinkCheckProgress(records);
+  const progressRecords = typeof logic.selectBacklinkProgressRecords === 'function'
+    ? logic.selectBacklinkProgressRecords(records, archiveBacklinkCheckState.targetIds)
+    : records;
+  const progress = logic.buildBacklinkCheckProgress(progressRecords);
   if (typeof logic.buildBacklinkCheckProgressText === 'function') {
     return logic.buildBacklinkCheckProgressText(progress, {
       active: archiveBacklinkCheckState.active,
@@ -2910,6 +3609,7 @@ function resetArchiveBacklinkCheckState() {
     queue: [],
     running: new Map(),
     records: [],
+    targetIds: [],
     total: 0,
     startedAt: 0
   };
@@ -2974,6 +3674,7 @@ async function checkArchiveBacklinkStatus(options = {}) {
     queue: checkTargets.slice(),
     running: new Map(),
     records: setArchiveRecordsChecking(records, checkTargets.map((record) => record.id)),
+    targetIds: checkTargets.map((record) => String(record.id)),
     total: checkTargets.length,
     startedAt: Date.now()
   };
@@ -3037,6 +3738,8 @@ async function runArchiveBacklinkRecordCheck(record) {
       throw new Error(payload.message || payload.error || `HTTP ${response.status}`);
     }
 
+    await syncBacklinkCheckResultToLinkAssistant(record, (payload.results || [])[0]);
+
     const logic = getBatchResultsLogic();
     archiveBacklinkCheckState.records = logic.mergeBacklinkCheckResults(
       archiveBacklinkCheckState.records,
@@ -3061,6 +3764,7 @@ async function runArchiveBacklinkRecordCheck(record) {
       latestBacklinkReason: error && error.message ? error.message : 'unknown_error'
     };
     const logic = getBatchResultsLogic();
+    await syncBacklinkCheckResultToLinkAssistant(record, fallback).catch(() => {});
     archiveBacklinkCheckState.records = logic.mergeBacklinkCheckResults(archiveBacklinkCheckState.records, [fallback]);
     await saveArchiveRecords(archiveBacklinkCheckState.records);
     await renderArchive();
@@ -3072,6 +3776,110 @@ async function runArchiveBacklinkRecordCheck(record) {
   } finally {
     archiveBacklinkCheckState.running.delete(String(record.id));
     pumpArchiveBacklinkQueue();
+  }
+}
+
+async function ensureLinkAssistantSubmissionIdForRecord(record) {
+  const existingId = record && (record.backendSubmissionId || record.submissionId || record.submission_id);
+  if (existingId) {
+    logSubmitFlow('archive-sync-existing-submission-id', {
+      recordId: record && record.id ? String(record.id) : '',
+      submissionId: String(existingId),
+      sourceUrl: record && (record.sourceUrl || record.url || ''),
+      targetUrl: record && (record.targetUrl || record.target_url || record.promotionWebsiteUrl || ''),
+      promotionProjectId: record && (record.promotionProjectId || record.promotion_project_id) || null
+    });
+    return existingId;
+  }
+  const payload = buildLinkAssistantSubmissionPayload({
+    ...(record || {}),
+    url: record && (record.sourceUrl || record.url)
+  });
+  logSubmitFlow('archive-sync-create-submission-attempt', {
+    recordId: record && record.id ? String(record.id) : '',
+    hasPayload: !!payload,
+    targetUrl: payload && payload.targetUrl || '',
+    sourceUrl: payload && payload.sourceUrl || '',
+    promotionProjectId: payload && payload.promotionProjectId || null
+  });
+  if (!payload) return null;
+  try {
+    const saved = await linkAssistantApiJson('/link-assistant/submissions', {
+      method: 'POST',
+      body: payload
+    });
+    const submissionId = saved.submissionId || saved.id || null;
+    if (record && submissionId) record.backendSubmissionId = submissionId;
+    logSubmitFlow('archive-sync-create-submission-success', {
+      recordId: record && record.id ? String(record.id) : '',
+      submissionId: submissionId ? String(submissionId) : '',
+      targetUrl: payload.targetUrl || '',
+      sourceUrl: payload.sourceUrl || ''
+    });
+    return submissionId;
+  } catch (error) {
+    logSubmitFlow('archive-sync-create-submission-failed', {
+      recordId: record && record.id ? String(record.id) : '',
+      status: error && error.status != null ? error.status : '',
+      message: error && error.message ? error.message : String(error),
+      targetUrl: payload.targetUrl || '',
+      sourceUrl: payload.sourceUrl || ''
+    });
+    throw error;
+  }
+}
+
+async function syncBacklinkCheckResultToLinkAssistant(record, result) {
+  const logic = getLinkAssistantRuntimeLogic();
+  if (!logic || typeof logic.buildBacklinkCheckResultPayload !== 'function') return false;
+  logSubmitFlow('archive-sync-result-start', {
+    recordId: record && record.id ? String(record.id) : '',
+    existingSubmissionId: record && (record.backendSubmissionId || record.submissionId || record.submission_id) || '',
+    sourceUrl: record && (record.sourceUrl || record.url || ''),
+    targetUrl: record && (record.targetUrl || record.target_url || record.promotionWebsiteUrl || ''),
+    promotionProjectId: record && (record.promotionProjectId || record.promotion_project_id) || null,
+    pageAscore: record ? (record.pageAscore ?? record.page_ascore ?? (record.semrushMeta && (record.semrushMeta.pageAscore ?? record.semrushMeta.page_ascore)) ?? null) : null,
+    resultStatus: result && result.latestBacklinkStatus || ''
+  });
+  let payload = logic.buildBacklinkCheckResultPayload({ record, result });
+  if (!payload || !payload.submissionId) {
+    const submissionId = await ensureLinkAssistantSubmissionIdForRecord(record);
+    if (!submissionId) return false;
+    payload = logic.buildBacklinkCheckResultPayload({ record: { ...(record || {}), backendSubmissionId: submissionId }, result });
+  }
+  if (!payload || !payload.submissionId) return false;
+  try {
+    await linkAssistantApiJson(`/link-assistant/submissions/${encodeURIComponent(payload.submissionId)}/backlink-check-result`, {
+      method: 'POST',
+      body: payload
+    });
+    logSubmitFlow('archive-sync-result-success', {
+      recordId: record && record.id ? String(record.id) : '',
+      submissionId: String(payload.submissionId),
+      status: payload.latestBacklinkStatus || '',
+      sourceUrl: payload.sourceUrl || '',
+      targetUrl: payload.targetUrl || '',
+      pageAscore: payload.pageAscore ?? null
+    });
+    console.info('[batch][link-assistant] backlink check synced', {
+      submissionId: payload.submissionId,
+      status: payload.latestBacklinkStatus || ''
+    });
+    return true;
+  } catch (error) {
+    logSubmitFlow('archive-sync-result-failed', {
+      recordId: record && record.id ? String(record.id) : '',
+      submissionId: payload.submissionId ? String(payload.submissionId) : '',
+      status: payload.latestBacklinkStatus || '',
+      httpStatus: error && error.status != null ? error.status : '',
+      message: error && error.message ? error.message : String(error)
+    });
+    console.warn('[batch][link-assistant] backlink check sync failed:', {
+      submissionId: payload.submissionId,
+      status: payload.latestBacklinkStatus || '',
+      message: error && error.message ? error.message : String(error)
+    });
+    return false;
   }
 }
 
@@ -3154,17 +3962,26 @@ async function clearBatch() {
     });
   }
 
+  const clearedPromotionKey = normalizePromotionWebsiteKey(currentPromotionWebsiteUrl || '');
   batchId = null;
   totalCount = successCount = failCount = skippedCount = noCommentBoxCount = manualRequiredCount = blockedIllegalCount = pendingCount = 0;
   batchStartedAt = 0;
   currentIndex = 0;
+  currentResultsCurrentPage = 1;
   localResults = [];
   activeTabs.clear();
   activeTabsByIndex.clear();
+  batchPerformanceTimings.clear();
   tabsPendingConfirm.clear();
   tabsWaitingClose.clear();
   isTerminated = false;
   isOpeningTab = false;
+  cancelBatchRuntimePersistTimer();
+  if (renderStatsTimer) {
+    clearTimeout(renderStatsTimer);
+    renderStatsTimer = null;
+  }
+  renderStatsLastAt = 0;
   statsTableBody.innerHTML = '';
   statsTotal.textContent = '0';
   statsSuccess.textContent = '0';
@@ -3182,12 +3999,39 @@ async function clearBatch() {
   setStatus('idle');
   updateUI();
   renderArchive();
-  chrome.storage.local.remove(['batchLocalResults', BATCH_RUNTIME_STATE_KEY, BATCH_PENDING_TASK_KEY, 'batchCtx', 'batchSubmitCtx']);
+  const runtimeData = await new Promise((resolve) => chrome.storage.local.get([BATCH_RUNTIME_STATE_BY_PROMOTION_KEY], resolve));
+  const snapshotsByPromotion = runtimeData && runtimeData[BATCH_RUNTIME_STATE_BY_PROMOTION_KEY] && typeof runtimeData[BATCH_RUNTIME_STATE_BY_PROMOTION_KEY] === 'object'
+    ? runtimeData[BATCH_RUNTIME_STATE_BY_PROMOTION_KEY]
+    : {};
+  if (clearedPromotionKey && clearedPromotionKey !== '__unconfigured__') {
+    delete snapshotsByPromotion[clearedPromotionKey];
+  }
+  await new Promise((resolve) => {
+    chrome.storage.local.set({ [BATCH_RUNTIME_STATE_BY_PROMOTION_KEY]: snapshotsByPromotion }, resolve);
+  });
+  let removedStorageKeys = [];
+  if (logic && typeof logic.selectCurrentBatchStorageKeysForRemoval === 'function') {
+    const currentBatchStorageData = await new Promise((resolve) => {
+      chrome.storage.local.get(['batchLocalResults', BATCH_RUNTIME_STATE_KEY, BATCH_PENDING_TASK_KEY, 'batchCtx', 'batchSubmitCtx'], resolve);
+    });
+    removedStorageKeys = logic.selectCurrentBatchStorageKeysForRemoval({
+      batchId: currentBatchId,
+      promotionKey: clearedPromotionKey,
+      storageData: currentBatchStorageData
+    });
+    if (removedStorageKeys.length > 0) {
+      await new Promise((resolve) => {
+        chrome.storage.local.remove(removedStorageKeys, resolve);
+      });
+    }
+  }
   console.log('[batch][results] cleared current batch', {
     batchId: currentBatchId,
+    promotionKey: clearedPromotionKey,
     localResultCount: resultCount,
     removedBatchResultCount: runtimeCleanup ? runtimeCleanup.removedBatchResultCount : 0,
-    removedReportedCount: runtimeCleanup ? runtimeCleanup.removedReportedCount : 0
+    removedReportedCount: runtimeCleanup ? runtimeCleanup.removedReportedCount : 0,
+    removedStorageKeys
   });
 }
 
@@ -3335,6 +4179,7 @@ function buildDomainOptions() {
     if (domain) domainMap.set(domain, (domainMap.get(domain) || 0) + 1);
   }
   const select = filterDomain;
+  const selected = select.value || 'all';
   select.innerHTML = '<option value="all">全部域名</option>';
   for (const [domain, count] of [...domainMap.entries()].sort((a, b) => b[1] - a[1])) {
     const opt = document.createElement('option');
@@ -3342,6 +4187,7 @@ function buildDomainOptions() {
     opt.textContent = `${domain} (${count})`;
     select.appendChild(opt);
   }
+  select.value = domainMap.has(selected) ? selected : 'all';
 }
 
 function extractDomain(url) {
@@ -3366,9 +4212,40 @@ function filterTimeBucket(elapsedSecs) {
 
 function renderStats() {
   if (localResults.length === 0) {
+    if (renderStatsTimer) {
+      clearTimeout(renderStatsTimer);
+      renderStatsTimer = null;
+    }
+    renderStatsImpl();
+    return;
+  }
+  const now = Date.now();
+  const elapsed = now - renderStatsLastAt;
+  if (elapsed >= RENDER_STATS_THROTTLE_MS) {
+    renderStatsLastAt = now;
+    renderStatsImpl();
+    return;
+  }
+  if (renderStatsTimer) return;
+  renderStatsTimer = setTimeout(() => {
+    renderStatsTimer = null;
+    renderStatsLastAt = Date.now();
+    renderStatsImpl();
+  }, Math.max(0, RENDER_STATS_THROTTLE_MS - elapsed));
+}
+
+function renderStatsImpl() {
+  if (localResults.length === 0) {
     if (statsTableWrap) statsTableWrap.style.display = 'none';
     if (currentResultsEmpty) currentResultsEmpty.style.display = 'block';
     if (statsCountLabel) statsCountLabel.textContent = '显示 0 / 0 条';
+    if (statsTableBody) statsTableBody.innerHTML = '';
+    updateCurrentResultsPaginationUI({
+      filteredCount: 0,
+      totalPages: 0,
+      currentPage: 1,
+      pageSize: getCurrentResultsPageSizeLocal()
+    });
     if (activeResultsView === 'current') renderSummaryCounts([]);
     updateResultsVisibility();
     return;
@@ -3401,11 +4278,21 @@ function renderStats() {
       return true;
     });
 
-  statsCountLabel.textContent = `显示 ${filtered.length} / ${localResults.length} 条`;
+  const pageSize = getCurrentResultsPageSizeLocal();
+  const totalPages = filtered.length > 0 ? Math.max(1, Math.ceil(filtered.length / pageSize)) : 0;
+  currentResultsCurrentPage = totalPages > 0 ? Math.min(Math.max(1, currentResultsCurrentPage), totalPages) : 1;
+  const startIndex = totalPages > 0 ? (currentResultsCurrentPage - 1) * pageSize : 0;
+  const displayRecords = totalPages > 0 ? filtered.slice(startIndex, startIndex + pageSize) : [];
+  updateCurrentResultsPaginationUI({
+    filteredCount: filtered.length,
+    totalPages,
+    currentPage: currentResultsCurrentPage,
+    pageSize
+  });
 
   // Text cleanup: previous comment was mojibake.
   statsTableBody.innerHTML = '';
-  for (const r of filtered) {
+  for (const r of displayRecords) {
     const tr = document.createElement('tr');
     const display = getResultDisplayLocal(r);
     tr.className = 'url-' + display.cssClass;
@@ -3464,6 +4351,45 @@ function renderStats() {
 
   // Text cleanup: previous comment was mojibake.
   statsTableWrap.scrollTop = 0;
+}
+
+function getCurrentResultsPageSizeLocal() {
+  const value = Number(currentPageSizeSelect ? currentPageSizeSelect.value : currentResultsPageSize);
+  return Number.isFinite(value) && value > 0 ? value : 200;
+}
+
+function buildCurrentResultsPageOptions(totalPages, currentPage) {
+  if (!currentPageJumpSelect) return;
+  if (totalPages <= 0) {
+    currentPageJumpSelect.innerHTML = '<option value="1">第 1 页</option>';
+    currentPageJumpSelect.value = '1';
+    currentPageJumpSelect.disabled = true;
+    return;
+  }
+  const options = [];
+  for (let i = 1; i <= totalPages; i++) {
+    options.push(`<option value="${i}">第 ${i} 页</option>`);
+  }
+  currentPageJumpSelect.innerHTML = options.join('');
+  currentPageJumpSelect.disabled = false;
+  currentPageJumpSelect.value = String(Math.min(Math.max(1, currentPage), totalPages));
+}
+
+function updateCurrentResultsPaginationUI({ filteredCount, totalPages, currentPage, pageSize }) {
+  if (currentPageInfo) {
+    currentPageInfo.textContent = totalPages > 0 ? `共 ${totalPages} 页` : '共 0 页';
+  }
+  if (statsCountLabel) {
+    const start = filteredCount > 0 ? ((currentPage - 1) * pageSize) + 1 : 0;
+    const end = filteredCount > 0 ? Math.min(filteredCount, currentPage * pageSize) : 0;
+    statsCountLabel.textContent = filteredCount > 0
+      ? `显示 ${start}-${end} / ${filteredCount} 条`
+      : '显示 0 / 0 条';
+  }
+  if (currentPageSizeSelect) {
+    currentPageSizeSelect.value = String(pageSize);
+  }
+  buildCurrentResultsPageOptions(totalPages, currentPage);
 }
 
 // ==================== section ====================
@@ -3620,6 +4546,7 @@ function getResultText(result) {
     case 'success': return '成功';
     case 'success_pending_moderation': return '提交成功，审核中';
     case 'skipped': return '已存在';
+    case 'source_hit': return '源码已命中';
     case 'manual_required': return '需手动处理';
     case 'submitted_unconfirmed': return '待确认';
     case 'no_comment_box': return '无评论框';
@@ -3636,10 +4563,18 @@ function escapeHtml(str) {
 }
 
 function formatTime(date) {
+  const logic = getBatchResultsLogic();
+  if (logic && typeof logic.formatDateTimeForDisplay === 'function') {
+    return logic.formatDateTimeForDisplay(date);
+  }
+  if (!date || Number.isNaN(date.getTime())) return '--';
+  const y = String(date.getFullYear());
+  const mo = String(date.getMonth() + 1).padStart(2, '0');
+  const d = String(date.getDate()).padStart(2, '0');
   const h = String(date.getHours()).padStart(2, '0');
   const m = String(date.getMinutes()).padStart(2, '0');
   const s = String(date.getSeconds()).padStart(2, '0');
-  return `${h}:${m}:${s}`;
+  return `${y}-${mo}-${d} ${h}:${m}:${s}`;
 }
 
 function debounce(fn, delay) {

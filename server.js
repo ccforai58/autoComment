@@ -13,7 +13,7 @@ app.use(express.urlencoded({ extended: true }));
 
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   if (req.method === 'OPTIONS') {
     res.status(200).end();
@@ -24,6 +24,7 @@ app.use((req, res, next) => {
 
 const blogRunStatsHandler = require('./api/blog-run-stats');
 const batchRouter = require('./api/batch');
+const linkAssistantRouter = require('./api/link-assistant');
 const csvBatchesRouter = ENABLE_PAYMENT ? require('./api/csv-batches') : null;
 const alipayRouter = ENABLE_PAYMENT ? require('./api/alipay') : null;
 const generateCopyHandler = require('./api/generate-copy');
@@ -39,6 +40,7 @@ app.use('/api', require('./api/debug-log'));
 app.use('/api', require('./api/local-status'));
 app.use('/api', require('./api/semrush-domain-review'));
 app.use('/api', require('./api/backlink-check'));
+app.use('/api', linkAssistantRouter);
 
 if (ENABLE_PAYMENT) {
   app.use('/api', csvBatchesRouter);
@@ -70,6 +72,10 @@ app.listen(PORT, () => {
 
   batchRouter.ensureTables().catch((err) => {
     console.error('[Server] batch_reports table init failed:', err);
+  });
+
+  linkAssistantRouter.ensureTables().catch((err) => {
+    console.error('[Server] link assistant tables init failed:', err);
   });
 
   if (ENABLE_PAYMENT) {

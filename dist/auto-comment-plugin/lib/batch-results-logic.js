@@ -29,6 +29,19 @@ function normalizeSubmissionSourceUrlKey(url) {
   }
 }
 
+function formatDateTimeForDisplay(value) {
+  if (!value) return '--';
+  const date = value instanceof Date ? value : new Date(value);
+  if (!date || Number.isNaN(date.getTime())) return '--';
+  const y = String(date.getFullYear());
+  const mo = String(date.getMonth() + 1).padStart(2, '0');
+  const d = String(date.getDate()).padStart(2, '0');
+  const h = String(date.getHours()).padStart(2, '0');
+  const mi = String(date.getMinutes()).padStart(2, '0');
+  const s = String(date.getSeconds()).padStart(2, '0');
+  return `${y}-${mo}-${d} ${h}:${mi}:${s}`;
+}
+
 function dedupeCsvSourceUrlItems(items) {
   const sourceItems = Array.isArray(items) ? items : [];
   const seen = new Set();
@@ -81,6 +94,14 @@ const RESULT_DISPLAY = {
     text: '已存在',
     categoryText: '已存在',
     cssClass: 'skipped'
+  },
+  source_hit: {
+    value: 'source_hit',
+    category: 'skipped',
+    subcategory: 'source_hit',
+    text: '\u6e90\u7801\u5df2\u547d\u4e2d',
+    categoryText: '\u5df2\u8df3\u8fc7',
+    cssClass: 'source_hit'
   },
   manual_required: {
     value: 'manual_required',
@@ -170,11 +191,35 @@ function getSubmittedUnconfirmedDisplay(record) {
   return base;
 }
 
+function getSkippedDisplay(record) {
+  const source = record && typeof record === 'object' ? record : {};
+  const message = String(source.errorMessage || source.reason || source.message || '').toLowerCase();
+  const base = { ...RESULT_DISPLAY.skipped };
+  if (/historical_no_comment_box|no comment box|no comment form|无评论框/.test(message)) {
+    return {
+      ...base,
+      subcategory: 'historical_no_comment_box',
+      text: '无评论框，跳过',
+      categoryText: '已跳过'
+    };
+  }
+  if (/historical_page_unavailable|page unavailable|unavailable|net::err_|err_name_not_resolved|访问不到|无法访问/.test(message)) {
+    return {
+      ...base,
+      subcategory: 'historical_page_unavailable',
+      text: '访问不到，跳过',
+      categoryText: '已跳过'
+    };
+  }
+  return base;
+}
+
 function getResultDisplay(input) {
   const isRecord = input && typeof input === 'object' && !Array.isArray(input);
   const result = isRecord ? input.result : input;
   const value = normalizeResultValue(result);
   if (value === 'submitted_unconfirmed') return getSubmittedUnconfirmedDisplay(isRecord ? input : { result });
+  if (value === 'skipped') return getSkippedDisplay(isRecord ? input : { result });
   if (RESULT_DISPLAY[value]) return { ...RESULT_DISPLAY[value] };
   const text = String(result || '').trim() || '未知';
   return {
@@ -361,35 +406,52 @@ function getExportRunResult(result) {
 function buildCurrentBatchExportCsv(input) {
   const source = input && typeof input === 'object' ? input : {};
   const records = sortByOriginalIndex(source.results);
-  const sample = records.find((record) => Array.isArray(record.originalRow) && record.originalRow.length > 0);
-  if (!sample) {
-    return { content: '', filename: '', recordCount: 0, error: 'missing_original_rows' };
-  }
+  const batchId = String(source.batchId || '');
+  const headers = [
+    '#',
+    'Promotion website',
+    'Promotion project ID',
+    'Source url',
+    'Source domain',
+    'Discovery target url',
+    'Page ascore',
+    'Result',
+    'Result label',
+    'Error info',
+    'AI content',
+    'Submitted at',
+    'Elapsed seconds',
+    'Backlink verified',
+    'Matched href',
+    'Batch ID'
+  ];
 
-  const originalRowLen = getExportSourceColumnCount(sample.originalRow);
-  const headers = [];
-  for (let i = 0; i < originalRowLen; i++) {
-    if (i === 0) headers.push('Page AS');
-    else if (i === 1) headers.push('Original URL');
-    else if (i === 2) headers.push('URL Domain');
-    else if (i === 3) headers.push('Target Domain');
-    else if (i === 4) headers.push('Type');
-    else if (i === 5) headers.push('External Link Count');
-    else headers.push(`Column ${i + 1}`);
-  }
-  headers.push('Run Result');
-
-  const rows = records.map((record) => {
-    const originalRow = Array.isArray(record.originalRow) ? record.originalRow : [];
-    const cols = [];
-    for (let i = 0; i < originalRowLen; i++) {
-      cols.push(csvEscape(originalRow[i] || ''));
-    }
-    cols.push(csvEscape(getExportRunResult(record.result)));
-    return cols.join(',');
+  const rows = records.map((record, index) => {
+    const sourceRecord = record && typeof record === 'object' ? record : {};
+    const display = getRecordResultDisplay(sourceRecord);
+    const semrushMeta = sourceRecord.semrushMeta && typeof sourceRecord.semrushMeta === 'object' ? sourceRecord.semrushMeta : {};
+    const cols = [
+      index + 1,
+      sourceRecord.promotionWebsiteUrl || sourceRecord.targetUrl || '',
+      sourceRecord.promotionProjectId || '',
+      sourceRecord.url || sourceRecord.sourceUrl || '',
+      sourceRecord.sourceDomain || '',
+      sourceRecord.discoveryTargetUrl || semrushMeta.targetUrl || '',
+      sourceRecord.pageAscore ?? sourceRecord.page_ascore ?? semrushMeta.pageAscore ?? semrushMeta.page_ascore ?? '',
+      display.value || sourceRecord.result || '',
+      display.text || '',
+      sourceRecord.errorMessage || sourceRecord.reason || '',
+      sourceRecord.aiContent || '',
+      sourceRecord.timestamp ? formatDateTimeForDisplay(sourceRecord.timestamp) : '',
+      sourceRecord.elapsed ?? '',
+      sourceRecord.linkVerified === undefined || sourceRecord.linkVerified === null ? '' : String(sourceRecord.linkVerified),
+      sourceRecord.matchedHref || '',
+      sourceRecord.batchId || batchId
+    ];
+    return cols.map(csvEscape).join(',');
   });
 
-  const batchPart = String(source.batchId || 'unknown').replace(/[^a-z0-9_-]+/gi, '-').replace(/^-+|-+$/g, '') || 'unknown';
+  const batchPart = String(batchId || 'unknown').replace(/[^a-z0-9_-]+/gi, '-').replace(/^-+|-+$/g, '') || 'unknown';
   return {
     content: [headers.map(csvEscape).join(','), ...rows].join('\n'),
     filename: `batch-results-current-${batchPart}.csv`,
@@ -472,12 +534,21 @@ function mergeBacklinkCheckResults(records, checkResults) {
     if (!check) return record;
     return {
       ...record,
+      backendSubmissionId: check.backendSubmissionId || record.backendSubmissionId || null,
       latestBacklinkStatus: check.latestBacklinkStatus || '',
       latestBacklinkCheckedAt: check.latestBacklinkCheckedAt || '',
       latestBacklinkMatchedHref: check.latestBacklinkMatchedHref || '',
       latestBacklinkReason: check.latestBacklinkReason || ''
     };
   });
+}
+
+function selectBacklinkProgressRecords(records, targetIds) {
+  const source = Array.isArray(records) ? records : [];
+  const ids = Array.isArray(targetIds) ? targetIds.map(String).filter(Boolean) : [];
+  if (ids.length === 0) return source;
+  const idSet = new Set(ids);
+  return source.filter((record) => record && idSet.has(String(record.id)));
 }
 
 function buildBacklinkCheckProgress(records) {
@@ -713,6 +784,60 @@ function removeCurrentBatchReportedState(input) {
   };
 }
 
+function isPlainObject(value) {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function getStorageOwnerPromotionKey(value) {
+  if (!isPlainObject(value)) return '';
+  return value.currentPromotionWebsiteKey
+    || value.promotionWebsiteKey
+    || value.copyPromotionWebsiteKey
+    || normalizePromotionWebsiteKey(value.currentPromotionWebsiteUrl || value.promotionWebsiteUrl);
+}
+
+function isStorageRecordOwnedByBatch(value, batchId) {
+  if (!isPlainObject(value)) return false;
+  const currentBatchId = String(batchId || '');
+  if (!currentBatchId) return false;
+  return String(value.batchId || '') === currentBatchId;
+}
+
+function isRuntimeSnapshotOwnedByCurrentBatch(value, batchId, promotionKey) {
+  if (!isPlainObject(value)) return false;
+  if (isStorageRecordOwnedByBatch(value, batchId)) return true;
+  const normalizedPromotionKey = promotionKey || '';
+  if (!normalizedPromotionKey || normalizedPromotionKey === '__unconfigured__') return false;
+  if (String(value.batchId || '')) return false;
+  return getStorageOwnerPromotionKey(value) === normalizedPromotionKey;
+}
+
+function selectCurrentBatchStorageKeysForRemoval(input) {
+  const source = input && typeof input === 'object' ? input : {};
+  const storageData = isPlainObject(source.storageData) ? source.storageData : {};
+  const currentBatchId = String(source.batchId || '');
+  const promotionKey = source.promotionKey || normalizePromotionWebsiteKey(source.promotionWebsiteUrl);
+  const keys = [];
+
+  if (isStorageRecordOwnedByBatch(storageData.batchLocalResults, currentBatchId)) {
+    keys.push('batchLocalResults');
+  }
+  if (isRuntimeSnapshotOwnedByCurrentBatch(storageData.batch_runtime_state_v1, currentBatchId, promotionKey)) {
+    keys.push('batch_runtime_state_v1');
+  }
+  if (isStorageRecordOwnedByBatch(storageData.batch_pending_task, currentBatchId)) {
+    keys.push('batch_pending_task');
+  }
+  if (isStorageRecordOwnedByBatch(storageData.batchCtx, currentBatchId)) {
+    keys.push('batchCtx');
+  }
+  if (isStorageRecordOwnedByBatch(storageData.batchSubmitCtx, currentBatchId)) {
+    keys.push('batchSubmitCtx');
+  }
+
+  return keys;
+}
+
 function formatCompactEta(ms) {
   const value = Number(ms);
   if (!Number.isFinite(value) || value < 0) return '估算中';
@@ -731,9 +856,12 @@ function buildCompactBatchProgress(input) {
   }
 
   const total = Math.max(0, Number(snapshot.totalCount || 0));
-  const completed = Math.min(total, Math.max(0, Array.isArray(snapshot.localResults)
-    ? snapshot.localResults.length
-    : Number(snapshot.completedCount || 0)));
+  const completedSource = Number.isFinite(Number(snapshot.localResultCount))
+    ? Number(snapshot.localResultCount)
+    : (Number.isFinite(Number(snapshot.completedCount))
+      ? Number(snapshot.completedCount)
+      : (Array.isArray(snapshot.localResults) ? snapshot.localResults.length : 0));
+  const completed = Math.min(total, Math.max(0, completedSource));
   const success = Math.max(0, Number(snapshot.successCount || 0));
   const currentRaw = Number(snapshot.currentIndex || 0);
   const current = total > 0 ? Math.min(total, Math.max(1, currentRaw)) : 0;
@@ -874,6 +1002,28 @@ function isDuplicatePromotionSubmissionResult(record) {
     display.value === 'submitted_unconfirmed';
 }
 
+function isHistoricalPageUnavailableRecord(record) {
+  const source = record && typeof record === 'object' ? record : {};
+  const display = getRecordResultDisplay(source);
+  if (display.value !== 'fail') return false;
+  const message = String(source.errorMessage || source.reason || source.message || '').toLowerCase();
+  return /net::err_|err_name_not_resolved|err_connection|err_timed_out|enotfound|econnrefused|econnreset|etimedout|failed to fetch|navigation timeout|page load timeout|load failed|unreachable|unavailable|cannot access|access denied|\u8bbf\u95ee\u4e0d\u5230|\u65e0\u6cd5\u8bbf\u95ee|\u7f51\u9875\u6253\u4e0d\u5f00/.test(message);
+}
+
+function getHistoricalHardStopSkip(record) {
+  const display = getRecordResultDisplay(record);
+  if (display.value === 'no_comment_box') {
+    return { shouldSkip: true, record, reason: 'historical_no_comment_box', result: 'skipped', suppressArchive: false };
+  }
+  if (display.value === 'blocked_illegal') {
+    return { shouldSkip: true, record, reason: 'historical_blocked_illegal', result: 'blocked_illegal', suppressArchive: false };
+  }
+  if (isHistoricalPageUnavailableRecord(record)) {
+    return { shouldSkip: true, record, reason: 'historical_page_unavailable', result: 'skipped', suppressArchive: false };
+  }
+  return null;
+}
+
 function findDuplicatePromotionSubmissionRecord(input) {
   const source = input && typeof input === 'object' ? input : {};
   const targetSourceKey = normalizeSubmissionSourceUrlKey(source.url || source.sourceUrl);
@@ -892,8 +1042,17 @@ function findDuplicatePromotionSubmissionRecord(input) {
     return {
       shouldSkip: true,
       record,
-      reason: 'duplicate_promotion_submission'
+      reason: 'duplicate_promotion_submission',
+      suppressArchive: true
     };
+  }
+
+  for (const record of records) {
+    if (!record || typeof record !== 'object') continue;
+    const recordSourceKey = normalizeSubmissionSourceUrlKey(record.sourceUrl || record.url);
+    if (recordSourceKey !== targetSourceKey) continue;
+    const hardStop = getHistoricalHardStopSkip(record);
+    if (hardStop) return hardStop;
   }
 
   return { shouldSkip: false, record: null, reason: '' };
@@ -902,6 +1061,7 @@ function findDuplicatePromotionSubmissionRecord(input) {
 const BatchResultsLogic = {
   normalizePromotionWebsiteKey,
   normalizeSubmissionSourceUrlKey,
+  formatDateTimeForDisplay,
   dedupeCsvSourceUrlItems,
   getRecordPromotionKey,
   normalizeResultValue,
@@ -915,6 +1075,7 @@ const BatchResultsLogic = {
   buildCurrentBatchExportCsv,
   buildArchiveExportCsv,
   mergeBacklinkCheckResults,
+  selectBacklinkProgressRecords,
   getLatestBacklinkStatusDisplay,
   buildBacklinkCheckProgress,
   buildBacklinkCheckControlState,
@@ -925,6 +1086,7 @@ const BatchResultsLogic = {
   deletePromotionWebsiteRecords,
   deleteAllPromotionWebsiteRecords,
   removeCurrentBatchReportedState,
+  selectCurrentBatchStorageKeysForRemoval,
   buildCompactBatchProgress,
   chooseAssistantProgressTab,
   buildServiceStatusSummary,

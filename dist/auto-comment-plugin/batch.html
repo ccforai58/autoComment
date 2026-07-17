@@ -202,18 +202,15 @@
         color: #9ca3af;
       }
 
-      input[type='file'] {
-        display: none;
-      }
-
-      .semrush-config {
+      .semrush-config-inline {
         display: grid;
         grid-template-columns: repeat(2, minmax(0, 1fr));
-        gap: 10px;
-        margin-top: 12px;
+        gap: 8px;
+        margin-top: 10px;
+        width: 100%;
       }
 
-      .semrush-config label {
+      .semrush-config-inline label {
         display: grid;
         gap: 5px;
         font-size: 12px;
@@ -221,12 +218,16 @@
         color: #4b5563;
       }
 
-      .semrush-config input {
+      .semrush-config-inline input {
         width: 100%;
         padding: 7px 9px;
         border: 1px solid #d1d5db;
         border-radius: 8px;
         font-size: 13px;
+      }
+
+      input[type='file'] {
+        display: none;
       }
 
       .import-status {
@@ -695,6 +696,48 @@
         margin-top: 8px;
       }
 
+      .archive-pagination-bar {
+        display: flex;
+        justify-content: flex-end;
+        align-items: center;
+        gap: 8px;
+        padding: 8px 12px 0;
+      }
+
+      .archive-pagination-controls {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        flex-wrap: wrap;
+        justify-content: flex-end;
+        margin-left: auto;
+      }
+
+      .archive-pagination-controls select {
+        padding: 5px 9px;
+        border-radius: 6px;
+        border: 1px solid #d1d5db;
+        font-size: 12px;
+        background: #fff;
+        outline: none;
+      }
+
+      .archive-pagination-controls #archivePageSize,
+      .archive-pagination-controls #currentPageSize {
+        width: 78px;
+      }
+
+      .archive-pagination-controls #archivePageJump,
+      .archive-pagination-controls #currentPageJump {
+        width: 92px;
+      }
+
+      .archive-page-info {
+        font-size: 12px;
+        color: #6b7280;
+        white-space: nowrap;
+      }
+
       .archive-tool-main {
         display: inline-flex;
         align-items: center;
@@ -846,6 +889,7 @@
       .result-badge.no_comment_box { background: #fef3c7; color: #92400e; }
       .result-badge.fail { background: #fee2e2; color: #991b1b; }
       .result-badge.skipped { background: #fef3c7; color: #92400e; }
+      .result-badge.source_hit { background: #e0f2fe; color: #075985; }
       .result-badge.blocked_illegal { background: #ffe4e6; color: #9f1239; }
 
       .ai-content-cell {
@@ -975,6 +1019,7 @@
         </div>
         <div class="topbar-actions">
           <button class="btn btn-secondary" id="openSettingsBtn">打开设置</button>
+          <button class="btn btn-secondary" id="openResourceLibraryBtn">资源库</button>
           <button class="btn btn-secondary" id="refreshSetupBtn">刷新配置</button>
         </div>
       </div>
@@ -1010,27 +1055,27 @@
       <!-- 文件上传区 -->
       <div class="card">
         <div class="card-title">上传 CSV 文件</div>
-        <div class="upload-grid">
+                <div class="upload-grid">
           <div class="upload-zone" id="uploadZone">
             <div class="upload-icon" aria-hidden="true">CSV</div>
-            <div class="upload-text">普通 CSV</div>
-            <div class="upload-hint">包含原 URL 的标准任务文件</div>
+            <div class="upload-text">普通 CSV 导入</div>
+            <div class="upload-hint">上传普通 CSV，至少包含“原URL”列；其他列可作为备注保留。</div>
             <input type="file" id="fileInput" accept=".csv" />
           </div>
           <div class="upload-zone semrush-upload-zone" id="semrushUploadZone">
             <div class="upload-icon" aria-hidden="true">SEMrush</div>
             <div class="upload-text">Semrush 外链 CSV</div>
-            <div class="upload-hint">读取 Source url 并过滤低质量来源</div>
+            <div class="upload-hint">读取 Semrush 外链 CSV，自动筛选可用来源。</div>
+            <div class="semrush-config-inline" id="semrushConfig">
+              <label>Page ascore 最低值
+                <input type="number" id="semrushMinAscore" min="0" max="100" value="10" />
+              </label>
+              <label>同域最多保留
+                <input type="number" id="semrushMaxPerDomain" min="1" max="20" value="3" />
+              </label>
+            </div>
             <input type="file" id="semrushFileInput" accept=".csv" />
           </div>
-        </div>
-        <div class="semrush-config" id="semrushConfig">
-          <label>Page ascore 最低值
-            <input type="number" id="semrushMinAscore" min="0" max="100" value="5" />
-          </label>
-          <label>同域最多保留
-            <input type="number" id="semrushMaxPerDomain" min="1" max="20" value="3" />
-          </label>
         </div>
         <div class="import-status" id="semrushImportStatus" aria-live="polite"></div>
 
@@ -1048,18 +1093,13 @@
           <table>
             <thead>
               <tr>
-                <th>#</th>
+	                  <th>序号</th>
                 <th>来源域名</th>
                 <th>目标页面</th>
               </tr>
             </thead>
             <tbody id="urlPreviewBody"></tbody>
           </table>
-        </div>
-
-        <div class="hint" style="margin-top:10px">
-          CSV 文件需包含"原URL"列，标准格式为：<br/>
-          页面AS, 原URL, URL对应域名, 目标域名, 类型, 外部链接数量, 自动评论运行结果
         </div>
       </div>
 
@@ -1241,13 +1281,25 @@
                 <th>错误信息</th>
                 <th>AI 生成内容</th>
                 <th>耗时</th>
-                <th>时间</th>
+	                <th>检测日期</th>
               </tr>
             </thead>
               <tbody id="statsTableBody"></tbody>
             </table>
           </div>
           <div class="results-empty" id="currentResultsEmpty">当前批次还没有结果。上传 CSV 并开始任务后，这里会实时显示执行结果。</div>
+          <div class="archive-pagination-bar current-pagination-bar">
+            <div class="archive-pagination-controls">
+              <label class="archive-pagination-label" for="currentPageSize">每页</label>
+              <select id="currentPageSize">
+                <option value="100">100</option>
+                <option value="200" selected>200</option>
+                <option value="500">500</option>
+              </select>
+              <select id="currentPageJump" aria-label="当前批次页码跳转"></select>
+              <span class="archive-page-info" id="currentPageInfo">共 0 页</span>
+            </div>
+          </div>
         </div>
 
         <div class="results-panel" id="archiveResultsPanel">
@@ -1321,14 +1373,26 @@
                   <th>检测日期</th>
                   <th>错误信息</th>
                   <th>AI 内容</th>
-                  <th>批次</th>
-                  <th>时间</th>
+	                  <th>批次</th>
                 </tr>
               </thead>
               <tbody id="archiveTableBody"></tbody>
             </table>
           </div>
           <div class="archive-empty" id="archiveEmpty">暂无历史归档记录。</div>
+        </div>
+        <div class="archive-pagination-bar">
+          <div class="archive-pagination-controls">
+            <label class="archive-pagination-label" for="archivePageSize">每页</label>
+            <select id="archivePageSize">
+              <option value="20">20</option>
+              <option value="50" selected>50</option>
+              <option value="100">100</option>
+              <option value="200">200</option>
+            </select>
+            <select id="archivePageJump" aria-label="页码跳转"></select>
+            <span class="archive-page-info" id="archivePageInfo">共 0 页</span>
+          </div>
         </div>
         <div class="archive-management-bar">
           <span class="archive-tool-label">记录管理：</span>
@@ -1351,6 +1415,7 @@
     <script src="lib/batch-results-logic.js"></script>
     <script src="extension-config.js"></script>
     <script src="illegal-site-filter.js"></script>
+    <script src="lib/link-assistant-runtime-logic.js"></script>
     <script src="lib/semrush-import-logic.js"></script>
     <script src="batch.js"></script>
   </body>

@@ -1,0 +1,363 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>外链资源库</title>
+    <style>
+      :root {
+        color-scheme: light;
+        font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background: #f6f8fb;
+        color: #18212f;
+      }
+
+      * { box-sizing: border-box; }
+
+      body {
+        margin: 0;
+        background: #f6f8fb;
+      }
+
+      main {
+        width: min(1360px, calc(100vw - 20px));
+        margin: 0 auto;
+        padding: 14px 0 18px;
+      }
+
+      header {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 16px;
+        margin-bottom: 8px;
+      }
+
+      h1 {
+        margin: 0 0 6px;
+        font-size: 18px;
+        line-height: 1.25;
+      }
+
+      .subtitle {
+        margin: 0;
+        font-size: 13px;
+        color: #667085;
+      }
+
+      .status {
+        min-height: 22px;
+        margin: 0 0 14px;
+        font-size: 13px;
+        color: #475467;
+      }
+
+      .status[data-tone="success"] { color: #067647; }
+      .status[data-tone="error"] { color: #b42318; }
+
+      button,
+      input,
+      select,
+      textarea {
+        font: inherit;
+      }
+
+      button {
+        min-height: 30px;
+        padding: 6px 10px;
+        border: 1px solid transparent;
+        border-radius: 7px;
+        cursor: pointer;
+        font-size: 13px;
+        font-weight: 700;
+        transition: background-color 0.16s ease, border-color 0.16s ease, color 0.16s ease, box-shadow 0.16s ease;
+        white-space: nowrap;
+      }
+
+      button:focus-visible,
+      input:focus-visible,
+      select:focus-visible,
+      textarea:focus-visible {
+        outline: 2px solid #2e90fa;
+        outline-offset: 2px;
+      }
+
+      button:disabled {
+        cursor: not-allowed;
+        opacity: 0.5;
+      }
+
+      .primary {
+        background: #1570ef;
+        color: #fff;
+        box-shadow: 0 8px 18px rgba(21, 112, 239, 0.18);
+      }
+
+      .primary:hover { background: #175cd3; }
+
+      .secondary {
+        background: #fff;
+        border-color: #d0d5dd;
+        color: #344054;
+      }
+
+      .secondary:hover { background: #f2f4f7; }
+
+      .text-danger {
+        background: #fff;
+        border-color: #fecdca;
+        color: #b42318;
+      }
+
+      .text-danger:hover { background: #fff5f4; }
+
+      .toolbar {
+        display: grid;
+        grid-template-columns: minmax(190px, 1.2fr) minmax(160px, 0.9fr) minmax(150px, 0.9fr) minmax(118px, 0.7fr) minmax(118px, 0.7fr) auto auto auto;
+        gap: 8px;
+        align-items: center;
+        padding: 8px;
+        border: 1px solid #e4e7ec;
+        border-radius: 8px;
+        background: #fff;
+        margin-bottom: 8px;
+      }
+
+      input,
+      select,
+      textarea {
+        width: 100%;
+        min-height: 30px;
+        border: 1px solid #d0d5dd;
+        border-radius: 7px;
+        background: #fff;
+        color: #101828;
+        padding: 5px 8px;
+      }
+
+      textarea {
+        min-height: 44px;
+        resize: vertical;
+      }
+
+      .summary {
+        margin: 0 0 6px;
+        color: #667085;
+        font-size: 12px;
+      }
+
+      .table-wrap {
+        overflow: auto;
+        max-height: calc(100vh - 210px);
+        border: 1px solid #e4e7ec;
+        border-radius: 8px;
+        background: #fff;
+      }
+
+      table {
+        width: 100%;
+        min-width: 1240px;
+        border-collapse: collapse;
+      }
+
+      th,
+      td {
+        padding: 6px 8px;
+        border-bottom: 1px solid #eef1f5;
+        text-align: left;
+        vertical-align: top;
+        font-size: 12px;
+      }
+
+      th {
+        position: sticky;
+        top: 0;
+        z-index: 1;
+        background: #f9fafb;
+        color: #475467;
+        font-weight: 800;
+      }
+
+      th.sortable {
+        cursor: pointer;
+        user-select: none;
+      }
+
+      th.sortable:hover {
+        color: #175cd3;
+      }
+
+      tr:hover td { background: #f9fafb; }
+
+      .num-cell {
+        width: 44px;
+        color: #667085;
+      }
+
+      .url-cell {
+        max-width: 300px;
+      }
+
+      .url-cell a,
+      .url-cell span {
+        display: block;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        color: #175cd3;
+        text-decoration: none;
+        white-space: nowrap;
+      }
+
+      .url-cell small,
+      td small {
+        display: block;
+        margin-top: 4px;
+        color: #667085;
+      }
+
+      td input,
+      td select,
+      td textarea {
+        min-width: 120px;
+        font-size: 12px;
+      }
+
+      .pager {
+        display: flex;
+        align-items: center;
+        justify-content: flex-end;
+        gap: 10px;
+        margin: 8px 0 0;
+        color: #475467;
+        font-size: 12px;
+      }
+
+      .pager-controls {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        flex-wrap: wrap;
+      }
+
+      .pager input,
+      .pager select {
+        width: auto;
+        min-width: 62px;
+      }
+
+      .empty {
+        padding: 28px 12px;
+        color: #667085;
+        text-align: center;
+      }
+
+      @media (max-width: 1040px) {
+        main { width: min(100vw - 24px, 1280px); }
+        header {
+          display: grid;
+        }
+        .toolbar {
+          grid-template-columns: 1fr 1fr;
+        }
+      }
+
+      @media (max-width: 640px) {
+        .toolbar {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <div>
+          <h1>外链资源库</h1>
+          <p class="subtitle">这里仅保存检测成功的外链资源；Semrush 导出中的 Target url 是发现来源。</p>
+        </div>
+      </header>
+
+      <p id="pageStatus" class="status" aria-live="polite"></p>
+
+      <section class="toolbar" aria-label="资源筛选与导出">
+        <input id="keywordInput" type="search" placeholder="搜索 Source url、域名、标题、备注" />
+        <select id="discoveryTargetFilter">
+          <option value="">全部发现来源</option>
+        </select>
+        <select id="promotionProjectFilter">
+          <option value="">全部推广网站</option>
+        </select>
+        <select id="typeFilter">
+          <option value="">全部类型</option>
+          <option value="blog_comment">博客评论</option>
+          <option value="directory">目录站</option>
+          <option value="media_article">媒体文章</option>
+          <option value="community_forum">社区论坛</option>
+          <option value="resource_page">资源页</option>
+          <option value="other">其他</option>
+        </select>
+        <select id="qualityFilter">
+          <option value="">全部评级</option>
+          <option value="excellent">优秀</option>
+          <option value="good">良好</option>
+          <option value="ok">一般</option>
+          <option value="low">偏低</option>
+        </select>
+        <input id="minAscoreInput" type="number" min="0" step="1" placeholder="AScore ≥" />
+        <input id="maxAscoreInput" type="number" min="0" step="1" placeholder="AScore ≤" />
+        <button id="refreshBtn" type="button" class="secondary">刷新</button>
+        <button id="exportCsvBtn" type="button" class="primary">导出 Semrush CSV</button>
+        <button id="exportManagementBtn" type="button" class="secondary">管理导出</button>
+      </section>
+
+      <p id="resourceSummary" class="summary"></p>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Source url</th>
+              <th>Discovery target url</th>
+              <th id="ascoreSortHeader" class="sortable" data-sort-field="pageAscore" aria-sort="none">AScore <span id="ascoreSortIndicator">↕</span></th>
+              <th>类型</th>
+              <th>评级</th>
+              <th>标签</th>
+              <th>备注</th>
+              <th>来源域名</th>
+              <th>更新时间</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody id="resourceRows">
+            <tr>
+              <td colspan="11" class="empty">正在加载...</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="pager" aria-label="资源库分页">
+        <span id="resourceTotal">共 0 条</span>
+        <div class="pager-controls">
+          <label>
+            每页
+            <select id="pageSizeSelect" aria-label="每页显示数量">
+              <option value="25">25 / 页</option>
+              <option value="50" selected>50 / 页</option>
+              <option value="100">100 / 页</option>
+              <option value="200">200 / 页</option>
+            </select>
+          </label>
+          <button id="prevPageBtn" type="button" class="secondary">上一页</button>
+          <select id="pageJumpSelect" aria-label="页码跳转"></select>
+          <button id="nextPageBtn" type="button" class="secondary">下一页</button>
+          <span id="resourcePageInfo">共 0 页</span>
+        </div>
+      </div>
+    </main>
+
+    <script src="extension-config.js"></script>
+    <script src="resource-library.js"></script>
+  </body>
+</html>
