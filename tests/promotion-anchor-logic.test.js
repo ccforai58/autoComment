@@ -42,6 +42,22 @@ test('ensurePromotionAnchor replaces duplicate or URL-like anchor text', () => {
   assert.match(result.text, /<a href="https:\/\/example\.com\/\n">personalized floral name design<\/a>/);
 });
 
+test('ensurePromotionAnchor removes a dangling trailing anchor before appending a complete one', () => {
+  const result = ensurePromotionAnchor(
+    'This article has helpful ideas for preserving memories, and it pairs well with <a href="https://nameintoflowers.com/',
+    {
+      promotionUrl: 'https://nameintoflowers.com/',
+      promotionKeywords: ['name into flowers', 'flower name art'],
+      promotionContent: 'Keywords: name into flowers, flower name art',
+      usedAnchorTexts: []
+    }
+  );
+
+  assert.equal(result.changed, true);
+  assert.match(result.text, /preserving memories, and it pairs well with\s+<a href="https:\/\/nameintoflowers\.com\/\n">name into flowers<\/a>$/);
+  assert.doesNotMatch(result.text, /<a href="https:\/\/nameintoflowers\.com\/<a href=/);
+});
+
 test('buildAnchorCandidates avoids generic and duplicate anchor text', () => {
   const candidates = buildAnchorCandidates({
     promotionUrl: 'https://nameintoflowers.com',

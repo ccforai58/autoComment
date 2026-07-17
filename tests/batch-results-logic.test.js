@@ -9,6 +9,7 @@ const {
   deleteAllPromotionWebsiteRecords,
   removeCurrentBatchReportedState,
   selectCurrentBatchStorageKeysForRemoval,
+  selectAssistantProgressSnapshot,
   buildCompactBatchProgress,
   chooseAssistantProgressTab,
   buildServiceStatusSummary,
@@ -30,12 +31,112 @@ const {
   buildManualReviewOpenMessage,
   dedupeCsvSourceUrlItems,
   formatDateTimeForDisplay,
-  findDuplicatePromotionSubmissionRecord
+  findDuplicatePromotionSubmissionRecord,
+  compactBatchRuntimeSnapshotForStorage,
+  buildBatchRuntimeStorageUpdate,
+  shouldRestoreRuntimeAfterPromotionKeyRefresh
 } = require('../lib/batch-results-logic');
 
 test('formatDateTimeForDisplay includes date and time in local display format', () => {
   assert.equal(formatDateTimeForDisplay(new Date(2026, 6, 17, 9, 8, 7)), '2026-07-17 09:08:07');
   assert.equal(formatDateTimeForDisplay(null), '--');
+});
+
+test('compactBatchRuntimeSnapshotForStorage removes duplicate semrush rows from pending urls but preserves original row', () => {
+  const headers = ['Target url', 'Source url', 'Page ascore', 'Extra'];
+  const row = ['https://discover.test/', 'https://source.test/post', '42', 'value'];
+  const snapshot = compactBatchRuntimeSnapshotForStorage({
+    batchId: 'batch-a',
+    parsedUrls: [{
+      originalIndex: 0,
+      url: 'https://source.test/post',
+      sourceDomain: 'source.test',
+      originalRow: row,
+      semrushHeaders: headers,
+      semrushRow: row,
+      semrushMeta: {
+        targetUrl: 'https://discover.test/',
+        sourceUrl: 'https://source.test/post',
+        sourceDomain: 'source.test',
+        pageAscore: 42,
+        semrushHeaders: headers,
+        semrushRow: row
+      }
+    }],
+    localResults: [{
+      originalIndex: 0,
+      url: 'https://source.test/post',
+      aiContent: 'copy',
+      originalRow: row,
+      semrushHeaders: headers,
+      semrushRow: row,
+      semrushMeta: {
+        pageAscore: 42,
+        semrushHeaders: headers,
+        semrushRow: row
+      }
+    }]
+  });
+
+  assert.deepEqual(snapshot.parsedUrls[0].originalRow, row);
+  assert.equal(snapshot.parsedUrls[0].semrushHeaders, undefined);
+  assert.equal(snapshot.parsedUrls[0].semrushRow, undefined);
+  assert.equal(snapshot.parsedUrls[0].semrushMeta.targetUrl, 'https://discover.test/');
+  assert.equal(snapshot.parsedUrls[0].semrushMeta.pageAscore, 42);
+  assert.equal(snapshot.parsedUrls[0].semrushMeta.semrushHeaders, undefined);
+  assert.equal(snapshot.parsedUrls[0].semrushMeta.semrushRow, undefined);
+  assert.deepEqual(snapshot.localResults[0].semrushHeaders, headers);
+  assert.deepEqual(snapshot.localResults[0].semrushRow, row);
+  assert.equal(snapshot.localResults[0].semrushMeta.semrushRow, undefined);
+});
+
+test('compactBatchRuntimeSnapshotForStorage removes ordinary CSV original rows from pending urls', () => {
+  const snapshot = compactBatchRuntimeSnapshotForStorage({
+    batchId: 'batch-csv',
+    parsedUrls: [{
+      originalIndex: 0,
+      url: 'https://source.test/post',
+      sourceDomain: 'source.test',
+      originalRow: ['https://source.test/post', 'large note']
+    }],
+    localResults: []
+  });
+
+  assert.equal(snapshot.parsedUrls[0].originalRow, undefined);
+});
+
+test('buildBatchRuntimeStorageUpdate stores full runtime once and keeps legacy key lightweight', () => {
+  const fullSnapshot = {
+    batchId: 'batch-large',
+    status: 'terminated',
+    totalCount: 4627,
+    currentIndex: 21,
+    parsedUrls: Array.from({ length: 3 }, (_, index) => ({
+      originalIndex: index,
+      url: `https://source.test/${index}`
+    })),
+    localResults: [{ originalIndex: 0, url: 'https://source.test/0', result: 'fail' }],
+    currentPromotionWebsiteKey: 'https://promo.test',
+    updatedAt: Date.now()
+  };
+  const activeTask = {
+    batchId: 'batch-large',
+    status: 'terminated',
+    totalCount: 4627,
+    currentIndex: 21,
+    localResultCount: 21,
+    currentPromotionWebsiteKey: 'https://promo.test'
+  };
+
+  const update = buildBatchRuntimeStorageUpdate({
+    runtimeStateKey: 'batch_runtime_state_v1',
+    promotionStorageKey: 'batch_runtime_state_promotion_v1:https%3A%2F%2Fpromo.test',
+    storageSnapshot: fullSnapshot,
+    activeTask
+  });
+
+  assert.deepEqual(update['batch_runtime_state_v1'], activeTask);
+  assert.equal(update['batch_runtime_state_promotion_v1:https%3A%2F%2Fpromo.test'], fullSnapshot);
 });
 
 test('buildCurrentBatchExportCsv exports a stable current batch result report', () => {
@@ -97,6 +198,7 @@ test('selectCurrentBatchStorageKeysForRemoval only removes storage owned by curr
       },
       batch_pending_task: { batchId: 'batch-b', urlIndex: 3 },
       batchCtx: { batchId: 'batch-a', urlIndex: 1 },
+      batch_active_task_v1: { batchId: 'batch-a' },
       batchSubmitCtx: {
         batchId: 'batch-b',
         promotionWebsiteKey: normalizePromotionWebsiteKey('https://promo-b.test/')
@@ -104,7 +206,7 @@ test('selectCurrentBatchStorageKeysForRemoval only removes storage owned by curr
     }
   });
 
-  assert.deepEqual(keys.sort(), ['batchCtx', 'batchLocalResults'].sort());
+  assert.deepEqual(keys.sort(), ['batchCtx', 'batchLocalResults', 'batch_active_task_v1'].sort());
 });
 
 test('selectCurrentBatchStorageKeysForRemoval can remove current promotion legacy snapshot by owner', () => {
@@ -125,6 +227,127 @@ test('selectCurrentBatchStorageKeysForRemoval can remove current promotion legac
   });
 
   assert.deepEqual(keys.sort(), ['batchSubmitCtx', 'batch_pending_task', 'batch_runtime_state_v1'].sort());
+});
+
+test('shouldRestoreRuntimeAfterPromotionKeyRefresh restores only when idle promotion key changes', () => {
+  const shouldRestore = shouldRestoreRuntimeAfterPromotionKeyRefresh;
+  assert.equal(typeof shouldRestore, 'function');
+
+  assert.equal(shouldRestore({
+    previousPromotionKey: normalizePromotionWebsiteKey('https://promo-a.test/'),
+    nextPromotionKey: normalizePromotionWebsiteKey('https://promo-b.test/'),
+    status: 'idle'
+  }), true);
+
+  assert.equal(shouldRestore({
+    previousPromotionKey: normalizePromotionWebsiteKey('https://promo-a.test/'),
+    nextPromotionKey: normalizePromotionWebsiteKey('https://promo-b.test/'),
+    status: 'running'
+  }), false);
+
+  assert.equal(shouldRestore({
+    previousPromotionKey: normalizePromotionWebsiteKey('https://promo-a.test/'),
+    nextPromotionKey: normalizePromotionWebsiteKey('https://promo-a.test'),
+    status: 'terminated'
+  }), false);
+});
+
+test('selectAssistantProgressSnapshot prefers the current task batch id over legacy snapshot', () => {
+  const snapshot = selectAssistantProgressSnapshot({
+    legacySnapshot: { batchId: 'old-batch', totalCount: 10 },
+    snapshotsByPromotion: {
+      'https://a.test': { batchId: 'batch-a', totalCount: 20 },
+      'https://b.test': { batchId: 'batch-b', totalCount: 30 }
+    },
+    currentBatchId: 'batch-b'
+  });
+
+  assert.equal(snapshot.batchId, 'batch-b');
+  assert.equal(snapshot.totalCount, 30);
+});
+
+test('selectAssistantProgressSnapshot can infer current batch id from pending task context', () => {
+  const snapshot = selectAssistantProgressSnapshot({
+    legacySnapshot: null,
+    snapshotsByPromotion: {
+      'https://a.test': { batchId: 'batch-a', totalCount: 20 }
+    },
+    pendingTask: { batchId: 'batch-a', urlIndex: 1 }
+  });
+
+  assert.equal(snapshot.batchId, 'batch-a');
+});
+
+test('selectAssistantProgressSnapshot can infer current batch id from active task context', () => {
+  const snapshot = selectAssistantProgressSnapshot({
+    legacySnapshot: { batchId: 'old-batch', totalCount: 10 },
+    snapshotsByPromotion: {
+      'https://a.test': { batchId: 'batch-a', totalCount: 20, status: 'running' }
+    },
+    activeTask: { batchId: 'batch-a', promotionWebsiteKey: 'https://a.test' },
+    requireCurrentContext: true
+  });
+
+  assert.equal(snapshot.batchId, 'batch-a');
+  assert.equal(snapshot.totalCount, 20);
+});
+
+test('selectAssistantProgressSnapshot can use active task as lightweight progress snapshot', () => {
+  const snapshot = selectAssistantProgressSnapshot({
+    legacySnapshot: null,
+    snapshotsByPromotion: {},
+    activeTask: {
+      batchId: 'batch-a',
+      status: 'running',
+      totalCount: 20,
+      currentIndex: 3,
+      localResultCount: 2,
+      successCount: 1
+    },
+    requireCurrentContext: true
+  });
+
+  assert.equal(snapshot.batchId, 'batch-a');
+  assert.equal(snapshot.totalCount, 20);
+  assert.equal(snapshot.currentIndex, 3);
+  assert.equal(snapshot.localResultCount, 2);
+});
+
+test('selectAssistantProgressSnapshot does not fall back when active task id is unmatched', () => {
+  const snapshot = selectAssistantProgressSnapshot({
+    legacySnapshot: { batchId: 'old-batch', totalCount: 10 },
+    snapshotsByPromotion: {
+      'https://a.test': { batchId: 'older-batch', totalCount: 20 }
+    },
+    activeTask: { batchId: 'new-batch', promotionWebsiteKey: 'https://a.test' },
+    requireCurrentContext: true
+  });
+
+  assert.equal(snapshot, null);
+});
+
+test('selectAssistantProgressSnapshot does not fall back to stale history when current batch id is unmatched', () => {
+  const snapshot = selectAssistantProgressSnapshot({
+    legacySnapshot: { batchId: 'old-batch', totalCount: 10 },
+    snapshotsByPromotion: {
+      'https://a.test': { batchId: 'older-batch', totalCount: 20 }
+    },
+    currentBatchId: 'new-batch'
+  });
+
+  assert.equal(snapshot, null);
+});
+
+test('selectAssistantProgressSnapshot can require a current task context', () => {
+  const snapshot = selectAssistantProgressSnapshot({
+    legacySnapshot: { batchId: 'old-batch', totalCount: 10 },
+    snapshotsByPromotion: {
+      'https://a.test': { batchId: 'older-batch', totalCount: 20 }
+    },
+    requireCurrentContext: true
+  });
+
+  assert.equal(snapshot, null);
 });
 
 test('chooseAssistantProgressTab switches to progress only before user tab choice', () => {

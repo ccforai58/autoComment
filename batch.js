@@ -24,8 +24,8 @@ let pendingBatchRuntimeSnapshot = null;
 let renderStatsTimer = null;
 let renderStatsLastAt = 0;
 
-function sendLocalDebugLog(source, payload) {
-  if (!AUTO_COMMENT_VERBOSE_LOGS) return;
+function sendLocalDebugLog(source, payload, options = {}) {
+  if (!AUTO_COMMENT_VERBOSE_LOGS && !options.force) return;
   try {
     fetch(`${API_BASE}/debug-log`, {
       method: 'POST',
@@ -34,6 +34,21 @@ function sendLocalDebugLog(source, payload) {
       keepalive: true
     }).catch(() => {});
   } catch (_) {}
+}
+
+function logRuntimeState(stage, details = {}) {
+  const entry = {
+    stage: `runtime.${stage}`,
+    batchId: details.batchId !== undefined ? details.batchId : batchId,
+    status,
+    totalCount,
+    currentIndex,
+    localResultCount: Array.isArray(localResults) ? localResults.length : 0,
+    promotionKey: normalizePromotionWebsiteKey(currentPromotionWebsiteUrl || ''),
+    ...details
+  };
+  console.warn('[batch][runtime-state]', entry);
+  sendLocalDebugLog('batch', entry, { force: true });
 }
 
 function getSemrushImportLogic() {
@@ -208,6 +223,11 @@ function shouldRestoreBatchRuntimeAfterPromotionChangeLocal({ changes, areaName,
   return String(change.oldValue || '') !== String(change.newValue || '');
 }
 
+function getPromotionRuntimeStorageKey(promotionKey) {
+  const key = String(promotionKey || '').trim();
+  return key ? `${BATCH_RUNTIME_STATE_PROMOTION_PREFIX}${encodeURIComponent(key)}` : '';
+}
+
 function resetRuntimeForNewUpload(parsedUrlCount) {
   cancelBatchRuntimePersistTimer();
   if (renderStatsTimer) {
@@ -216,6 +236,7 @@ function resetRuntimeForNewUpload(parsedUrlCount) {
   }
   renderStatsLastAt = 0;
   batchId = null;
+  currentBatchUploadId = generateUUID();
   status = 'idle';
   activeTabCount = 0;
   currentIndex = 0;
@@ -246,6 +267,15 @@ function resetRuntimeForNewUpload(parsedUrlCount) {
   }
   stopTimeoutChecker();
   setStatus('idle');
+  console.info('[batch][runtime] new upload task prepared', {
+    uploadBatchId: currentBatchUploadId,
+    parsedUrlCount: Number(parsedUrlCount || 0)
+  });
+  logRuntimeState('new_upload_prepared', {
+    batchId: currentBatchUploadId,
+    uploadBatchId: currentBatchUploadId,
+    parsedUrlCount: Number(parsedUrlCount || 0)
+  });
 }
 
 function resetRuntimeViewForPromotionSwitch() {
@@ -299,36 +329,131 @@ function resetRuntimeViewForPromotionSwitch() {
   updateUI();
 }
 
-async function restoreRuntimeForActivePromotionChange() {
+async function restoreRuntimeForActivePromotionChange(options = {}) {
+  if (stopBatchInProgress) {
+    pendingPromotionRestoreAfterStop = true;
+    logRuntimeState('restore_deferred_stop_in_progress', {
+      pendingPromotionRestoreAfterStop: true
+    });
+    console.info('[batch][runtime-switch] defer restore while stop is still saving', {
+      batchId,
+      status,
+      totalCount,
+      resultCount: localResults.length,
+      promotionKey: normalizePromotionWebsiteKey(currentPromotionWebsiteUrl || '')
+    });
+    return;
+  }
   if (status === 'running') {
+    logRuntimeState('restore_ignored_running');
     console.info('[batch][runtime] ignored promotion change while running', { batchId });
     return;
   }
+  const runId = ++promotionRestoreRunId;
+  const skipPreRestoreFlush = !!options.skipPreRestoreFlush;
+  if (!skipPreRestoreFlush && batchId && totalCount > 0) {
+    logRuntimeState('restore_flush_before_switch', { runId });
+    console.info('[batch][runtime-switch] flush before promotion restore', {
+      runId,
+      batchId,
+      status,
+      totalCount,
+      resultCount: localResults.length,
+      promotionKey: normalizePromotionWebsiteKey(currentPromotionWebsiteUrl || '')
+    });
+    await persistBatchRuntimeState({ immediate: true });
+  } else if (skipPreRestoreFlush) {
+    logRuntimeState('restore_skip_pre_flush', {
+      runId,
+      reason: options.reason || ''
+    });
+    console.info('[batch][runtime-switch] skip pre-restore flush', {
+      runId,
+      batchId,
+      status,
+      totalCount,
+      resultCount: localResults.length,
+      reason: options.reason || ''
+    });
+  }
   resetRuntimeViewForPromotionSwitch();
   await refreshSetupSummary();
+  if (runId !== promotionRestoreRunId) return;
   await renderArchive();
-  await restoreBatchRuntimeState();
+  if (runId !== promotionRestoreRunId) return;
+  await restoreBatchRuntimeState({
+    shouldContinue: () => runId === promotionRestoreRunId
+  });
+  if (runId !== promotionRestoreRunId) return;
   updateUI();
 }
 
-function clearRuntimeStorageForNewUpload() {
+async function clearRuntimeStorageForNewUpload(options = {}) {
   try {
-    chrome.storage.local.remove([
+    const promotionKey = options.promotionKey || normalizePromotionWebsiteKey(options.promotionWebsiteUrl || currentPromotionWebsiteUrl || '');
+    const promotionStorageKey = promotionKey && promotionKey !== '__unconfigured__'
+      ? getPromotionRuntimeStorageKey(promotionKey)
+      : '';
+    const keysToRemove = [
       BATCH_RUNTIME_STATE_KEY,
+      BATCH_ACTIVE_TASK_KEY,
       BATCH_PENDING_TASK_KEY,
       'batchCtx',
       'batchSubmitCtx',
       AI_REUSE_STATE_STORAGE_KEY
-    ], () => {
-      console.log('[batch][runtime] cleared previous runtime state for new upload');
+    ];
+    if (promotionStorageKey) keysToRemove.push(promotionStorageKey);
+
+    logRuntimeState('clear_new_upload_start', {
+      promotionKey,
+      promotionStorageKey,
+      removedKeys: keysToRemove
+    });
+    console.info('[batch][runtime] clear previous runtime state start', {
+      promotionKey,
+      promotionStorageKey,
+      removedKeys: keysToRemove
+    });
+
+    await new Promise((resolve) => {
+      chrome.storage.local.get([BATCH_RUNTIME_STATE_BY_PROMOTION_KEY], (data) => {
+        const snapshotsByPromotion = data && data[BATCH_RUNTIME_STATE_BY_PROMOTION_KEY] && typeof data[BATCH_RUNTIME_STATE_BY_PROMOTION_KEY] === 'object'
+          ? { ...data[BATCH_RUNTIME_STATE_BY_PROMOTION_KEY] }
+          : {};
+        if (promotionKey && promotionKey !== '__unconfigured__') {
+          delete snapshotsByPromotion[promotionKey];
+        }
+        chrome.storage.local.set({ [BATCH_RUNTIME_STATE_BY_PROMOTION_KEY]: snapshotsByPromotion }, () => {
+          chrome.storage.local.remove(keysToRemove, () => {
+            const error = chrome.runtime && chrome.runtime.lastError ? chrome.runtime.lastError.message : '';
+            console.log('[batch][runtime] cleared previous runtime state for new upload', {
+              promotionKey,
+              promotionStorageKey,
+              removedKeys: keysToRemove,
+              error
+            });
+            logRuntimeState('clear_new_upload_done', {
+              promotionKey,
+              promotionStorageKey,
+              removedKeys: keysToRemove,
+              error
+            });
+            resolve();
+          });
+        });
+      });
     });
   } catch (error) {
+    logRuntimeState('clear_new_upload_failed', {
+      message: error && error.message ? error.message : String(error)
+    });
     console.warn('[batch][runtime] failed to clear previous runtime state:', error);
   }
 }
 
 // ==================== section ====================
 let batchId = null;
+let currentBatchUploadId = '';
 let userId = null;
 let parsedUrls = [];                // [{originalIndex, url}]
 let status = 'idle';                // idle | running | completed
@@ -479,6 +604,9 @@ let archiveBacklinkCheckState = {
   total: 0,
   startedAt: 0
 };
+let promotionRestoreRunId = 0;
+let stopBatchInProgress = false;
+let pendingPromotionRestoreAfterStop = false;
 
 // Text cleanup: previous comment was mojibake.
 const batchAutoOpenPanel = document.getElementById('batchAutoOpenPanel');
@@ -491,6 +619,8 @@ const BATCH_URLS_KEY = 'batch_task_urls';
 const BATCH_PENDING_TASK_KEY = 'batch_pending_task';
 const BATCH_RUNTIME_STATE_KEY = 'batch_runtime_state_v1';
 const BATCH_RUNTIME_STATE_BY_PROMOTION_KEY = 'batch_runtime_state_by_promotion_v1';
+const BATCH_RUNTIME_STATE_PROMOTION_PREFIX = 'batch_runtime_state_promotion_v1:';
+const BATCH_ACTIVE_TASK_KEY = 'batch_active_task_v1';
 const WEBSITE_URL_STORAGE_KEY = 'promotion_website_url';
 const WEBSITE_CONTENT_STORAGE_KEY = 'promotion_website_content';
 const PROMPT_FIELD_VALUES_STORAGE_KEY = 'auto_fill_prompt_field_values';
@@ -927,6 +1057,17 @@ function bindEvents() {
   if (chrome.storage && chrome.storage.onChanged) {
     chrome.storage.onChanged.addListener((changes, areaName) => {
       if (!shouldRestoreBatchRuntimeAfterPromotionChangeLocal({ changes, areaName, status })) return;
+      const change = changes[CURRENT_PROMOTION_PROJECT_ID_KEY] || {};
+      console.info('[batch][runtime-switch] promotion project changed', {
+        oldProjectId: change.oldValue || '',
+        newProjectId: change.newValue || '',
+        status,
+        stopBatchInProgress,
+        batchId,
+        totalCount,
+        resultCount: localResults.length,
+        promotionKey: normalizePromotionWebsiteKey(currentPromotionWebsiteUrl || '')
+      });
       restoreRuntimeForActivePromotionChange().catch((error) => {
         console.warn('[batch][runtime] restore after promotion change failed:', {
           message: error && error.message ? error.message : String(error)
@@ -1036,8 +1177,49 @@ function bindEvents() {
 }
 
 async function refreshWorkbenchConfig() {
+  const previousPromotionKey = normalizePromotionWebsiteKey(currentPromotionWebsiteUrl || '');
+  const shouldPreservePreviousRuntime = status !== 'running' && batchId && totalCount > 0;
+  if (shouldPreservePreviousRuntime) {
+    logRuntimeState('setup_refresh_preserve_before', {
+      previousPromotionKey
+    });
+    console.info('[batch][runtime-switch] preserve before setup refresh', {
+      batchId,
+      status,
+      totalCount,
+      resultCount: localResults.length,
+      previousPromotionKey
+    });
+    await persistBatchRuntimeState({ immediate: true });
+  }
   await loadUserId();
   await refreshSetupSummary();
+  const nextPromotionKey = normalizePromotionWebsiteKey(currentPromotionWebsiteUrl || '');
+  const logic = getBatchResultsLogic();
+  const shouldRestore = logic && typeof logic.shouldRestoreRuntimeAfterPromotionKeyRefresh === 'function'
+    ? logic.shouldRestoreRuntimeAfterPromotionKeyRefresh({ previousPromotionKey, nextPromotionKey, status })
+    : (status !== 'running' && previousPromotionKey && nextPromotionKey && previousPromotionKey !== nextPromotionKey && nextPromotionKey !== '__unconfigured__');
+  console.info('[batch][runtime-switch] setup refresh checked promotion key', {
+    previousPromotionKey,
+    nextPromotionKey,
+    status,
+    batchId,
+    totalCount,
+    resultCount: localResults.length,
+    shouldRestore
+  });
+  logRuntimeState('setup_refresh_checked_promotion_key', {
+    previousPromotionKey,
+    nextPromotionKey,
+    shouldRestore,
+    shouldPreservePreviousRuntime
+  });
+  if (shouldRestore) {
+    await restoreRuntimeForActivePromotionChange({
+      skipPreRestoreFlush: shouldPreservePreviousRuntime,
+      reason: 'setup_refresh_promotion_changed'
+    });
+  }
   await loadPoints();
 }
 
@@ -1145,8 +1327,8 @@ function processFile(file) {
   }
 
   const reader = new FileReader();
-  reader.onload = (e) => {
-    parseCSV(e.target.result, file.name);
+  reader.onload = async (e) => {
+    await parseCSV(e.target.result, file.name);
   };
   reader.onerror = () => {
     alert('文件读取失败');
@@ -1220,7 +1402,7 @@ function normalizeEncoding(arrayBuffer) {
   return utf8Text;
 }
 
-function parseCSV(raw, fileNameParam) {
+async function parseCSV(raw, fileNameParam) {
   const text = normalizeEncoding(raw);
   const lines = text.split(/\r?\n/).filter((line) => line.trim());
   if (lines.length < 2) {
@@ -1336,8 +1518,12 @@ function parseCSV(raw, fileNameParam) {
   }
   updateCostHint(Math.max(0, validCount - illegalCount));
   if (validCount > 0) {
+    if (startBtn) startBtn.disabled = true;
+    const uploadPromotionKey = normalizePromotionWebsiteKey(
+      currentPromotionWebsiteUrl || (currentPromotionProject && currentPromotionProject.targetUrl) || ''
+    );
+    await clearRuntimeStorageForNewUpload({ promotionKey: uploadPromotionKey });
     resetRuntimeForNewUpload(parsedUrls.length);
-    clearRuntimeStorageForNewUpload();
   }
   updateStatsUI();
   updateUI();
@@ -1426,8 +1612,12 @@ async function processSemrushFile(file) {
     if (semrushUploadZone) semrushUploadZone.classList.add('has-file');
     fileCount.textContent = logic.buildSemrushImportSummary(result.stats);
     updateCostHint(parsedUrls.length);
+    if (startBtn) startBtn.disabled = true;
+    const uploadPromotionKey = normalizePromotionWebsiteKey(
+      currentPromotionWebsiteUrl || (currentPromotionProject && currentPromotionProject.targetUrl) || ''
+    );
+    await clearRuntimeStorageForNewUpload({ promotionKey: uploadPromotionKey });
     resetRuntimeForNewUpload(parsedUrls.length);
-    clearRuntimeStorageForNewUpload();
     updateStatsUI();
     updateUI();
     setSemrushImportStatus('导入完成');
@@ -1585,7 +1775,8 @@ async function startBatch() {
   }
   currentPromotionWebsiteUrl = currentPromotionProject.targetUrl;
   initialPoints = parseInt(pointsBalance.textContent || '0', 10);
-  batchId = generateUUID();
+  batchId = currentBatchUploadId || generateUUID();
+  currentBatchUploadId = batchId;
   totalCount = parsedUrls.length;
   batchStartedAt = Date.now();
   successCount = 0;
@@ -1602,7 +1793,12 @@ async function startBatch() {
   setStatus('running');
   updateUI();
   updateStatsUI();
-  persistBatchRuntimeState({ immediate: true });
+  logRuntimeState('start_batch', {
+    batchId,
+    promotionProjectId: currentPromotionProject && currentPromotionProject.id ? currentPromotionProject.id : null,
+    promotionKey: normalizePromotionWebsiteKey(currentPromotionWebsiteUrl || '')
+  });
+  await persistBatchRuntimeState({ immediate: true });
 
   // Text cleanup: previous comment was mojibake.
   openNextTabSync();
@@ -1643,6 +1839,20 @@ async function clearBatchTaskSettings() {
 let isTerminated = false;
 
 async function stopBatch() {
+  stopBatchInProgress = true;
+  logRuntimeState('stop_start', {
+    activeTabCount,
+    pendingPromotionRestoreAfterStop
+  });
+  console.info('[batch][runtime-switch] stop start', {
+    batchId,
+    status,
+    totalCount,
+    currentIndex,
+    resultCount: localResults.length,
+    activeTabCount,
+    promotionKey: normalizePromotionWebsiteKey(currentPromotionWebsiteUrl || '')
+  });
   // Text cleanup: previous comment was mojibake.
   isTerminated = true;
   setStatus('terminated');
@@ -1682,10 +1892,33 @@ async function stopBatch() {
   // Text cleanup: previous comment was mojibake.
   updateStatsUI();
   updateUI();
-  persistBatchRuntimeState({ immediate: true });
+  await persistBatchRuntimeState({ immediate: true });
 
   // Text cleanup: previous comment was mojibake.
   console.log(`[batch] Manually stopped. Kept ${localResults.length} result(s), success ${successCount}, fail ${failCount}, skipped ${terminatedCount} pending item(s).`);
+  console.info('[batch][runtime-switch] stop saved', {
+    batchId,
+    status,
+    totalCount,
+    currentIndex,
+    resultCount: localResults.length,
+    pendingPromotionRestoreAfterStop,
+    promotionKey: normalizePromotionWebsiteKey(currentPromotionWebsiteUrl || '')
+  });
+  logRuntimeState('stop_saved', {
+    pendingPromotionRestoreAfterStop,
+    activeTabCount
+  });
+  stopBatchInProgress = false;
+  if (pendingPromotionRestoreAfterStop) {
+    pendingPromotionRestoreAfterStop = false;
+    console.info('[batch][runtime-switch] run deferred restore after stop');
+    restoreRuntimeForActivePromotionChange().catch((error) => {
+      console.warn('[batch][runtime-switch] deferred restore failed:', {
+        message: error && error.message ? error.message : String(error)
+      });
+    });
+  }
 }
 
 // Text cleanup: previous comment was mojibake.
@@ -2347,8 +2580,7 @@ function persistBatchRuntimeState(options = {}) {
   pendingBatchRuntimeSnapshot = snapshot;
   if (options.immediate) {
     cancelBatchRuntimePersistTimer();
-    writeBatchRuntimeSnapshot(snapshot);
-    return;
+    return writeBatchRuntimeSnapshot(snapshot);
   }
   if (batchRuntimePersistTimer) return;
   batchRuntimePersistTimer = setTimeout(() => {
@@ -2357,28 +2589,133 @@ function persistBatchRuntimeState(options = {}) {
     pendingBatchRuntimeSnapshot = null;
     writeBatchRuntimeSnapshot(nextSnapshot);
   }, BATCH_RUNTIME_PERSIST_DELAY_MS);
+  return Promise.resolve();
+}
+
+function getApproxJsonBytes(value) {
+  try {
+    return JSON.stringify(value).length;
+  } catch (_) {
+    return 0;
+  }
 }
 
 function writeBatchRuntimeSnapshot(snapshot) {
-  const promotionKey = snapshot.currentPromotionWebsiteKey || normalizePromotionWebsiteKey(snapshot.currentPromotionWebsiteUrl || '');
-  chrome.storage.local.get([BATCH_RUNTIME_STATE_BY_PROMOTION_KEY], (data) => {
-    const snapshotsByPromotion = data && data[BATCH_RUNTIME_STATE_BY_PROMOTION_KEY] && typeof data[BATCH_RUNTIME_STATE_BY_PROMOTION_KEY] === 'object'
-      ? data[BATCH_RUNTIME_STATE_BY_PROMOTION_KEY]
-      : {};
-    if (promotionKey && promotionKey !== '__unconfigured__') {
-      snapshotsByPromotion[promotionKey] = snapshot;
-    }
-    chrome.storage.local.set({
-      [BATCH_RUNTIME_STATE_KEY]: snapshot,
-      [BATCH_RUNTIME_STATE_BY_PROMOTION_KEY]: snapshotsByPromotion
-    }, () => {
+  const logic = getBatchResultsLogic();
+  const storageSnapshot = logic && typeof logic.compactBatchRuntimeSnapshotForStorage === 'function'
+    ? logic.compactBatchRuntimeSnapshotForStorage(snapshot)
+    : snapshot;
+  const promotionKey = storageSnapshot.currentPromotionWebsiteKey || normalizePromotionWebsiteKey(storageSnapshot.currentPromotionWebsiteUrl || '');
+  const activeTask = snapshot.batchId ? {
+    batchId: snapshot.batchId,
+    status: snapshot.status,
+    totalCount: snapshot.totalCount || 0,
+    currentIndex: snapshot.currentIndex || 0,
+    localResultCount: snapshot.localResultCount || 0,
+    successCount: snapshot.successCount || 0,
+    failCount: snapshot.failCount || 0,
+    skippedCount: snapshot.skippedCount || 0,
+    noCommentBoxCount: snapshot.noCommentBoxCount || 0,
+    manualRequiredCount: snapshot.manualRequiredCount || 0,
+    blockedIllegalCount: snapshot.blockedIllegalCount || 0,
+    pendingCount: snapshot.pendingCount || 0,
+    currentPromotionWebsiteUrl: snapshot.currentPromotionWebsiteUrl || '',
+    currentPromotionWebsiteKey: promotionKey,
+    currentPromotionProjectId: snapshot.currentPromotionProjectId || null,
+    batchStartedAt: snapshot.batchStartedAt || 0,
+    updatedAt: snapshot.updatedAt || Date.now()
+  } : null;
+  if (activeTask) {
+    chrome.storage.local.set({ [BATCH_ACTIVE_TASK_KEY]: activeTask }, () => {
+      const error = chrome.runtime && chrome.runtime.lastError ? chrome.runtime.lastError.message : '';
+      if (error) {
+        console.warn('[batch][runtime] failed to save active task', {
+          batchId: activeTask.batchId,
+          error
+        });
+      }
+    });
+  }
+  const promotionStorageKey = promotionKey && promotionKey !== '__unconfigured__'
+    ? getPromotionRuntimeStorageKey(promotionKey)
+    : '';
+  const storageUpdate = logic && typeof logic.buildBatchRuntimeStorageUpdate === 'function'
+    ? logic.buildBatchRuntimeStorageUpdate({
+      runtimeStateKey: BATCH_RUNTIME_STATE_KEY,
+      promotionStorageKey,
+      storageSnapshot,
+      activeTask
+    })
+    : {
+      [BATCH_RUNTIME_STATE_KEY]: promotionStorageKey && activeTask ? activeTask : storageSnapshot,
+      ...(promotionStorageKey ? { [promotionStorageKey]: storageSnapshot } : {})
+    };
+  const snapshotBytes = getApproxJsonBytes(storageSnapshot);
+  logRuntimeState('save_full_snapshot_request', {
+    batchId: snapshot.batchId,
+    snapshotStatus: snapshot.status,
+    promotionKey,
+    promotionStorageKey,
+    snapshotTotalCount: storageSnapshot.totalCount,
+    parsedUrlCount: Array.isArray(storageSnapshot.parsedUrls) ? storageSnapshot.parsedUrls.length : 0,
+    resultCount: storageSnapshot.localResultCount || (Array.isArray(storageSnapshot.localResults) ? storageSnapshot.localResults.length : 0),
+    approxBytes: snapshotBytes
+  });
+  console.info('[batch][runtime-switch] save full snapshot request', {
+    batchId: snapshot.batchId,
+    status: snapshot.status,
+    promotionKey,
+    promotionStorageKey,
+    totalCount: storageSnapshot.totalCount,
+    parsedUrlCount: Array.isArray(storageSnapshot.parsedUrls) ? storageSnapshot.parsedUrls.length : 0,
+    resultCount: storageSnapshot.localResultCount || (Array.isArray(storageSnapshot.localResults) ? storageSnapshot.localResults.length : 0),
+    approxBytes: snapshotBytes
+  });
+  return new Promise((resolve) => {
+    chrome.storage.local.set(storageUpdate, () => {
+      const error = chrome.runtime && chrome.runtime.lastError ? chrome.runtime.lastError.message : '';
+      if (error) {
+        logRuntimeState('save_full_snapshot_failed', {
+          batchId: snapshot.batchId,
+          promotionKey,
+          promotionStorageKey,
+          snapshotTotalCount: storageSnapshot.totalCount,
+          parsedUrlCount: Array.isArray(storageSnapshot.parsedUrls) ? storageSnapshot.parsedUrls.length : 0,
+          resultCount: storageSnapshot.localResultCount || (Array.isArray(storageSnapshot.localResults) ? storageSnapshot.localResults.length : 0),
+          approxBytes: snapshotBytes,
+          error
+        });
+        console.warn('[batch][runtime] failed to save full snapshot', {
+          batchId: snapshot.batchId,
+          promotionKey,
+          promotionStorageKey,
+          totalCount: storageSnapshot.totalCount,
+          parsedUrlCount: Array.isArray(storageSnapshot.parsedUrls) ? storageSnapshot.parsedUrls.length : 0,
+          resultCount: storageSnapshot.localResultCount || (Array.isArray(storageSnapshot.localResults) ? storageSnapshot.localResults.length : 0),
+          approxBytes: snapshotBytes,
+          error
+        });
+        resolve({ success: false, error });
+        return;
+      }
       console.log('[batch][runtime] saved', {
         batchId: snapshot.batchId,
         status: snapshot.status,
         promotionKey,
+        promotionStorageKey,
         currentIndex: snapshot.currentIndex,
         resultCount: snapshot.localResultCount || snapshot.localResults.length
       });
+      logRuntimeState('save_full_snapshot_success', {
+        batchId: snapshot.batchId,
+        snapshotStatus: snapshot.status,
+        promotionKey,
+        promotionStorageKey,
+        snapshotTotalCount: storageSnapshot.totalCount,
+        parsedUrlCount: Array.isArray(storageSnapshot.parsedUrls) ? storageSnapshot.parsedUrls.length : 0,
+        resultCount: snapshot.localResultCount || snapshot.localResults.length
+      });
+      resolve({ success: true });
     });
   });
 }
@@ -2390,8 +2727,14 @@ function isFreshBatchRuntimeSnapshot(snapshot, now = Date.now(), maxAgeMs = 24 *
   return !!updatedAt && now - updatedAt <= maxAgeMs;
 }
 
-function selectBatchRuntimeSnapshotForCurrentPromotion({ legacySnapshot, snapshotsByPromotion, currentPromotionWebsiteUrl }) {
+function selectBatchRuntimeSnapshotForCurrentPromotion({ legacySnapshot, promotionSnapshot, snapshotsByPromotion, currentPromotionWebsiteUrl }) {
   const currentKey = normalizePromotionWebsiteKey(currentPromotionWebsiteUrl || '');
+  if (currentKey && currentKey !== '__unconfigured__' && isFreshBatchRuntimeSnapshot(promotionSnapshot)) {
+    const promotionSnapshotKey = normalizePromotionWebsiteKey(promotionSnapshot.currentPromotionWebsiteUrl || '');
+    if (!promotionSnapshotKey || promotionSnapshotKey === currentKey) {
+      return { snapshot: promotionSnapshot, reason: 'promotion_storage_key' };
+    }
+  }
   const map = snapshotsByPromotion && typeof snapshotsByPromotion === 'object' ? snapshotsByPromotion : {};
   if (currentKey && currentKey !== '__unconfigured__' && isFreshBatchRuntimeSnapshot(map[currentKey])) {
     return { snapshot: map[currentKey], reason: 'promotion_snapshot' };
@@ -2427,20 +2770,63 @@ function renderParsedUrlPreviewFromState() {
   }
 }
 
-async function restoreBatchRuntimeState() {
+async function restoreBatchRuntimeState(options = {}) {
   await loadCurrentPromotionProject({ createFromLegacy: false }).catch(() => null);
+  if (options.shouldContinue && !options.shouldContinue()) return false;
   const activePromotionWebsiteUrl = currentPromotionWebsiteUrl || '';
-  const data = await new Promise((resolve) => chrome.storage.local.get([BATCH_RUNTIME_STATE_KEY, BATCH_RUNTIME_STATE_BY_PROMOTION_KEY], resolve));
+  const activePromotionKey = normalizePromotionWebsiteKey(activePromotionWebsiteUrl || '');
+  const promotionStorageKey = getPromotionRuntimeStorageKey(activePromotionKey);
+  const storageKeys = [
+    BATCH_RUNTIME_STATE_KEY,
+    BATCH_RUNTIME_STATE_BY_PROMOTION_KEY
+  ];
+  if (promotionStorageKey) storageKeys.push(promotionStorageKey);
+  const data = await new Promise((resolve) => chrome.storage.local.get(storageKeys, resolve));
+  if (options.shouldContinue && !options.shouldContinue()) return false;
+  console.info('[batch][runtime-switch] restore read storage', {
+    activePromotionKey,
+    activePromotionWebsiteUrl,
+    status,
+    promotionStorageKey,
+    hasPromotionSnapshot: !!(promotionStorageKey && data[promotionStorageKey]),
+    promotionSnapshotBatchId: promotionStorageKey && data[promotionStorageKey] ? data[promotionStorageKey].batchId : '',
+    promotionSnapshotTotal: promotionStorageKey && data[promotionStorageKey] ? data[promotionStorageKey].totalCount : 0,
+    promotionSnapshotUpdatedAt: promotionStorageKey && data[promotionStorageKey] ? data[promotionStorageKey].updatedAt : 0,
+    hasLegacySnapshot: !!data[BATCH_RUNTIME_STATE_KEY],
+    legacyBatchId: data[BATCH_RUNTIME_STATE_KEY] && data[BATCH_RUNTIME_STATE_KEY].batchId,
+    legacyPromotionKey: data[BATCH_RUNTIME_STATE_KEY] && data[BATCH_RUNTIME_STATE_KEY].currentPromotionWebsiteKey,
+    hasLegacyMap: !!data[BATCH_RUNTIME_STATE_BY_PROMOTION_KEY]
+  });
+  logRuntimeState('restore_read_storage', {
+    activePromotionKey,
+    activePromotionWebsiteUrl,
+    promotionStorageKey,
+    hasPromotionSnapshot: !!(promotionStorageKey && data[promotionStorageKey]),
+    promotionSnapshotBatchId: promotionStorageKey && data[promotionStorageKey] ? data[promotionStorageKey].batchId : '',
+    promotionSnapshotTotal: promotionStorageKey && data[promotionStorageKey] ? data[promotionStorageKey].totalCount : 0,
+    promotionSnapshotUpdatedAt: promotionStorageKey && data[promotionStorageKey] ? data[promotionStorageKey].updatedAt : 0,
+    hasLegacySnapshot: !!data[BATCH_RUNTIME_STATE_KEY],
+    legacyBatchId: data[BATCH_RUNTIME_STATE_KEY] && data[BATCH_RUNTIME_STATE_KEY].batchId,
+    legacyPromotionKey: data[BATCH_RUNTIME_STATE_KEY] && data[BATCH_RUNTIME_STATE_KEY].currentPromotionWebsiteKey,
+    hasLegacyMap: !!data[BATCH_RUNTIME_STATE_BY_PROMOTION_KEY]
+  });
   const selection = selectBatchRuntimeSnapshotForCurrentPromotion({
     legacySnapshot: data[BATCH_RUNTIME_STATE_KEY],
+    promotionSnapshot: promotionStorageKey ? data[promotionStorageKey] : null,
     snapshotsByPromotion: data[BATCH_RUNTIME_STATE_BY_PROMOTION_KEY],
     currentPromotionWebsiteUrl: activePromotionWebsiteUrl
   });
   const snapshot = selection.snapshot;
   if (!snapshot) {
+    logRuntimeState('restore_skipped', {
+      reason: selection.reason,
+      activePromotionKey,
+      promotionStorageKey
+    });
     console.info('[batch][runtime] skipped restore', {
       reason: selection.reason,
-      activePromotionKey: normalizePromotionWebsiteKey(activePromotionWebsiteUrl || '')
+      activePromotionKey,
+      promotionStorageKey
     });
     return false;
   }
@@ -2481,6 +2867,15 @@ async function restoreBatchRuntimeState() {
     promotionKey: normalizePromotionWebsiteKey(currentPromotionWebsiteUrl || ''),
     totalCount,
     resultCount: localResults.length,
+    persistedResultCount: snapshot.localResultCount || localResults.length
+  });
+  logRuntimeState('restore_success', {
+    restoredBatchId: batchId,
+    restoredStatus: status,
+    reason: selection.reason,
+    promotionKey: normalizePromotionWebsiteKey(currentPromotionWebsiteUrl || ''),
+    restoredTotalCount: totalCount,
+    restoredResultCount: localResults.length,
     persistedResultCount: snapshot.localResultCount || localResults.length
   });
   return true;
@@ -2775,6 +3170,7 @@ async function renderArchive() {
     const sourceUrl = record.sourceUrl || '';
     const shortSource = sourceUrl.length > 46 ? sourceUrl.substring(0, 43) + '...' : sourceUrl;
     const aiText = record.aiContent || '';
+    const aiDisplayText = formatAiContentForDisplay(aiText);
     const shortBatch = record.batchId ? String(record.batchId).slice(0, 8) : '--';
 	    const display = getResultDisplayLocal(record);
 	    const latestBacklinkDisplay = getLatestBacklinkStatusDisplayLocal(record);
@@ -2789,7 +3185,7 @@ async function renderArchive() {
       <td><span class="result-badge ${latestBacklinkDisplay.cssClass}" title="${escapeHtml(latestBacklinkDisplay.title || record.latestBacklinkReason || '')}">${escapeHtml(latestBacklinkDisplay.text)}</span></td>
 	      <td style="font-size:11px;color:#9ca3af;white-space:nowrap;" title="${escapeHtml(record.latestBacklinkCheckedAt || record.timestamp || '')}">${escapeHtml(latestBacklinkTime)}</td>
       <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(record.errorMessage || '')}">${escapeHtml(record.errorMessage || '--')}</td>
-	      <td class="ai-content-cell" title="${escapeHtml(aiText)}">${escapeHtml(aiText || '--')}</td>
+	      <td class="ai-content-cell" title="${escapeHtml(aiDisplayText)}">${escapeHtml(aiDisplayText || '--')}</td>
 	      <td style="font-size:11px;color:#9ca3af;white-space:nowrap;" title="${escapeHtml(record.batchId || '')}">${escapeHtml(shortBatch)}</td>
 	    `;
     attachManualReviewTargetCell(tr.children[2], record, 'archive', tr);
@@ -4012,7 +4408,7 @@ async function clearBatch() {
   let removedStorageKeys = [];
   if (logic && typeof logic.selectCurrentBatchStorageKeysForRemoval === 'function') {
     const currentBatchStorageData = await new Promise((resolve) => {
-      chrome.storage.local.get(['batchLocalResults', BATCH_RUNTIME_STATE_KEY, BATCH_PENDING_TASK_KEY, 'batchCtx', 'batchSubmitCtx'], resolve);
+      chrome.storage.local.get(['batchLocalResults', BATCH_RUNTIME_STATE_KEY, BATCH_PENDING_TASK_KEY, BATCH_ACTIVE_TASK_KEY, 'batchCtx', 'batchSubmitCtx'], resolve);
     });
     removedStorageKeys = logic.selectCurrentBatchStorageKeysForRemoval({
       batchId: currentBatchId,
@@ -4024,6 +4420,11 @@ async function clearBatch() {
         chrome.storage.local.remove(removedStorageKeys, resolve);
       });
     }
+  }
+  const promotionStorageKey = getPromotionRuntimeStorageKey(clearedPromotionKey);
+  if (promotionStorageKey) {
+    await new Promise((resolve) => chrome.storage.local.remove([promotionStorageKey], resolve));
+    removedStorageKeys.push(promotionStorageKey);
   }
   console.log('[batch][results] cleared current batch', {
     batchId: currentBatchId,
@@ -4304,9 +4705,10 @@ function renderStatsImpl() {
 
     const aiCell = document.createElement('td');
     if (r.aiContent) {
+      const aiDisplayText = formatAiContentForDisplay(r.aiContent);
       aiCell.className = 'ai-content-cell';
-      aiCell.textContent = r.aiContent;
-      aiCell.title = r.aiContent;
+      aiCell.textContent = aiDisplayText;
+      aiCell.title = aiDisplayText;
       aiCell.addEventListener('click', () => {
         aiCell.classList.toggle('expanded');
       });
@@ -4560,6 +4962,10 @@ function escapeHtml(str) {
   const div = document.createElement('div');
   div.textContent = str;
   return div.innerHTML;
+}
+
+function formatAiContentForDisplay(value) {
+  return String(value || '').replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/\n/g, '\\n');
 }
 
 function formatTime(date) {

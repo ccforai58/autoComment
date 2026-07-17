@@ -1244,6 +1244,8 @@
   const BATCH_URLS_KEY = 'batch_task_urls';
   const BATCH_PENDING_TASK_KEY = 'batch_pending_task';
   const BATCH_RUNTIME_STATE_KEY = 'batch_runtime_state_v1';
+  const BATCH_RUNTIME_STATE_BY_PROMOTION_KEY = 'batch_runtime_state_by_promotion_v1';
+  const BATCH_ACTIVE_TASK_KEY = 'batch_active_task_v1';
 
   // ====== 积分系统配置 ======
   const POINTS_API_BASE = API_BASE;
@@ -5764,6 +5766,56 @@
     return rest > 0 ? `约 ${hours} 小时 ${rest} 分钟后` : `约 ${hours} 小时后`;
   }
 
+  function isPlainObjectLocal(value) {
+    return !!value && typeof value === 'object' && !Array.isArray(value);
+  }
+
+  function isBatchRuntimeSnapshotLocal(value) {
+    return isPlainObjectLocal(value) && (!!value.batchId || Number.isFinite(Number(value.totalCount)));
+  }
+
+  function isLightweightProgressSnapshotLocal(value) {
+    return isBatchRuntimeSnapshotLocal(value) && Number.isFinite(Number(value.totalCount));
+  }
+
+  function collectBatchRuntimeSnapshotsLocal(input) {
+    const source = input && typeof input === 'object' ? input : {};
+    const snapshots = [];
+    if (isBatchRuntimeSnapshotLocal(source.legacySnapshot)) snapshots.push(source.legacySnapshot);
+    const snapshotsByPromotion = isPlainObjectLocal(source.snapshotsByPromotion) ? source.snapshotsByPromotion : {};
+    for (const snapshot of Object.values(snapshotsByPromotion)) {
+      if (isBatchRuntimeSnapshotLocal(snapshot)) snapshots.push(snapshot);
+    }
+    if (isLightweightProgressSnapshotLocal(source.activeTask)) snapshots.push(source.activeTask);
+    return snapshots;
+  }
+
+  function getBatchIdFromContextLocal(value) {
+    return isPlainObjectLocal(value) && value.batchId ? String(value.batchId) : '';
+  }
+
+  function selectAssistantProgressSnapshotLocal(input) {
+    const source = input && typeof input === 'object' ? input : {};
+    const snapshots = collectBatchRuntimeSnapshotsLocal(source);
+    const contextBatchId = String(source.currentBatchId || '')
+      || getBatchIdFromContextLocal(source.batchSubmitCtx)
+      || getBatchIdFromContextLocal(source.pendingTask)
+      || getBatchIdFromContextLocal(source.activeTask)
+      || getBatchIdFromContextLocal(source.batchCtx);
+
+    if (contextBatchId) {
+      const matched = snapshots.find((snapshot) => String(snapshot.batchId || '') === contextBatchId);
+      if (matched) return matched;
+      return null;
+    }
+
+    if (source.requireCurrentContext === true) return null;
+    if (isBatchRuntimeSnapshotLocal(source.legacySnapshot)) return source.legacySnapshot;
+    return snapshots
+      .slice()
+      .sort((a, b) => Number(b.updatedAt || 0) - Number(a.updatedAt || 0))[0] || null;
+  }
+
   function buildCompactBatchProgressLocal(snapshot, now = Date.now()) {
     if (!snapshot || typeof snapshot !== 'object' || (!snapshot.batchId && !snapshot.totalCount)) {
       return { isBatch: false };
@@ -6117,10 +6169,37 @@
 
     async function refreshBatchProgressPane() {
       if (!qwenPanelEl || !qwenPanelEl.parentNode || typeof chrome === 'undefined' || !chrome.storage || !chrome.storage.local) return;
-      const data = await new Promise((resolve) => chrome.storage.local.get([BATCH_RUNTIME_STATE_KEY, AI_REUSE_STATE_STORAGE_KEY], resolve));
-      const progress = buildCompactBatchProgressLocal(data[BATCH_RUNTIME_STATE_KEY]);
+      const data = await new Promise((resolve) => chrome.storage.local.get([
+        BATCH_RUNTIME_STATE_KEY,
+        BATCH_RUNTIME_STATE_BY_PROMOTION_KEY,
+        AI_REUSE_STATE_STORAGE_KEY,
+        BATCH_PENDING_TASK_KEY,
+        BATCH_ACTIVE_TASK_KEY,
+        'batchSubmitCtx',
+        'batchCtx'
+      ], resolve));
+      const snapshot = selectAssistantProgressSnapshotLocal({
+        legacySnapshot: data[BATCH_RUNTIME_STATE_KEY],
+        snapshotsByPromotion: data[BATCH_RUNTIME_STATE_BY_PROMOTION_KEY],
+        currentBatchId: _batchCtx && _batchCtx.batchId ? _batchCtx.batchId : '',
+        pendingTask: data[BATCH_PENDING_TASK_KEY],
+        activeTask: data[BATCH_ACTIVE_TASK_KEY],
+        batchSubmitCtx: data.batchSubmitCtx,
+        batchCtx: data.batchCtx,
+        requireCurrentContext: true
+      });
+      const progress = buildCompactBatchProgressLocal(snapshot);
       const warning = buildAssistantWarningLocal(data[AI_REUSE_STATE_STORAGE_KEY]);
       if (!progress.isBatch) {
+        console.warn('[AutoComment][progress] no batch snapshot available', {
+          hasLegacySnapshot: !!data[BATCH_RUNTIME_STATE_KEY],
+          hasPromotionSnapshots: !!data[BATCH_RUNTIME_STATE_BY_PROMOTION_KEY],
+          legacyBatchId: data[BATCH_RUNTIME_STATE_KEY] && data[BATCH_RUNTIME_STATE_KEY].batchId,
+          activeBatchId: data[BATCH_ACTIVE_TASK_KEY] && data[BATCH_ACTIVE_TASK_KEY].batchId,
+          pendingBatchId: data[BATCH_PENDING_TASK_KEY] && data[BATCH_PENDING_TASK_KEY].batchId,
+          submitBatchId: data.batchSubmitCtx && data.batchSubmitCtx.batchId,
+          pageBatchId: _batchCtx && _batchCtx.batchId
+        });
         metricCompleted.valueEl.textContent = '--';
         metricSuccess.valueEl.textContent = '--';
         metricCurrent.valueEl.textContent = '--';
