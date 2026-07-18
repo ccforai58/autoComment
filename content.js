@@ -6554,6 +6554,29 @@
     }
   }
 
+  async function openPromotionSettingsPageFromContent() {
+    const settingsUrl = typeof chrome !== 'undefined' && chrome.runtime && typeof chrome.runtime.getURL === 'function'
+      ? chrome.runtime.getURL('link-assistant-settings.html')
+      : '';
+    if (typeof chrome !== 'undefined' && chrome.runtime && typeof chrome.runtime.sendMessage === 'function') {
+      try {
+        const response = await chrome.runtime.sendMessage({ type: 'OPEN_LINK_ASSISTANT_SETTINGS' });
+        if (response && response.ok) return response;
+        throw new Error(response && response.error ? response.error : 'open_settings_failed');
+      } catch (error) {
+        manualAssistantLog('error', {
+          operation: 'open_settings_message',
+          message: error && error.message ? error.message : String(error)
+        });
+      }
+    }
+    if (settingsUrl) {
+      window.open(settingsUrl, '_blank', 'noopener');
+      return { ok: true, fallback: true };
+    }
+    throw new Error('无法打开推广配置页');
+  }
+
   function activateQwenProgressTabForBatch() {
     removeManualAssistantIcon();
     if (!qwenPanelEl || !qwenPanelEl.parentNode || typeof qwenPanelEl._qwenSetActiveTab !== 'function') return;
@@ -6714,9 +6737,16 @@
       scrollManualCandidateIntoView(scan.candidates[manualAssistantState.selectedCandidateIndex]);
       refreshSummary();
     });
-    settingsBtn.addEventListener('click', () => {
-      if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.openOptionsPage) {
-        chrome.runtime.openOptionsPage();
+    settingsBtn.addEventListener('click', async () => {
+      settingsBtn.disabled = true;
+      setLocalStatus('正在打开推广配置...', '#94a3b8');
+      try {
+        await openPromotionSettingsPageFromContent();
+        setLocalStatus('已打开推广网站配置页', '#22c55e');
+      } catch (error) {
+        setLocalStatus(error && error.message ? error.message : '打开推广配置失败', '#f97373');
+      } finally {
+        settingsBtn.disabled = false;
       }
     });
     detectBtn.addEventListener('click', async () => {

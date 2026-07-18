@@ -57,6 +57,29 @@ chrome.action.onClicked.addListener((tab) => {
   chrome.tabs.create({ url: chrome.runtime.getURL('batch.html') });
 });
 
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message && message.type === 'OPEN_LINK_ASSISTANT_SETTINGS') {
+    const url = chrome.runtime.getURL('link-assistant-settings.html');
+    chrome.tabs.create({ url, active: true }, (tab) => {
+      const error = chrome.runtime && chrome.runtime.lastError ? chrome.runtime.lastError.message : '';
+      if (error) {
+        console.warn('[background][manual-assistant] open settings failed', {
+          senderTabId: sender && sender.tab ? sender.tab.id : null,
+          error
+        });
+        sendResponse({ ok: false, error });
+        return;
+      }
+      console.info('[background][manual-assistant] opened promotion settings', {
+        senderTabId: sender && sender.tab ? sender.tab.id : null,
+        tabId: tab && tab.id ? tab.id : null
+      });
+      sendResponse({ ok: true, tabId: tab && tab.id ? tab.id : null });
+    });
+    return true;
+  }
+});
+
 /**
  * 将批量结果写入 storage（本地存储，由 batch.js 轮询读取）
  */
