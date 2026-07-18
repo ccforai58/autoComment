@@ -22,7 +22,7 @@
   "content_scripts": [
     {
       "matches": ["<all_urls>"],
-      "js": ["extension-config.js", "illegal-site-filter.js", "content.js"],
+      "js": ["extension-config.js", "illegal-site-filter.js", "lib/link-assistant-runtime-logic.js", "lib/link-assistant-form-detector.js", "content.js"],
       "run_at": "document_idle"
     }
   ]

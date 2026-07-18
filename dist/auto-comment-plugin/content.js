@@ -1214,17 +1214,9 @@
   const API_BASE = (window.AUTO_COMMENT_CONFIG && window.AUTO_COMMENT_CONFIG.API_BASE) || 'http://127.0.0.1:3000/api';
   const QWEN_API_BASE = API_BASE;
   const BATCH_SCRIPT_BUILD_TAG = 'batch-segmented-link-fill-2026-07-14-ai-cancel-01';
-  const AUTO_COMMENT_LOG_LEVEL = (window.AUTO_COMMENT_CONFIG && window.AUTO_COMMENT_CONFIG.LOG_LEVEL) || 'essential';
-  const AUTO_COMMENT_VERBOSE_LOGS = AUTO_COMMENT_LOG_LEVEL === 'debug';
-  if (!AUTO_COMMENT_VERBOSE_LOGS && typeof console !== 'undefined' && !console.__autoCommentReleaseLogFiltered) {
-    console.__autoCommentReleaseLogFiltered = true;
-    console.log = () => {};
-    console.info = () => {};
-  }
   console.info('[content][config] API_BASE =', API_BASE);
   const WEBSITE_URL_STORAGE_KEY = 'promotion_website_url';
   const WEBSITE_CONTENT_STORAGE_KEY = 'promotion_website_content';
-  const CURRENT_PROMOTION_PROJECT_ID_KEY = 'current_promotion_project_id';
   const USER_NAME_STORAGE_KEY = 'auto_fill_user_name';
   const USER_EMAIL_STORAGE_KEY = 'auto_fill_user_email';
   const USER_PASSWORD_STORAGE_KEY = 'auto_fill_user_password';
@@ -1233,11 +1225,6 @@
   const PROMPT_FIELD_VALUES_STORAGE_KEY = 'auto_fill_prompt_field_values';
   const AI_REUSE_STATE_STORAGE_KEY = 'batch_ai_reuse_state_v1';
   let activeAiRequestId = '';
-  let currentPromotionProjectCache = {
-    project: null,
-    projectId: '',
-    loadedAt: 0
-  };
 
   // ====== 批量任务设置（从 storage.local 读取）======
   const BATCH_SETTINGS_KEY = 'batch_task_settings';
@@ -1246,6 +1233,9 @@
   const BATCH_RUNTIME_STATE_KEY = 'batch_runtime_state_v1';
   const BATCH_RUNTIME_STATE_BY_PROMOTION_KEY = 'batch_runtime_state_by_promotion_v1';
   const BATCH_ACTIVE_TASK_KEY = 'batch_active_task_v1';
+  const CURRENT_PROMOTION_PROJECT_ID_KEY = 'current_promotion_project_id';
+  const MANUAL_ASSISTANT_ICON_ID = 'auto-comment-manual-assistant-icon';
+  const MANUAL_ASSISTANT_MODAL_ID = 'auto-comment-manual-resource-modal';
 
   // ====== 积分系统配置 ======
   const POINTS_API_BASE = API_BASE;
@@ -1264,6 +1254,146 @@
   function safeLowerStringLocal(value) {
     if (value == null) return '';
     return String(value).toLowerCase();
+  }
+
+  function getLinkAssistantRuntimeLogicLocal() {
+    return window.AutoCommentLinkAssistantRuntimeLogic || null;
+  }
+
+  function getLinkAssistantFormDetectorLocal() {
+    return window.AutoCommentLinkAssistantFormDetector || null;
+  }
+
+  function sanitizeLogDetailsLocal(details) {
+    if (!details || typeof details !== 'object') return {};
+    const output = {};
+    for (const [key, value] of Object.entries(details)) {
+      if (/token|secret|password|cookie|authorization/i.test(key)) {
+        output[key] = '[redacted]';
+      } else if (/url|href/i.test(key)) {
+        output[key] = safeLogUrlLocal(value);
+      } else {
+        output[key] = value;
+      }
+    }
+    return output;
+  }
+
+  function safeLogUrlLocal(value) {
+    const text = String(value || '').trim();
+    if (!text) return '';
+    try {
+      const parsed = new URL(text, location.href);
+      parsed.username = '';
+      parsed.password = '';
+      parsed.search = parsed.search ? '?...' : '';
+      parsed.hash = '';
+      return parsed.href;
+    } catch (_) {
+      return text.slice(0, 160);
+    }
+  }
+
+  function manualAssistantLog(event, details = {}) {
+    const level = window.AUTO_COMMENT_CONFIG && window.AUTO_COMMENT_CONFIG.LOG_LEVEL;
+    const essentialEvents = new Set([
+      'init',
+      'scan.done',
+      'panel.open',
+      'generate.done',
+      'submit.recorded',
+      'resource.saved',
+      'backlink.detected',
+      'error'
+    ]);
+    if (level === 'essential' && !essentialEvents.has(event)) return;
+    console.info(`[AutoComment][manual-assistant] ${event}`, sanitizeLogDetailsLocal(details));
+  }
+
+  function contentLinkAssistantApiJson(path, options = {}) {
+    return fetch(`${API_BASE}${path}`, {
+      method: options.method || 'GET',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(options.headers || {})
+      },
+      body: options.body ? JSON.stringify(options.body) : undefined
+    }).then(async (response) => {
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok || payload.success === false) {
+        const error = new Error(payload.message || payload.error || `HTTP ${response.status}`);
+        error.status = response.status;
+        error.payload = payload;
+        throw error;
+      }
+      return payload;
+    });
+  }
+
+  async function getCurrentPromotionProjectIdLocal() {
+    return new Promise((resolve) => {
+      if (typeof chrome === 'undefined' || !chrome.storage || !chrome.storage.local) {
+        resolve('');
+        return;
+      }
+      chrome.storage.local.get([CURRENT_PROMOTION_PROJECT_ID_KEY], (data) => {
+        resolve(data && data[CURRENT_PROMOTION_PROJECT_ID_KEY] ? String(data[CURRENT_PROMOTION_PROJECT_ID_KEY]) : '');
+      });
+    });
+  }
+
+  async function loadCurrentPromotionProjectForContent(options = {}) {
+    const logic = getLinkAssistantRuntimeLogicLocal();
+    const currentPromotionProjectId = await getCurrentPromotionProjectIdLocal();
+    try {
+      const response = await contentLinkAssistantApiJson('/link-assistant/projects');
+      const normalized = logic && typeof logic.normalizeCurrentProjectResponse === 'function'
+        ? logic.normalizeCurrentProjectResponse({ currentPromotionProjectId, response })
+        : { project: null, missingReason: currentPromotionProjectId ? 'runtime_logic_unavailable' : 'missing_current_promotion_project_id' };
+      if (normalized.project) return normalized.project;
+      if (!options.createFromLegacy) return null;
+    } catch (error) {
+      manualAssistantLog('error', {
+        operation: 'load_project',
+        message: error && error.message ? error.message : String(error)
+      });
+      if (!options.createFromLegacy) return null;
+    }
+
+    const legacyUrl = await getWebsiteUrl();
+    if (!legacyUrl) return null;
+    return {
+      id: null,
+      targetUrl: legacyUrl,
+      targetDomain: normalizePromotionWebsiteKey(legacyUrl),
+      keywords: [],
+      pageTitle: '',
+      metaDescription: await getWebsiteContent(),
+      h1: '',
+      commentAuthor: '',
+      contactEmail: '',
+      defaultSubmitMode: 'auto'
+    };
+  }
+
+  function normalizeManualSourceUrl(input) {
+    const detector = getLinkAssistantFormDetectorLocal();
+    const canonical = document.querySelector('link[rel="canonical"], link[rel="Canonical"]');
+    const canonicalUrl = canonical && canonical.href ? canonical.href : '';
+    if (detector && typeof detector.normalizeStableSourceUrl === 'function') {
+      return detector.normalizeStableSourceUrl({
+        canonicalUrl,
+        url: input || location.href
+      }, location.href);
+    }
+    try {
+      const parsed = new URL(canonicalUrl || input || location.href, location.href);
+      parsed.hash = '';
+      ['utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content', 'fbclid', 'gclid'].forEach((key) => parsed.searchParams.delete(key));
+      return { sourceUrl: parsed.href, sourceUrlKey: parsed.href.replace(/\/+$/, '').toLowerCase(), reason: canonicalUrl ? 'canonical' : 'current_url' };
+    } catch (_) {
+      return { sourceUrl: String(input || location.href), sourceUrlKey: String(input || location.href).toLowerCase(), reason: 'fallback' };
+    }
   }
 
   function normalizeHostForCompareLocal(value) {
@@ -1625,7 +1755,6 @@
   }
 
   function sendLocalDebugLog(source, payload) {
-    if (!AUTO_COMMENT_VERBOSE_LOGS) return;
     try {
       const body = JSON.stringify({
         source,
@@ -1773,115 +1902,6 @@
   }
 
   // 从 chrome.storage.sync 中异步获取推广网站地址
-  function getLinkAssistantRuntimeLogic() {
-    return window.AutoCommentLinkAssistantRuntimeLogic || null;
-  }
-
-  function getBatchPromotionProject() {
-    return _batchCtx && _batchCtx.promotionProject ? _batchCtx.promotionProject : null;
-  }
-
-  function sendChromeMessage(message) {
-    return new Promise((resolve, reject) => {
-      if (typeof chrome === 'undefined' || !chrome.runtime || typeof chrome.runtime.sendMessage !== 'function') {
-        reject(new Error('chrome_runtime_unavailable'));
-        return;
-      }
-      try {
-        chrome.runtime.sendMessage(message, (response) => {
-          if (chrome.runtime && chrome.runtime.lastError) {
-            reject(new Error(chrome.runtime.lastError.message || 'chrome_message_failed'));
-            return;
-          }
-          resolve(response);
-        });
-      } catch (error) {
-        reject(error);
-      }
-    });
-  }
-
-  async function linkAssistantApiRequest(path) {
-    const bridged = await sendChromeMessage({
-      type: 'LINK_ASSISTANT_API_REQUEST',
-      apiBase: API_BASE,
-      path,
-      options: {
-        method: 'GET',
-        headers: { Accept: 'application/json' }
-      }
-    });
-    if (!bridged || bridged.success === false) {
-      throw new Error((bridged && bridged.error) || 'LINK_ASSISTANT_API_REQUEST_FAILED');
-    }
-    const payload = bridged.json != null ? bridged.json : (bridged.text ? JSON.parse(bridged.text) : {});
-    if (!bridged.ok || (payload && payload.success === false)) {
-      throw new Error((payload && (payload.message || payload.error)) || `Request failed: ${bridged.status}`);
-    }
-    return payload;
-  }
-
-  async function getCurrentPromotionProjectId() {
-    if (typeof chrome === 'undefined' || !chrome.storage || !chrome.storage.local) return '';
-    const data = await new Promise((resolve) => {
-      chrome.storage.local.get([CURRENT_PROMOTION_PROJECT_ID_KEY], (result) => resolve(result || {}));
-    });
-    return data[CURRENT_PROMOTION_PROJECT_ID_KEY] ? String(data[CURRENT_PROMOTION_PROJECT_ID_KEY]) : '';
-  }
-
-  async function loadCurrentPromotionProject() {
-    const batchProject = getBatchPromotionProject();
-    if (batchProject && batchProject.targetUrl) return batchProject;
-
-    const currentPromotionProjectId = await getCurrentPromotionProjectId();
-    if (!currentPromotionProjectId) return null;
-    const now = Date.now();
-    if (
-      currentPromotionProjectCache.project &&
-      currentPromotionProjectCache.projectId === currentPromotionProjectId &&
-      now - currentPromotionProjectCache.loadedAt < 15000
-    ) {
-      return currentPromotionProjectCache.project;
-    }
-
-    const logic = getLinkAssistantRuntimeLogic();
-    if (!logic || typeof logic.normalizeCurrentProjectResponse !== 'function') return null;
-    try {
-      const response = await linkAssistantApiRequest('/link-assistant/projects');
-      const normalized = logic.normalizeCurrentProjectResponse({ currentPromotionProjectId, response });
-      currentPromotionProjectCache = {
-        project: normalized.project || null,
-        projectId: currentPromotionProjectId,
-        loadedAt: now
-      };
-      if (normalized.project) {
-        console.info('[content][link-assistant] current project loaded', {
-          projectId: normalized.project.id,
-          targetDomain: normalized.project.targetDomain || ''
-        });
-      }
-      return normalized.project || null;
-    } catch (error) {
-      console.warn('[content][link-assistant] current project load failed:', {
-        message: error && error.message ? error.message : String(error)
-      });
-      return null;
-    }
-  }
-
-  async function getPromotionCopyInputsFromProject(legacyUrl, legacyContent) {
-    const project = await loadCurrentPromotionProject();
-    const logic = getLinkAssistantRuntimeLogic();
-    if (!project || !logic || typeof logic.selectPromotionCopyInputs !== 'function') {
-      return {
-        promotionWebsiteUrl: legacyUrl,
-        promotionWebsiteContent: legacyContent,
-        usedProjectKeywords: []
-      };
-    }
-    return logic.selectPromotionCopyInputs({ project, legacyUrl, legacyContent });
-  }
-
   function getWebsiteUrl() {
     return new Promise((resolve) => {
       if (typeof chrome === 'undefined' || !chrome.storage || !chrome.storage.sync) {
@@ -1904,10 +1924,7 @@
           'website url',
           'url'
         ]);
-        const fallbackUrl = savedUrl || legacyUrl;
-        getPromotionCopyInputsFromProject(fallbackUrl, '').then((inputs) => {
-          resolve(inputs.promotionWebsiteUrl || fallbackUrl);
-        }).catch(() => resolve(fallbackUrl));
+        resolve(savedUrl || legacyUrl);
       });
     });
   }
@@ -1934,12 +1951,7 @@
           'site content',
           'description'
         ]);
-        const fallbackContent = savedContent || legacyContent;
-        getWebsiteUrl().then((legacyUrl) => (
-          getPromotionCopyInputsFromProject(legacyUrl, fallbackContent)
-        )).then((inputs) => {
-          resolve(inputs.promotionWebsiteContent || fallbackContent);
-        }).catch(() => resolve(fallbackContent));
+        resolve(savedContent || legacyContent);
       });
     });
   }
@@ -1970,13 +1982,7 @@
           if (!email) email = DEFAULT_EMAIL;
           if (!password) password = DEFAULT_PASSWORD;
 
-          loadCurrentPromotionProject().then((project) => {
-            resolve({
-              name: project && project.commentAuthor ? project.commentAuthor : name,
-              email: project && project.contactEmail ? project.contactEmail : email,
-              password
-            });
-          }).catch(() => resolve({ name, email, password }));
+          resolve({ name, email, password });
         }
       );
     });
@@ -2258,18 +2264,9 @@
   let _batchCtx = null; // { batchId, urlIndex, url }
   let runningBatchTaskKey = null;
 
-  function setBatchContext(batchId, urlIndex, url, context = {}) {
-    _batchCtx = {
-      batchId,
-      urlIndex,
-      url,
-      promotionProject: context.promotionProject || null,
-      promotionProjectId: context.promotionProjectId || null,
-      targetUrl: context.targetUrl || '',
-      targetDomain: context.targetDomain || '',
-      discoveryTargetUrl: context.discoveryTargetUrl || '',
-      semrushMeta: context.semrushMeta || null
-    };
+  function setBatchContext(batchId, urlIndex, url) {
+    _batchCtx = { batchId, urlIndex, url };
+    removeManualAssistantIcon();
     activateQwenProgressTabForBatch();
   }
 
@@ -2885,12 +2882,19 @@
 
     fillInputs();
     setupFormSubmitListener();
-    ensureOutlinkFloatingButton();
+    setupManualAssistantSubmitWatcher();
+    runManualAssistantScan({ scroll: false }).catch((error) => {
+      manualAssistantLog('error', {
+        operation: 'initial_scan',
+        message: error && error.message ? error.message : String(error)
+      });
+    });
+    refreshManualAssistantAvailability();
     tryStartPendingBatchTaskFromStorage();
 
     getAutoOpenQwenPanelSetting().then((shouldOpen) => {
       if (shouldOpen) {
-        createOrToggleQwenPanel();
+        showQwenPanel({ tab: 'progress', progressOnly: true });
       }
     });
 
@@ -5543,36 +5547,6 @@
     return Array.from(new Set(used.map((item) => String(item || '').trim()).filter(Boolean)));
   }
 
-  function buildRecentAnchorTextStatsLocal(records, promotionWebsiteUrl, now = Date.now(), windowMs = 48 * 60 * 60 * 1000) {
-    const source = Array.isArray(records) ? records : [];
-    const targetKey = normalizePromotionWebsiteKey(promotionWebsiteUrl);
-    const counts = new Map();
-    for (const record of source) {
-      if (!record || typeof record !== 'object') continue;
-      if (targetKey && normalizePromotionWebsiteKey(record.promotionWebsiteUrl) !== targetKey) continue;
-      const timestamp = typeof record.timestamp === 'number' ? record.timestamp : Date.parse(String(record.timestamp || record.createdAt || ''));
-      if (!timestamp || now - timestamp > windowMs || timestamp > now + 60000) continue;
-      const anchors = [];
-      if (record.anchorText) anchors.push(record.anchorText);
-      anchors.push(...extractAnchorTextsFromCopy(record.aiContent));
-      for (const anchor of anchors) {
-        const text = String(anchor || '').replace(/\s+/g, ' ').trim();
-        if (!text) continue;
-        const key = text.toLowerCase();
-        const current = counts.get(key) || { text, count: 0 };
-        current.count += 1;
-        counts.set(key, current);
-      }
-    }
-    return Array.from(counts.values()).sort((a, b) => b.count - a.count || a.text.localeCompare(b.text));
-  }
-
-  async function getRecentAnchorTextStatsForPromotion(promotionWebsiteUrl) {
-    if (typeof chrome === 'undefined' || !chrome.storage || !chrome.storage.local) return [];
-    const data = await new Promise((resolve) => chrome.storage.local.get(['batchResults'], resolve));
-    return buildRecentAnchorTextStatsLocal(data && data.batchResults, promotionWebsiteUrl);
-  }
-
   function createAiRequestId() {
     const batchId = _batchCtx && _batchCtx.batchId ? _batchCtx.batchId : 'manual';
     const urlIndex = _batchCtx && Number.isFinite(Number(_batchCtx.urlIndex)) ? _batchCtx.urlIndex : 'na';
@@ -5645,7 +5619,6 @@
       getWebsiteContent(),
       getUsedAnchorTextsForCurrentBatch()
     ]);
-    const usedAnchorTextStats = await getRecentAnchorTextStatsForPromotion(promotionWebsiteUrl);
 
     // 检查用户ID是否配置
     const userId = await getUserId();
@@ -5682,7 +5655,6 @@
       titleLength: title.length,
       bodyTextLength: bodyText.length,
       usedAnchorCount: usedAnchorTexts.length,
-      recentAnchorTextCount: usedAnchorTextStats.length,
       pageLanguageHint: languagePayload.pageLanguageHint
     });
     const controller = new AbortController();
@@ -5705,7 +5677,6 @@
           promotionWebsiteUrl,
           promotionWebsiteContent,
           usedAnchorTexts,
-          usedAnchorTextStats,
           aiRequestId,
           pageLanguageHint: languagePayload.pageLanguageHint,
           pageLanguageEvidence: languagePayload.pageLanguageEvidence,
@@ -5755,6 +5726,7 @@
   // ====== 页面内浮动窗口 UI ======
   let qwenPanelEl = null;
   let qwenProgressTimer = null;
+  let qwenPanelRequestedMode = 'manual';
 
   function formatCompactBatchEtaLocal(ms) {
     const value = Number(ms);
@@ -5880,8 +5852,690 @@
     return { visible: false, text: '' };
   }
 
+  const manualAssistantState = {
+    icon: null,
+    scan: null,
+    currentProject: null,
+    currentText: '',
+    lastSubmissionId: null,
+    lastSubmitRecordKey: '',
+    lastSubmitRecordedAt: 0,
+    selectedCandidateIndex: 0,
+    existingBacklink: null,
+    nativeWatcherInstalled: false
+  };
+
+  function getElementLabelTextLocal(field) {
+    if (!field) return '';
+    const parts = [
+      field.name,
+      field.id,
+      field.className,
+      field.type,
+      field.placeholder,
+      field.getAttribute && field.getAttribute('aria-label'),
+      field.getAttribute && field.getAttribute('title'),
+      field.getAttribute && field.getAttribute('autocomplete')
+    ];
+    const form = field.closest && field.closest('form');
+    if (field.id && form && typeof CSS !== 'undefined' && CSS.escape) {
+      try {
+        const label = form.querySelector(`label[for="${CSS.escape(field.id)}"]`);
+        if (label) parts.push(label.textContent);
+      } catch (_) {}
+    }
+    const closestLabel = field.closest && field.closest('label');
+    if (closestLabel) parts.push(closestLabel.textContent);
+    const previous = field.previousElementSibling;
+    if (previous && (previous.textContent || '').length < 160) parts.push(previous.textContent);
+    const parent = field.parentElement;
+    if (parent && (parent.textContent || '').length < 220) parts.push(parent.textContent);
+    return parts.filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
+  }
+
+  function isManualCandidateField(field) {
+    if (!field || field.disabled) return false;
+    const tag = (field.tagName || '').toLowerCase();
+    const type = (field.type || '').toLowerCase();
+    if (!['input', 'textarea', 'select'].includes(tag)) return false;
+    if (['hidden', 'button', 'submit', 'reset', 'image', 'file'].includes(type)) return false;
+    if (!isVisibleFormField(field)) return false;
+    return true;
+  }
+
+  function scoreManualFieldRole(field) {
+    const detector = getLinkAssistantFormDetectorLocal();
+    const context = getElementLabelTextLocal(field);
+    if (detector && typeof detector.scoreFieldRole === 'function') {
+      return detector.scoreFieldRole({
+        tagName: field.tagName || '',
+        type: field.type || '',
+        name: field.name || '',
+        id: field.id || '',
+        placeholder: field.placeholder || '',
+        label: context
+      });
+    }
+    const text = `${field.name || ''} ${field.id || ''} ${field.placeholder || ''} ${context}`.toLowerCase();
+    if (/mail|email|e-mail|邮箱/.test(text)) return { role: 'email', score: 80, reasons: ['fallback_email'] };
+    if (/url|website|site|link|网址|链接/.test(text)) return { role: 'website', score: 75, reasons: ['fallback_url'] };
+    if (/comment|message|content|description|bio|简介|评论|留言|描述/.test(text)) return { role: 'comment', score: 70, reasons: ['fallback_text'] };
+    if (/name|author|title|标题|名称|姓名/.test(text)) return { role: 'name', score: 65, reasons: ['fallback_name'] };
+    return { role: 'unknown', score: 0, reasons: [] };
+  }
+
+  function detectManualPageType(candidates, fields) {
+    const detector = getLinkAssistantFormDetectorLocal();
+    const bodyText = (document.body && document.body.innerText ? document.body.innerText : '').slice(0, 6000);
+    const signals = {
+      url: location.href,
+      title: document.title || '',
+      bodyText,
+      formCount: candidates.length,
+      roles: fields.map((item) => item.role).filter(Boolean),
+      hasCommentForm: candidates.some((item) => item.kind === 'blog_comment'),
+      hasProfileFields: fields.some((item) => ['bio', 'profileBio', 'profile', 'avatar'].includes(item.role)),
+      hasDirectoryFields: fields.some((item) => ['website', 'websiteUrl', 'title', 'description'].includes(item.role))
+    };
+    if (detector && typeof detector.detectPageTypeFromSignals === 'function') {
+      return detector.detectPageTypeFromSignals(signals);
+    }
+    if (signals.hasCommentForm || signals.roles.includes('comment')) return { pageType: 'blog_comment', confidence: 0.72, reasons: ['comment_field'] };
+    if (signals.hasProfileFields) return { pageType: 'profile', confidence: 0.62, reasons: ['profile_fields'] };
+    if (signals.hasDirectoryFields) return { pageType: 'directory', confidence: 0.58, reasons: ['directory_fields'] };
+    return { pageType: 'generic', confidence: 0.35, reasons: ['fallback'] };
+  }
+
+  function collectManualAssistantCandidates() {
+    const candidates = [];
+    const allFields = [];
+    const commentForm = findCommentForm();
+    if (commentForm) {
+      candidates.push({
+        kind: 'blog_comment',
+        form: commentForm,
+        root: commentForm,
+        score: 95,
+        fields: Array.from(commentForm.querySelectorAll('input, textarea, select')).filter(isManualCandidateField)
+      });
+    }
+
+    const forms = Array.from(document.querySelectorAll('form'));
+    for (const form of forms) {
+      if (commentForm && form === commentForm) continue;
+      const fields = Array.from(form.querySelectorAll('input, textarea, select')).filter(isManualCandidateField);
+      if (!fields.length) continue;
+      const scored = fields.map((field) => ({ field, ...scoreManualFieldRole(field) }));
+      scored.forEach((item) => allFields.push(item));
+      const usefulScore = scored.reduce((sum, item) => sum + Math.max(0, item.score || 0), 0);
+      const usefulRoles = new Set(scored.filter((item) => item.score >= 45).map((item) => item.role));
+      if (usefulRoles.size || usefulScore >= 80) {
+        candidates.push({
+          kind: 'form',
+          form,
+          root: form,
+          score: usefulScore + usefulRoles.size * 15,
+          fields
+        });
+      }
+    }
+
+    const looseFields = Array.from(document.querySelectorAll('input, textarea, select')).filter((field) => {
+      if (!isManualCandidateField(field)) return false;
+      if (field.closest && field.closest('form')) return false;
+      return true;
+    });
+    const looseScored = looseFields.map((field) => ({ field, ...scoreManualFieldRole(field) }));
+    looseScored.forEach((item) => allFields.push(item));
+    const looseUseful = looseScored.filter((item) => item.score >= 45);
+    if (looseUseful.length) {
+      const root = looseUseful[0].field.closest('section, article, main, div') || looseUseful[0].field;
+      candidates.push({
+        kind: 'loose_fields',
+        form: null,
+        root,
+        score: looseUseful.reduce((sum, item) => sum + item.score, 0),
+        fields: looseUseful.map((item) => item.field)
+      });
+    }
+
+    const deduped = [];
+    const seenRoots = new Set();
+    for (const candidate of candidates.sort((a, b) => b.score - a.score)) {
+      const key = candidate.root || candidate.form;
+      if (!key || seenRoots.has(key)) continue;
+      seenRoots.add(key);
+      deduped.push(candidate);
+    }
+    const pageType = detectManualPageType(deduped, allFields);
+    const source = normalizeManualSourceUrl(location.href);
+    return {
+      candidates: deduped.slice(0, 8),
+      allFields,
+      pageType: pageType.pageType || 'generic',
+      confidence: pageType.confidence || 0,
+      reasons: pageType.reasons || [],
+      sourceUrl: source.sourceUrl,
+      sourceUrlKey: source.sourceUrlKey,
+      sourceReason: source.reason
+    };
+  }
+
+  async function runManualAssistantScan(options = {}) {
+    const scroll = options.scroll === true;
+    const project = await loadCurrentPromotionProjectForContent({ createFromLegacy: true }).catch(() => null);
+    manualAssistantState.currentProject = project;
+    const scan = collectManualAssistantCandidates();
+    manualAssistantState.scan = scan;
+    if (scroll && scan.candidates.length) {
+      const candidate = scan.candidates[manualAssistantState.selectedCandidateIndex] || scan.candidates[0];
+      scrollManualCandidateIntoView(candidate);
+    }
+    manualAssistantState.existingBacklink = await detectManualAssistantExistingBacklink(project).catch((error) => {
+      manualAssistantLog('error', { operation: 'detect_existing_backlink', message: error && error.message ? error.message : String(error) });
+      return { success: false, reason: 'error', matchedHref: '' };
+    });
+    manualAssistantLog('scan.done', {
+      candidateCount: scan.candidates.length,
+      pageType: scan.pageType,
+      confidence: scan.confidence,
+      projectId: project && project.id ? project.id : '',
+      existingBacklink: !!(manualAssistantState.existingBacklink && manualAssistantState.existingBacklink.success)
+    });
+    return scan;
+  }
+
+  function scrollManualCandidateIntoView(candidate) {
+    const target = candidate && (candidate.root || candidate.form || candidate.fields && candidate.fields[0]);
+    if (!target || typeof target.scrollIntoView !== 'function') return;
+    target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    try {
+      target.style.outline = '3px solid #22c55e';
+      target.style.outlineOffset = '3px';
+      setTimeout(() => {
+        target.style.outline = '';
+        target.style.outlineOffset = '';
+      }, 2600);
+    } catch (_) {}
+  }
+
+  async function detectManualAssistantExistingBacklink(projectInput) {
+    const project = projectInput || manualAssistantState.currentProject || await loadCurrentPromotionProjectForContent({ createFromLegacy: true });
+    const targetUrl = project && project.targetUrl ? project.targetUrl : await getWebsiteUrl();
+    if (!targetUrl) return { success: false, reason: 'missing_target_url', matchedHref: '' };
+    const html = document.documentElement ? document.documentElement.outerHTML : '';
+    const hit = detectPromotionSourceHitLocal(html, targetUrl);
+    if (hit && hit.success) {
+      manualAssistantLog('backlink.detected', {
+        projectId: project && project.id ? project.id : '',
+        targetDomain: project && project.targetDomain ? project.targetDomain : '',
+        sourceUrl: manualAssistantState.scan && manualAssistantState.scan.sourceUrl,
+        matchedHref: hit.matchedHref || ''
+      });
+    }
+    return hit || { success: false, reason: 'not_found', matchedHref: '' };
+  }
+
+  async function isBatchAssistantActiveNow() {
+    if (_batchCtx) return true;
+    if (typeof chrome === 'undefined' || !chrome.storage || !chrome.storage.local) return false;
+    const data = await new Promise((resolve) => chrome.storage.local.get([
+      BATCH_ACTIVE_TASK_KEY,
+      BATCH_PENDING_TASK_KEY,
+      'batchSubmitCtx',
+      'batchCtx'
+    ], resolve));
+    const possible = [data[BATCH_ACTIVE_TASK_KEY], data[BATCH_PENDING_TASK_KEY], data.batchSubmitCtx, data.batchCtx].filter(Boolean);
+    return possible.some((item) => item && item.batchId && (!item.url || isSameTaskUrl(item.url, location.href)));
+  }
+
+  function removeManualAssistantIcon() {
+    const icon = manualAssistantState.icon || document.getElementById(MANUAL_ASSISTANT_ICON_ID);
+    if (icon && icon.parentNode) icon.parentNode.removeChild(icon);
+    manualAssistantState.icon = null;
+  }
+
+  async function ensureManualAssistantIcon() {
+    if (await isBatchAssistantActiveNow()) {
+      removeManualAssistantIcon();
+      return;
+    }
+    if (document.getElementById(MANUAL_ASSISTANT_ICON_ID)) {
+      manualAssistantState.icon = document.getElementById(MANUAL_ASSISTANT_ICON_ID);
+      return;
+    }
+    const icon = document.createElement('button');
+    icon.id = MANUAL_ASSISTANT_ICON_ID;
+    icon.type = 'button';
+    icon.title = '打开手动外链助手';
+    icon.textContent = '链';
+    icon.style.position = 'fixed';
+    icon.style.right = '18px';
+    icon.style.top = '92px';
+    icon.style.zIndex = '2147483647';
+    icon.style.width = '38px';
+    icon.style.height = '38px';
+    icon.style.borderRadius = '10px';
+    icon.style.border = '1px solid rgba(148,163,184,0.56)';
+    icon.style.background = 'rgba(15,23,42,0.95)';
+    icon.style.color = '#f8fafc';
+    icon.style.boxShadow = '0 12px 30px rgba(15,23,42,0.36)';
+    icon.style.fontSize = '15px';
+    icon.style.fontWeight = '700';
+    icon.style.cursor = 'grab';
+    icon.style.lineHeight = '1';
+    icon.style.userSelect = 'none';
+
+    let dragState = null;
+    icon.addEventListener('pointerdown', (event) => {
+      dragState = {
+        startX: event.clientX,
+        startY: event.clientY,
+        startRight: parseFloat(icon.style.right) || 18,
+        startTop: parseFloat(icon.style.top) || 92,
+        moved: false
+      };
+      icon.setPointerCapture && icon.setPointerCapture(event.pointerId);
+      icon.style.cursor = 'grabbing';
+    });
+    icon.addEventListener('pointermove', (event) => {
+      if (!dragState) return;
+      const dx = event.clientX - dragState.startX;
+      const dy = event.clientY - dragState.startY;
+      if (Math.abs(dx) + Math.abs(dy) > 4) dragState.moved = true;
+      icon.style.right = `${Math.max(8, dragState.startRight - dx)}px`;
+      icon.style.top = `${Math.max(8, Math.min(window.innerHeight - 46, dragState.startTop + dy))}px`;
+    });
+    icon.addEventListener('pointerup', (event) => {
+      const moved = dragState && dragState.moved;
+      dragState = null;
+      icon.releasePointerCapture && icon.releasePointerCapture(event.pointerId);
+      icon.style.cursor = 'grab';
+      if (!moved) openManualAssistantPanel();
+    });
+    icon.addEventListener('click', (event) => {
+      if (dragState && dragState.moved) return;
+      event.preventDefault();
+    });
+    (document.body || document.documentElement).appendChild(icon);
+    manualAssistantState.icon = icon;
+    manualAssistantLog('init', { sourceUrl: location.href });
+  }
+
+  async function refreshManualAssistantAvailability() {
+    if (await isBatchAssistantActiveNow()) {
+      removeManualAssistantIcon();
+      if (qwenPanelEl && qwenPanelEl.parentNode) applyQwenPanelMode('progress-only');
+      return;
+    }
+    await ensureManualAssistantIcon();
+  }
+
+  async function openManualAssistantPanel() {
+    await runManualAssistantScan({ scroll: true });
+    const shown = showQwenPanel({ tab: 'manual', manualAssistant: true });
+    manualAssistantLog('panel.open', {
+      shown,
+      candidateCount: manualAssistantState.scan && manualAssistantState.scan.candidates ? manualAssistantState.scan.candidates.length : 0,
+      pageType: manualAssistantState.scan && manualAssistantState.scan.pageType
+    });
+    if (shown && qwenPanelEl && typeof qwenPanelEl._manualAssistantRefresh === 'function') {
+      qwenPanelEl._manualAssistantRefresh();
+    }
+  }
+
+  function getManualAssistantProjectProfile(project) {
+    const source = project || {};
+    return getUserProfile().then((legacy) => ({
+      author: (source.commentAuthor || legacy.name || '').trim(),
+      email: (source.contactEmail || legacy.email || '').trim(),
+      website: (source.targetUrl || '').trim(),
+      title: (source.pageTitle || (Array.isArray(source.keywords) && source.keywords[0]) || source.targetDomain || '').trim(),
+      description: (source.metaDescription || source.h1 || '').trim()
+    }));
+  }
+
+  function getCandidateFields(candidate) {
+    if (!candidate) return [];
+    if (Array.isArray(candidate.fields) && candidate.fields.length) return candidate.fields.filter(isManualCandidateField);
+    const root = candidate.root || candidate.form;
+    return root ? Array.from(root.querySelectorAll('input, textarea, select')).filter(isManualCandidateField) : [];
+  }
+
+  async function fillManualAssistantFields(commentText) {
+    const scan = manualAssistantState.scan || collectManualAssistantCandidates();
+    manualAssistantState.scan = scan;
+    const project = manualAssistantState.currentProject || await loadCurrentPromotionProjectForContent({ createFromLegacy: true });
+    manualAssistantState.currentProject = project;
+    const profile = await getManualAssistantProjectProfile(project);
+    const candidate = scan.candidates[manualAssistantState.selectedCandidateIndex] || scan.candidates[0] || null;
+    let blogFill = null;
+    if (scan.pageType === 'blog_comment' || (candidate && candidate.kind === 'blog_comment')) {
+      await triggerCommentFormFlowWithTimeout(6000).catch(() => false);
+      blogFill = await ensureAllCommentFormFieldsFilled(commentText || '', true).catch((error) => ({
+        success: false,
+        error: error && error.message ? error.message : String(error)
+      }));
+    }
+    const fields = getCandidateFields(candidate);
+    let filledCount = 0;
+    for (const field of fields) {
+      const scored = scoreManualFieldRole(field);
+      if (!scored || scored.score < 45) continue;
+      const role = scored.role;
+      let value = '';
+      if (role === 'email') value = profile.email;
+      else if (role === 'website' || role === 'websiteUrl' || role === 'url') value = profile.website;
+      else if (role === 'name' || role === 'author' || role === 'title') value = profile.author || profile.title;
+      else if (role === 'description' || role === 'bio' || role === 'profileBio') value = profile.description || commentText;
+      else if (role === 'comment' || role === 'message' || role === 'content') value = commentText;
+      if (!value) continue;
+      const current = field.value == null ? '' : String(field.value).trim();
+      if (current && !['comment', 'message', 'content', 'description', 'bio'].includes(role)) continue;
+      setValue(field, value);
+      filledCount += 1;
+    }
+    manualAssistantLog('fill.done', {
+      pageType: scan.pageType,
+      fieldCount: fields.length,
+      filledCount,
+      usedBlogFill: !!blogFill,
+      blogFillSuccess: blogFill ? !!blogFill.success : false
+    });
+    return { filledCount, blogFill, candidate };
+  }
+
+  function buildManualSubmissionPayload(input = {}) {
+    const scan = manualAssistantState.scan || collectManualAssistantCandidates();
+    const project = manualAssistantState.currentProject || {};
+    const now = new Date().toISOString();
+    return {
+      promotionProjectId: project.id || null,
+      targetUrl: project.targetUrl || '',
+      targetDomain: project.targetDomain || '',
+      sourceUrl: scan.sourceUrl || location.href,
+      sourceTitle: document.title || '',
+      discoveryTargetUrl: scan.sourceUrl || location.href,
+      resourceType: input.pageType || scan.pageType || 'generic',
+      submitMode: 'manual',
+      submitResult: input.result || 'submitted_unconfirmed',
+      aiContent: input.aiContent == null ? (manualAssistantState.currentText || null) : input.aiContent,
+      errorMessage: input.errorMessage || null,
+      submitSource: 'manual_assistant',
+      pageType: input.pageType || scan.pageType || 'generic',
+      detectorVersion: getLinkAssistantFormDetectorLocal() && getLinkAssistantFormDetectorLocal().DETECTOR_VERSION || 'manual-assistant-detector-unavailable',
+      submissionSourceUrl: scan.sourceUrl || location.href,
+      stableSourceUrlReason: scan.sourceReason || '',
+      detectedExistingBacklink: !!(manualAssistantState.existingBacklink && manualAssistantState.existingBacklink.success),
+      existingBacklinkHref: manualAssistantState.existingBacklink && manualAssistantState.existingBacklink.matchedHref || '',
+      manualAssistantRecordedAt: now,
+      fieldCandidateCount: scan.candidates ? scan.candidates.length : 0
+    };
+  }
+
+  async function recordManualAssistantSubmission(input = {}) {
+    const project = manualAssistantState.currentProject || await loadCurrentPromotionProjectForContent({ createFromLegacy: true });
+    manualAssistantState.currentProject = project;
+    const payload = buildManualSubmissionPayload(input);
+    if (!payload.targetUrl) {
+      throw new Error('请先配置推广网站');
+    }
+    const recordKey = `${payload.sourceUrl}|${payload.promotionProjectId || payload.targetUrl}|${payload.submitResult}`;
+    const now = Date.now();
+    if (recordKey === manualAssistantState.lastSubmitRecordKey && now - manualAssistantState.lastSubmitRecordedAt < 5000) {
+      return { duplicate: true, submissionId: manualAssistantState.lastSubmissionId };
+    }
+    const response = await contentLinkAssistantApiJson('/link-assistant/submissions', {
+      method: 'POST',
+      body: payload
+    });
+    manualAssistantState.lastSubmitRecordKey = recordKey;
+    manualAssistantState.lastSubmitRecordedAt = now;
+    manualAssistantState.lastSubmissionId = response.submissionId || response.id || null;
+    manualAssistantLog('submit.recorded', {
+      submissionId: manualAssistantState.lastSubmissionId,
+      result: payload.submitResult,
+      pageType: payload.pageType,
+      projectId: payload.promotionProjectId,
+      sourceUrl: payload.sourceUrl
+    });
+    return response;
+  }
+
+  async function syncManualAssistantBacklinkSuccess(hit) {
+    const submission = manualAssistantState.lastSubmissionId
+      ? { submissionId: manualAssistantState.lastSubmissionId }
+      : await recordManualAssistantSubmission({ result: 'submitted_unconfirmed', errorMessage: 'detected before explicit submit record' });
+    const submissionId = submission.submissionId || submission.id || manualAssistantState.lastSubmissionId;
+    if (!submissionId) throw new Error('未找到提交记录，无法同步检测结果');
+    const scan = manualAssistantState.scan || collectManualAssistantCandidates();
+    const project = manualAssistantState.currentProject || {};
+    const payload = {
+      submissionId,
+      promotionProjectId: project.id || null,
+      targetUrl: project.targetUrl || '',
+      targetDomain: project.targetDomain || '',
+      sourceUrl: scan.sourceUrl || location.href,
+      sourceTitle: document.title || '',
+      discoveryTargetUrl: scan.sourceUrl || location.href,
+      latestBacklinkStatus: 'success',
+      latestBacklinkCheckedAt: new Date().toISOString(),
+      latestBacklinkMatchedHref: hit && hit.matchedHref || '',
+      latestBacklinkReason: hit && hit.reason || 'manual_assistant_current_page_detected'
+    };
+    const response = await contentLinkAssistantApiJson(`/link-assistant/submissions/${encodeURIComponent(submissionId)}/backlink-check-result`, {
+      method: 'POST',
+      body: payload
+    });
+    manualAssistantLog('backlink.detected', {
+      submissionId,
+      projectId: project.id || '',
+      sourceUrl: scan.sourceUrl || location.href,
+      matchedHref: payload.latestBacklinkMatchedHref
+    });
+    return response;
+  }
+
+  async function handleManualAssistantDetectCurrentPage() {
+    const project = manualAssistantState.currentProject || await loadCurrentPromotionProjectForContent({ createFromLegacy: true });
+    manualAssistantState.currentProject = project;
+    const hit = await detectManualAssistantExistingBacklink(project);
+    manualAssistantState.existingBacklink = hit;
+    if (hit && hit.success) {
+      await syncManualAssistantBacklinkSuccess(hit);
+    }
+    return hit;
+  }
+
+  function openManualResourceModal() {
+    const existing = document.getElementById(MANUAL_ASSISTANT_MODAL_ID);
+    if (existing) existing.remove();
+    const scan = manualAssistantState.scan || collectManualAssistantCandidates();
+    manualAssistantState.scan = scan;
+    const overlay = document.createElement('div');
+    overlay.id = MANUAL_ASSISTANT_MODAL_ID;
+    overlay.style.position = 'fixed';
+    overlay.style.inset = '0';
+    overlay.style.zIndex = '2147483647';
+    overlay.style.background = 'rgba(15,23,42,0.38)';
+    overlay.style.display = 'flex';
+    overlay.style.alignItems = 'center';
+    overlay.style.justifyContent = 'center';
+
+    const modal = document.createElement('div');
+    modal.style.width = '360px';
+    modal.style.maxWidth = 'calc(100vw - 28px)';
+    modal.style.background = '#0f172a';
+    modal.style.color = '#e5e7eb';
+    modal.style.border = '1px solid rgba(148,163,184,0.35)';
+    modal.style.borderRadius = '10px';
+    modal.style.boxShadow = '0 20px 52px rgba(15,23,42,0.55)';
+    modal.style.padding = '12px';
+    modal.style.fontFamily = "-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif";
+
+    const title = document.createElement('div');
+    title.textContent = '加入外链资源库';
+    title.style.fontSize = '14px';
+    title.style.fontWeight = '700';
+    title.style.marginBottom = '8px';
+
+    function makeField(label, value, type = 'text') {
+      const wrap = document.createElement('label');
+      wrap.style.display = 'block';
+      wrap.style.fontSize = '11px';
+      wrap.style.color = '#94a3b8';
+      wrap.style.marginTop = '7px';
+      const input = document.createElement(type === 'textarea' ? 'textarea' : 'input');
+      if (type !== 'textarea') input.type = type;
+      input.value = value || '';
+      input.style.width = '100%';
+      input.style.boxSizing = 'border-box';
+      input.style.marginTop = '3px';
+      input.style.border = '1px solid rgba(148,163,184,0.42)';
+      input.style.borderRadius = '7px';
+      input.style.background = 'rgba(2,6,23,0.72)';
+      input.style.color = '#f8fafc';
+      input.style.fontSize = '12px';
+      input.style.padding = '7px 8px';
+      if (type === 'textarea') input.style.minHeight = '58px';
+      wrap.append(label, input);
+      return { wrap, input };
+    }
+
+    const sourceUrl = makeField('可提交地址', scan.sourceUrl || location.href);
+    const pageAscore = makeField('Page ascore', '', 'number');
+    const traffic = makeField('流量', '', 'number');
+    const resourceType = makeField('类型', scan.pageType || 'generic');
+    const qualityLabel = makeField('等级', '');
+    const notes = makeField('备注', '', 'textarea');
+    const status = document.createElement('div');
+    status.style.fontSize = '11px';
+    status.style.minHeight = '16px';
+    status.style.marginTop = '7px';
+    status.style.color = '#94a3b8';
+
+    const row = document.createElement('div');
+    row.style.display = 'flex';
+    row.style.gap = '8px';
+    row.style.justifyContent = 'flex-end';
+    row.style.marginTop = '10px';
+    const cancel = document.createElement('button');
+    cancel.type = 'button';
+    cancel.textContent = '取消';
+    const save = document.createElement('button');
+    save.type = 'button';
+    save.textContent = '保存';
+    [cancel, save].forEach((btn) => {
+      btn.style.border = '1px solid rgba(148,163,184,0.48)';
+      btn.style.borderRadius = '7px';
+      btn.style.padding = '7px 11px';
+      btn.style.fontSize = '12px';
+      btn.style.cursor = 'pointer';
+    });
+    cancel.style.background = 'rgba(15,23,42,0.85)';
+    cancel.style.color = '#e5e7eb';
+    save.style.background = '#16a34a';
+    save.style.color = '#f8fafc';
+    cancel.addEventListener('click', () => overlay.remove());
+    save.addEventListener('click', async () => {
+      save.disabled = true;
+      status.textContent = '正在保存...';
+      try {
+        const detector = getLinkAssistantFormDetectorLocal();
+        const payload = detector && typeof detector.buildManualResourcePayload === 'function'
+          ? detector.buildManualResourcePayload({
+            sourceUrl: sourceUrl.input.value,
+            pageType: resourceType.input.value,
+            pageAscore: pageAscore.input.value,
+            traffic: traffic.input.value,
+            qualityLabel: qualityLabel.input.value,
+            notes: notes.input.value,
+            sourceTitle: document.title || '',
+            discoveryTargetUrl: scan.sourceUrl || location.href,
+            submitSource: 'manual_assistant'
+          })
+          : {
+            sourceUrl: sourceUrl.input.value,
+            sourceTitle: document.title || '',
+            resourceType: resourceType.input.value || 'generic',
+            pageAscore: pageAscore.input.value || null,
+            traffic: traffic.input.value || null,
+            qualityLabel: qualityLabel.input.value || '',
+            notes: notes.input.value || '',
+            discoveryTargetUrl: scan.sourceUrl || location.href,
+            submitSource: 'manual_assistant'
+          };
+        await contentLinkAssistantApiJson('/link-assistant/resources', { method: 'POST', body: payload });
+        manualAssistantLog('resource.saved', {
+          sourceUrl: payload.sourceUrl,
+          resourceType: payload.resourceType,
+          submitSource: 'manual_assistant'
+        });
+        status.textContent = '已保存到资源库';
+        status.style.color = '#22c55e';
+        setTimeout(() => overlay.remove(), 650);
+      } catch (error) {
+        save.disabled = false;
+        status.textContent = error && error.message ? error.message : '保存失败';
+        status.style.color = '#f97373';
+      }
+    });
+    row.append(cancel, save);
+    modal.append(title, sourceUrl.wrap, resourceType.wrap, pageAscore.wrap, traffic.wrap, qualityLabel.wrap, notes.wrap, status, row);
+    overlay.appendChild(modal);
+    document.documentElement.appendChild(overlay);
+  }
+
+  function setupManualAssistantSubmitWatcher() {
+    if (manualAssistantState.nativeWatcherInstalled) return;
+    manualAssistantState.nativeWatcherInstalled = true;
+    const maybeRecord = async (reason, target) => {
+      if (await isBatchAssistantActiveNow()) return;
+      const scan = manualAssistantState.scan || collectManualAssistantCandidates();
+      const candidate = scan.candidates[manualAssistantState.selectedCandidateIndex] || scan.candidates[0];
+      if (!candidate) return;
+      const root = candidate.root || candidate.form;
+      if (root && target && !root.contains(target) && target !== root) return;
+      try {
+        manualAssistantState.scan = scan;
+        await recordManualAssistantSubmission({
+          result: 'submitted_unconfirmed',
+          errorMessage: reason
+        });
+      } catch (error) {
+        manualAssistantLog('error', {
+          operation: 'native_submit_record',
+          message: error && error.message ? error.message : String(error)
+        });
+      }
+    };
+    document.addEventListener('submit', (event) => {
+      setTimeout(() => maybeRecord('native_form_submit', event.target), 600);
+    }, { capture: true });
+    document.addEventListener('click', (event) => {
+      const target = event.target && event.target.closest
+        ? event.target.closest('button, input[type="submit"], input[type="button"], a')
+        : null;
+      if (!target) return;
+      const text = `${target.textContent || ''} ${target.value || ''} ${target.getAttribute('aria-label') || ''}`.toLowerCase();
+      if (!/(submit|post|send|publish|comment|add|save|提交|发布|发送|评论|保存)/i.test(text)) return;
+      setTimeout(() => maybeRecord('native_submit_button_click', target), 1000);
+    }, { capture: true });
+  }
+
+  function applyQwenPanelMode(mode) {
+    if (!qwenPanelEl || !qwenPanelEl.parentNode) return;
+    const nextMode = mode === 'progress-only' ? 'progress-only' : 'manual';
+    qwenPanelEl._qwenPanelMode = nextMode;
+    if (typeof qwenPanelEl._qwenApplyMode === 'function') {
+      qwenPanelEl._qwenApplyMode(nextMode);
+    }
+  }
+
   function activateQwenProgressTabForBatch() {
+    removeManualAssistantIcon();
     if (!qwenPanelEl || !qwenPanelEl.parentNode || typeof qwenPanelEl._qwenSetActiveTab !== 'function') return;
+    applyQwenPanelMode('progress-only');
     const nextTab = chooseAssistantProgressTabLocal({
       hasBatchContext: !!_batchCtx,
       userSelectedTab: qwenPanelEl._qwenUserSelectedTab === true,
@@ -5893,8 +6547,284 @@
     }
   }
 
-  function createOrToggleQwenPanel() {
+  function makeManualAssistantButton(label, variant = 'secondary') {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.textContent = label;
+    btn.style.border = variant === 'primary' ? 'none' : '1px solid rgba(148,163,184,0.42)';
+    btn.style.borderRadius = '7px';
+    btn.style.padding = '7px 9px';
+    btn.style.fontSize = '12px';
+    btn.style.fontWeight = variant === 'primary' ? '700' : '600';
+    btn.style.lineHeight = '1.1';
+    btn.style.cursor = 'pointer';
+    btn.style.background = variant === 'primary' ? '#16a34a' : 'rgba(15,23,42,0.78)';
+    btn.style.color = '#f8fafc';
+    btn.style.whiteSpace = 'nowrap';
+    return btn;
+  }
+
+  function buildManualAssistantPanelBody(body, helpers = {}) {
+    body.textContent = '';
+    body.style.padding = '10px';
+    body.style.gap = '8px';
+    body.style.overflowY = 'auto';
+    body.style.maxHeight = 'calc(78vh - 54px)';
+
+    const statusEl = document.createElement('div');
+    statusEl.style.fontSize = '11px';
+    statusEl.style.color = '#94a3b8';
+    statusEl.style.lineHeight = '1.35';
+    statusEl.style.minHeight = '16px';
+
+    const summary = document.createElement('div');
+    summary.style.border = '1px solid rgba(148,163,184,0.24)';
+    summary.style.borderRadius = '8px';
+    summary.style.background = 'rgba(2,6,23,0.42)';
+    summary.style.padding = '8px';
+    summary.style.fontSize = '11px';
+    summary.style.lineHeight = '1.45';
+    summary.style.color = '#cbd5e1';
+
+    const pageType = document.createElement('select');
+    ['blog_comment', 'directory', 'media', 'profile', 'generic'].forEach((value) => {
+      const opt = document.createElement('option');
+      opt.value = value;
+      opt.textContent = value;
+      pageType.appendChild(opt);
+    });
+    pageType.style.width = '100%';
+    pageType.style.border = '1px solid rgba(148,163,184,0.42)';
+    pageType.style.borderRadius = '7px';
+    pageType.style.background = 'rgba(15,23,42,0.86)';
+    pageType.style.color = '#f8fafc';
+    pageType.style.padding = '6px 8px';
+    pageType.style.fontSize = '12px';
+
+    const topRow = document.createElement('div');
+    topRow.style.display = 'grid';
+    topRow.style.gridTemplateColumns = '1fr 1fr';
+    topRow.style.gap = '6px';
+    const rescanBtn = makeManualAssistantButton('重新扫描');
+    const nextBtn = makeManualAssistantButton('下一个位置');
+    topRow.append(rescanBtn, nextBtn);
+
+    const detectRow = document.createElement('div');
+    detectRow.style.display = 'grid';
+    detectRow.style.gridTemplateColumns = '1fr 1fr';
+    detectRow.style.gap = '6px';
+    const detectBtn = makeManualAssistantButton('检测当前页');
+    const settingsBtn = makeManualAssistantButton('推广配置');
+    detectRow.append(detectBtn, settingsBtn);
+
+    const textarea = document.createElement('textarea');
+    textarea.style.width = '100%';
+    textarea.style.boxSizing = 'border-box';
+    textarea.style.minHeight = '98px';
+    textarea.style.maxHeight = '170px';
+    textarea.style.borderRadius = '8px';
+    textarea.style.border = '1px solid rgba(148,163,184,0.42)';
+    textarea.style.background = 'rgba(2,6,23,0.78)';
+    textarea.style.color = '#e5e7eb';
+    textarea.style.fontSize = '12px';
+    textarea.style.lineHeight = '1.42';
+    textarea.style.fontFamily = "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace";
+    textarea.style.padding = '8px';
+    textarea.placeholder = 'AI 生成或手动填写的提交内容';
+    textarea.value = manualAssistantState.currentText || lastGeneratedPromotionCopy || '';
+
+    const contentRow = document.createElement('div');
+    contentRow.style.display = 'grid';
+    contentRow.style.gridTemplateColumns = '1fr 1fr';
+    contentRow.style.gap = '6px';
+    const generateFillBtn = makeManualAssistantButton('生成并填充', 'primary');
+    const copyBtn = makeManualAssistantButton('复制内容');
+    contentRow.append(generateFillBtn, copyBtn);
+
+    const submitRow = document.createElement('div');
+    submitRow.style.display = 'grid';
+    submitRow.style.gridTemplateColumns = '1fr 1fr';
+    submitRow.style.gap = '6px';
+    const submitBtn = makeManualAssistantButton('提交并记录', 'primary');
+    const manualRecordBtn = makeManualAssistantButton('已手动提交');
+    submitRow.append(submitBtn, manualRecordBtn);
+
+    const resourceRow = document.createElement('div');
+    resourceRow.style.display = 'grid';
+    resourceRow.style.gridTemplateColumns = '1fr';
+    const saveResourceBtn = makeManualAssistantButton('加入外链资源库');
+    resourceRow.appendChild(saveResourceBtn);
+
+    function setLocalStatus(text, color) {
+      statusEl.textContent = text || '';
+      statusEl.style.color = color || '#94a3b8';
+      if (helpers.setStatus) helpers.setStatus(text || '', color || '#94a3b8');
+    }
+
+    function refreshSummary() {
+      const scan = manualAssistantState.scan || collectManualAssistantCandidates();
+      manualAssistantState.scan = scan;
+      pageType.value = scan.pageType || 'generic';
+      const project = manualAssistantState.currentProject || {};
+      const hit = manualAssistantState.existingBacklink;
+      const source = scan.sourceUrl || location.href;
+      summary.textContent = [
+        `推广：${project.targetDomain || project.targetUrl || '未配置'}`,
+        `页面：${scan.pageType || 'generic'} · 可提交区 ${scan.candidates.length} 个`,
+        `地址：${source.length > 86 ? source.slice(0, 83) + '...' : source}`,
+        hit && hit.success ? '状态：源码已命中，避免重复提交' : '状态：未发现已存在外链'
+      ].join('\n');
+    }
+
+    rescanBtn.addEventListener('click', async () => {
+      setLocalStatus('正在扫描...', '#94a3b8');
+      await runManualAssistantScan({ scroll: true });
+      refreshSummary();
+      setLocalStatus('扫描完成', '#22c55e');
+    });
+    nextBtn.addEventListener('click', () => {
+      const scan = manualAssistantState.scan || collectManualAssistantCandidates();
+      if (!scan.candidates.length) {
+        setLocalStatus('未找到可提交区', '#f59e0b');
+        return;
+      }
+      manualAssistantState.selectedCandidateIndex = (manualAssistantState.selectedCandidateIndex + 1) % scan.candidates.length;
+      scrollManualCandidateIntoView(scan.candidates[manualAssistantState.selectedCandidateIndex]);
+      refreshSummary();
+    });
+    settingsBtn.addEventListener('click', () => {
+      if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.openOptionsPage) {
+        chrome.runtime.openOptionsPage();
+      }
+    });
+    detectBtn.addEventListener('click', async () => {
+      detectBtn.disabled = true;
+      setLocalStatus('正在检测当前页...', '#94a3b8');
+      try {
+        const hit = await handleManualAssistantDetectCurrentPage();
+        refreshSummary();
+        setLocalStatus(hit && hit.success ? '源码已命中，并已同步检测结果' : '当前页未检测到推广外链', hit && hit.success ? '#22c55e' : '#f59e0b');
+      } catch (error) {
+        setLocalStatus(error && error.message ? error.message : '检测失败', '#f97373');
+      } finally {
+        detectBtn.disabled = false;
+      }
+    });
+    textarea.addEventListener('input', () => {
+      manualAssistantState.currentText = textarea.value;
+      lastGeneratedPromotionCopy = textarea.value;
+    });
+    generateFillBtn.addEventListener('click', async () => {
+      generateFillBtn.disabled = true;
+      setLocalStatus('正在生成并填充...', '#94a3b8');
+      try {
+        const text = await generatePromotionCopyWithRetry(3);
+        if (!text) {
+          setLocalStatus('当前页面命中黑名单，已跳过生成', '#f59e0b');
+          return;
+        }
+        manualAssistantState.currentText = text;
+        lastGeneratedPromotionCopy = text;
+        textarea.value = text;
+        await recordGenerationTime(text);
+        const fill = await fillManualAssistantFields(text);
+        manualAssistantLog('generate.done', {
+          pageType: manualAssistantState.scan && manualAssistantState.scan.pageType,
+          contentLength: text.length,
+          filledCount: fill.filledCount
+        });
+        setLocalStatus(`已生成并填充 ${fill.filledCount} 个字段`, '#22c55e');
+      } catch (error) {
+        setLocalStatus(error && error.message ? error.message : '生成失败', '#f97373');
+      } finally {
+        generateFillBtn.disabled = false;
+      }
+    });
+    copyBtn.addEventListener('click', async () => {
+      const text = textarea.value || '';
+      try {
+        if (navigator.clipboard && navigator.clipboard.writeText) await navigator.clipboard.writeText(text);
+        else {
+          textarea.focus();
+          textarea.select();
+          document.execCommand('copy');
+        }
+        setLocalStatus('内容已复制', '#22c55e');
+      } catch (_) {
+        setLocalStatus('复制失败，请手动选择复制', '#f97373');
+      }
+    });
+    submitBtn.addEventListener('click', async () => {
+      submitBtn.disabled = true;
+      setLocalStatus('正在填充并尝试提交...', '#94a3b8');
+      try {
+        const text = textarea.value || manualAssistantState.currentText || '';
+        manualAssistantState.currentText = text;
+        await fillManualAssistantFields(text);
+        const scan = manualAssistantState.scan || collectManualAssistantCandidates();
+        const candidate = scan.candidates[manualAssistantState.selectedCandidateIndex] || scan.candidates[0];
+        let clickResult = null;
+        if (candidate && candidate.kind === 'blog_comment') {
+          clickResult = await clickCommentSubmitButton(candidate.form || null).catch((error) => ({ success: false, error: error.message || String(error) }));
+        } else {
+          const button = candidate && (candidate.root || candidate.form)
+            ? (candidate.root || candidate.form).querySelector('button[type="submit"], input[type="submit"], button:not([type]), input[type="button"]')
+            : null;
+          if (button && isButtonClickable(button)) {
+            button.click();
+            clickResult = { success: true, submitResult: 'clicked' };
+          } else {
+            clickResult = { success: false, error: 'no_submit_button' };
+          }
+        }
+        const result = clickResult && clickResult.success ? 'submitted_unconfirmed' : 'manual_required';
+        await recordManualAssistantSubmission({
+          result,
+          aiContent: text,
+          errorMessage: clickResult && clickResult.error ? clickResult.error : ''
+        });
+        setLocalStatus(clickResult && clickResult.success ? '已点击提交并记录' : '已记录，需手动处理提交', clickResult && clickResult.success ? '#22c55e' : '#f59e0b');
+      } catch (error) {
+        setLocalStatus(error && error.message ? error.message : '提交记录失败', '#f97373');
+      } finally {
+        submitBtn.disabled = false;
+      }
+    });
+    manualRecordBtn.addEventListener('click', async () => {
+      manualRecordBtn.disabled = true;
+      setLocalStatus('正在记录...', '#94a3b8');
+      try {
+        await recordManualAssistantSubmission({
+          result: 'submitted_unconfirmed',
+          aiContent: textarea.value || manualAssistantState.currentText || '',
+          errorMessage: 'user_marked_manual_submitted'
+        });
+        setLocalStatus('已记录本次手动提交', '#22c55e');
+      } catch (error) {
+        setLocalStatus(error && error.message ? error.message : '记录失败', '#f97373');
+      } finally {
+        manualRecordBtn.disabled = false;
+      }
+    });
+    saveResourceBtn.addEventListener('click', openManualResourceModal);
+
+    body.append(summary, pageType, topRow, detectRow, textarea, contentRow, submitRow, resourceRow, statusEl);
+    if (qwenPanelEl) {
+      qwenPanelEl._qwenTextarea = textarea;
+      qwenPanelEl._manualAssistantRefresh = refreshSummary;
+    }
+    refreshSummary();
+  }
+
+  function createOrToggleQwenPanel(options = {}) {
+    const requestedMode = options.mode || qwenPanelRequestedMode || (options.tab === 'progress' ? 'progress-only' : 'manual');
+    qwenPanelRequestedMode = requestedMode === 'progress-only' ? 'progress-only' : 'manual';
     if (qwenPanelEl && qwenPanelEl.parentNode) {
+      if (options.forceOpen) {
+        applyQwenPanelMode(qwenPanelRequestedMode);
+        qwenPanelEl.style.display = 'flex';
+        return;
+      }
       qwenPanelEl.parentNode.removeChild(qwenPanelEl);
       qwenPanelEl = null;
       if (qwenProgressTimer) {
@@ -5909,9 +6839,9 @@
     panel.style.position = 'fixed';
     panel.style.right = '24px';
     panel.style.bottom = '24px';
-    panel.style.width = '360px';
+    panel.style.width = qwenPanelRequestedMode === 'progress-only' ? '340px' : '382px';
     panel.style.maxWidth = '80vw';
-    panel.style.maxHeight = '60vh';
+    panel.style.maxHeight = qwenPanelRequestedMode === 'progress-only' ? '60vh' : '78vh';
     panel.style.zIndex = '2147483647';
     panel.style.background = 'rgba(15,23,42,0.97)';
     panel.style.color = '#e5e7eb';
@@ -5932,7 +6862,7 @@
     header.style.borderBottom = '1px solid rgba(148,163,184,0.25)';
     header.style.fontSize = '13px';
     header.style.fontWeight = '600';
-    header.textContent = 'AI · 网站推广助手';
+    header.textContent = qwenPanelRequestedMode === 'progress-only' ? '批量进度' : '手动外链助手';
 
     const closeBtn = document.createElement('button');
     closeBtn.textContent = '×';
@@ -6155,6 +7085,9 @@
     qwenPanelEl._qwenPresetCopyMode = false;
 
     function setTabActive(tabName) {
+      if (qwenPanelEl && qwenPanelEl._qwenPanelMode === 'progress-only') {
+        tabName = 'progress';
+      }
       const isProgress = tabName === 'progress';
       qwenPanelEl._qwenActiveTab = isProgress ? 'progress' : 'manual';
       body.style.display = isProgress ? 'none' : 'flex';
@@ -6166,6 +7099,25 @@
     }
     qwenPanelEl._qwenSetActiveTab = setTabActive;
     qwenPanelEl._qwenRefreshBatchProgress = refreshBatchProgressPane;
+    qwenPanelEl._qwenApplyMode = (mode) => {
+      const progressOnly = mode === 'progress-only';
+      qwenPanelEl._qwenPanelMode = progressOnly ? 'progress-only' : 'manual';
+      panel.style.width = progressOnly ? '340px' : '382px';
+      panel.style.maxHeight = progressOnly ? '60vh' : '78vh';
+      tabBar.style.display = 'none';
+      const firstTextNode = Array.from(header.childNodes).find((node) => node.nodeType === Node.TEXT_NODE);
+      if (firstTextNode) firstTextNode.textContent = progressOnly ? '批量进度' : '手动外链助手';
+      if (!progressOnly && qwenPanelEl._manualAssistantBuilt !== true) {
+        buildManualAssistantPanelBody(body, {
+          setStatus,
+          setCopyEnabled,
+          setGenerateLoading
+        });
+        qwenPanelEl._manualAssistantBuilt = true;
+      }
+      setTabActive(progressOnly ? 'progress' : 'manual');
+      if (progressOnly && typeof refreshBatchProgressPane === 'function') refreshBatchProgressPane();
+    };
 
     async function refreshBatchProgressPane() {
       if (!qwenPanelEl || !qwenPanelEl.parentNode || typeof chrome === 'undefined' || !chrome.storage || !chrome.storage.local) return;
@@ -6640,6 +7592,16 @@
     btnRow.appendChild(generateBtn);
     btnRow.appendChild(outlinkBtn);
     btnRow.appendChild(copyBtn);
+
+    if (qwenPanelRequestedMode !== 'progress-only') {
+      buildManualAssistantPanelBody(body, {
+        setStatus,
+        setCopyEnabled,
+        setGenerateLoading
+      });
+      qwenPanelEl._manualAssistantBuilt = true;
+    }
+    applyQwenPanelMode(qwenPanelRequestedMode);
   }
 
   // ====== 独立外链导出浮窗按钮 ======
@@ -6715,11 +7677,20 @@
 
   function showQwenPanel(options = {}) {
     if (!qwenPanelEl || !qwenPanelEl.parentNode) {
-      createOrToggleQwenPanel();
+      const mode = options.progressOnly || options.tab === 'progress' ? 'progress-only' : 'manual';
+      createOrToggleQwenPanel({ forceOpen: true, mode });
     }
     if (!qwenPanelEl || !qwenPanelEl.parentNode) return false;
     qwenPanelEl.style.display = 'flex';
     qwenPanelEl.style.zIndex = '2147483647';
+    if (options.progressOnly || options.tab === 'progress') {
+      applyQwenPanelMode('progress-only');
+    } else {
+      applyQwenPanelMode('manual');
+      if (typeof qwenPanelEl._manualAssistantRefresh === 'function') {
+        qwenPanelEl._manualAssistantRefresh();
+      }
+    }
     if (options.tab === 'manual' && typeof qwenPanelEl._qwenSetActiveTab === 'function') {
       qwenPanelEl._qwenUserSelectedTab = true;
       qwenPanelEl._qwenSetActiveTab('manual');
@@ -6800,10 +7771,21 @@
         return;
       }
       if (message && message.type === 'TOGGLE_PROMOTE_PANEL') {
-        createOrToggleQwenPanel();
+        isBatchAssistantActiveNow().then((active) => {
+          if (active) {
+            showQwenPanel({ tab: 'progress', progressOnly: true });
+          } else {
+            openManualAssistantPanel();
+          }
+        }).catch(() => openManualAssistantPanel());
+        _sendResponse({ ok: true, async: true });
+        return;
       }
       if (message && message.type === 'SHOW_PROMOTE_PANEL') {
-        const options = { tab: message.tab === 'progress' ? 'progress' : 'manual' };
+        const options = {
+          tab: message.tab === 'progress' ? 'progress' : 'manual',
+          progressOnly: message.tab === 'progress'
+        };
         if (Object.prototype.hasOwnProperty.call(message, 'presetAiContent')) {
           options.presetAiContent = message.presetAiContent;
         }
@@ -6813,13 +7795,15 @@
       }
       if (message && message.type === 'BATCH_HANDLE') {
         console.log('[content] BATCH_HANDLE received', { batchId: message.batchId, urlIndex: message.urlIndex, url: message.url, time: new Date().toISOString() });
+        removeManualAssistantIcon();
+        showQwenPanel({ tab: 'progress', progressOnly: true });
         const taskKey = getBatchTaskKey(message.batchId, message.urlIndex);
         if (runningBatchTaskKey === taskKey) {
           console.log('[content] duplicate BATCH_HANDLE ignored because task is already running:', taskKey);
           _sendResponse({ ok: true, accepted: true, duplicate: true, urlIndex: message.urlIndex });
           return;
         }
-        setBatchContext(message.batchId, message.urlIndex, message.url, message);
+        setBatchContext(message.batchId, message.urlIndex, message.url);
         _sendResponse({ ok: true, accepted: true, urlIndex: message.urlIndex });
         handleBatchTask(message.batchId, message.urlIndex, message.url)
           .then(() => {
