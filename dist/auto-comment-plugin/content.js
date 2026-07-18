@@ -1250,6 +1250,7 @@
   const BATCH_SUCCESS_CONFIRMATION_MARKER = 'submit-confirmed-v3';
   const BATCH_PENDING_TASK_TTL_MS = 10 * 60 * 1000;
   const AI_COPY_REQUEST_TIMEOUT_MS = 180 * 1000;
+  const BATCH_ACTIVE_GLOBAL_SUPPRESS_MS = 45 * 1000;
 
   function safeLowerStringLocal(value) {
     if (value == null) return '';
@@ -6085,8 +6086,29 @@
       'batchSubmitCtx',
       'batchCtx'
     ], resolve));
-    const possible = [data[BATCH_ACTIVE_TASK_KEY], data[BATCH_PENDING_TASK_KEY], data.batchSubmitCtx, data.batchCtx].filter(Boolean);
-    return possible.some((item) => item && item.batchId && (!item.url || isSameTaskUrl(item.url, location.href)));
+    const pendingOrSubmitContexts = [data[BATCH_PENDING_TASK_KEY], data.batchSubmitCtx, data.batchCtx].filter(Boolean);
+    const matchingPageContext = pendingOrSubmitContexts.some((item) => {
+      if (!item || !item.batchId || !item.url) return false;
+      return isSameTaskUrl(item.url, location.href);
+    });
+    if (matchingPageContext) return true;
+
+    const activeTask = data[BATCH_ACTIVE_TASK_KEY];
+    if (activeTask && activeTask.batchId) {
+      const status = safeLowerStringLocal(activeTask.status);
+      const updatedAt = Number(activeTask.updatedAt || activeTask.batchStartedAt || 0);
+      const fresh = updatedAt > 0 && Date.now() - updatedAt <= BATCH_ACTIVE_GLOBAL_SUPPRESS_MS;
+      const running = ['running', 'opening', 'processing', 'submitting'].includes(status);
+      if (running && fresh) return true;
+      manualAssistantLog('batch_state.ignored', {
+        reason: 'stale_or_unmatched_active_task',
+        batchId: activeTask.batchId,
+        status,
+        ageMs: updatedAt > 0 ? Date.now() - updatedAt : null,
+        hasUrl: !!activeTask.url
+      });
+    }
+    return false;
   }
 
   function removeManualAssistantIcon() {
