@@ -6,6 +6,7 @@ const {
   buildSemrushCompatibleResourceCsv,
   normalizeHttpUrl,
   normalizePromotionProject,
+  normalizeSubmitMode,
   shapeResourcePage
 } = require('../lib/link-assistant-resource-logic');
 
@@ -469,7 +470,7 @@ function createMemoryLinkAssistantStore() {
       return { ...row };
     },
     async listResources() {
-      return verifiedBacklinks.map((verified) => {
+      const verifiedRows = verifiedBacklinks.map((verified) => {
         const resource = resourcePages.find((row) => String(row.id) === String(verified.resourcePageId)) || {};
         const project = projects.find((row) => String(row.id) === String(verified.promotionProjectId)) || {};
         return {
@@ -489,7 +490,24 @@ function createMemoryLinkAssistantStore() {
           metaDescription: project.metaDescription,
           h1: project.h1
         };
-      }).map(shapeResourceRow);
+      });
+      const verifiedResourceIds = new Set(verifiedBacklinks.map((row) => String(row.resourcePageId)));
+      const unverifiedRows = resourcePages
+        .filter((resource) => !verifiedResourceIds.has(String(resource.id)))
+        .map((resource) => ({
+          ...resource,
+          verifiedBacklinkId: null,
+          promotionProjectId: null,
+          targetUrl: '',
+          targetDomain: '',
+          targetDomainAuthority: null,
+          targetDomainTraffic: null,
+          firstVerifiedAt: '',
+          lastVerifiedAt: '',
+          backlinkStatus: '',
+          matchedHref: ''
+        }));
+      return [...verifiedRows, ...unverifiedRows].map(shapeResourceRow);
     }
   };
 }
@@ -860,6 +878,8 @@ function createMysqlLinkAssistantStore(db = database) {
         await db.execute(`
           UPDATE link_submission_records
           SET resource_page_id = ?,
+            submit_mode = ?,
+            result = ?,
             target_url = ?,
             target_domain = ?,
             source_url = ?,
@@ -874,6 +894,8 @@ function createMysqlLinkAssistantStore(db = database) {
           WHERE id = ?
         `, [
           submission.resourcePageId || null,
+          submission.submitMode || 'auto',
+          submission.submitResult || '',
           submission.targetUrl,
           submission.targetDomain,
           submission.sourceUrl,
@@ -900,7 +922,7 @@ function createMysqlLinkAssistantStore(db = database) {
         submission.sourceDomain,
         submission.promotionProjectId,
         1,
-        'auto',
+        submission.submitMode || 'auto',
         submission.submitResult || '',
         submission.resourcePageId || null,
         submission.targetUrl,
@@ -992,10 +1014,10 @@ function createMysqlLinkAssistantStore(db = database) {
           pp.page_title,
           pp.meta_description,
           pp.h1
-        FROM verified_backlinks vb
-        JOIN resource_pages rp ON rp.id = vb.resource_page_id
+        FROM resource_pages rp
+        LEFT JOIN verified_backlinks vb ON rp.id = vb.resource_page_id
         LEFT JOIN link_promotion_projects pp ON pp.id = vb.promotion_project_id
-        ORDER BY vb.last_verified_at DESC, rp.updated_at DESC
+        ORDER BY COALESCE(vb.last_verified_at, '') DESC, rp.updated_at DESC
       `, []);
       return rows.map(shapeResourceRow);
     }
@@ -1133,6 +1155,7 @@ function createLinkAssistantService(options = {}) {
       sourceUrlKey: resource.sourceUrlKey,
       sourceDomain: resource.sourceDomain,
       discoveryTargetUrl: resource.firstDiscoveryTargetUrl || source.discoveryTargetUrl || '',
+      submitMode: normalizeSubmitMode(source.submitMode || source.submit_mode || source.defaultSubmitMode || source.default_submit_mode),
       submitResult: safeText(source.submitResult || source.result),
       aiContent: source.aiContent == null ? null : String(source.aiContent),
       errorMessage: source.errorMessage == null ? null : String(source.errorMessage),
@@ -1155,6 +1178,27 @@ function createLinkAssistantService(options = {}) {
       sourceUrl: resource.sourceUrl,
       sourceDomain: resource.sourceDomain
     };
+  }
+
+  async function saveResourcePage(input) {
+    const source = input && typeof input === 'object' ? input : {};
+    const resource = shapeResourcePage({
+      ...source,
+      sourceUrl: source.sourceUrl || source.source_url || source.url
+    });
+    if (!resource.sourceUrl || !resource.sourceUrlKey) {
+      const error = new Error('sourceUrl is required');
+      error.statusCode = 400;
+      throw error;
+    }
+    const saved = await store.upsertResourcePage(resource, currentIso());
+    console.info('[link-assistant][resource-library] resource page saved', {
+      resourcePageId: saved && saved.id,
+      sourceDomain: resource.sourceDomain,
+      resourceType: resource.resourceType,
+      submitSource: safeText(source.submitSource || source.submit_source || 'manual_assistant')
+    });
+    return shapeResourceRow(saved);
   }
 
   function buildRecoveredSubmissionInput(source) {
@@ -1341,6 +1385,7 @@ function createLinkAssistantService(options = {}) {
     fetchPromotionMetadata,
     savePromotionProject,
     saveSubmission,
+    saveResourcePage,
     saveBacklinkCheckResult,
     listResources,
     patchResource: async (id, patch) => {
@@ -1417,6 +1462,11 @@ function createRouter(service = createLinkAssistantService()) {
   router.get('/link-assistant/resources', (req, res) => handle(async () => {
     const rows = filterResourceRowsForQuery(await service.listResources(), req.query || {});
     res.status(200).json({ success: true, resources: rows });
+  }, req, res));
+
+  router.post('/link-assistant/resources', (req, res) => handle(async () => {
+    const resource = await service.saveResourcePage(req.body || {});
+    res.status(200).json({ success: true, resource });
   }, req, res));
 
   router.patch('/link-assistant/resources/:id', (req, res) => handle(async () => {

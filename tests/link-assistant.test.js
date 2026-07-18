@@ -144,6 +144,86 @@ test('saving a submission does not insert resource pages before backlink verific
   assert.deepEqual(calls, []);
 });
 
+test('manual assistant submission metadata is preserved in raw payload', async () => {
+  let savedSubmission = null;
+  let nextId = 1;
+  const store = {
+    async ensureTables() {},
+    async listProjects() { return []; },
+    async saveProject(project, now) {
+      return { ...project, id: nextId++, createdAt: now, updatedAt: now };
+    },
+    async getProject() { return null; },
+    async deleteProject() { return false; },
+    async upsertResourcePage() {
+      throw new Error('resource page should not be upserted during submission save');
+    },
+    async saveSubmission(submission, now) {
+      savedSubmission = { ...submission, id: nextId++, createdAt: now, updatedAt: now };
+      return { ...savedSubmission };
+    },
+    async getSubmission() { return savedSubmission ? { ...savedSubmission } : null; },
+    async updateSubmissionBacklinkCheck() { return null; },
+    async upsertVerifiedBacklink() { return null; },
+    async listResources() { return []; },
+    async patchResourcePage() { return null; },
+    async deleteResourcePage() { return false; }
+  };
+  const service = createLinkAssistantService({
+    store,
+    now: () => new Date('2026-07-18T08:00:00.000Z')
+  });
+
+  await service.saveSubmission({
+    targetUrl: 'https://ainail.design/',
+    sourceUrl: 'https://example.com/submit',
+    submitResult: 'submitted_unconfirmed',
+    submitSource: 'manual_assistant',
+    submitMode: 'manual',
+    pageType: 'directory_submission',
+    detectorVersion: 'manual-assistant-detector-2026-07-18-v1',
+    submissionSourceUrl: 'https://example.com/submit',
+    detectedExistingBacklink: true,
+    existingBacklinkHref: 'https://ainail.design/'
+  });
+
+  assert.equal(savedSubmission.rawPayload.submitSource, 'manual_assistant');
+  assert.equal(savedSubmission.rawPayload.submitMode, 'manual');
+  assert.equal(savedSubmission.rawPayload.pageType, 'directory_submission');
+  assert.equal(savedSubmission.rawPayload.detectorVersion, 'manual-assistant-detector-2026-07-18-v1');
+  assert.equal(savedSubmission.rawPayload.submissionSourceUrl, 'https://example.com/submit');
+  assert.equal(savedSubmission.rawPayload.detectedExistingBacklink, true);
+});
+
+test('manual resource save creates resource pool entry without verified backlink', async () => {
+  const service = createLinkAssistantService({
+    store: createMemoryLinkAssistantStore(),
+    now: () => new Date('2026-07-18T08:00:00.000Z')
+  });
+
+  const saved = await service.saveResourcePage({
+    sourceUrl: 'https://directory.example/submit',
+    sourceTitle: 'Submit AI tools',
+    resourceType: 'directory_submission',
+    qualityLabel: 'high',
+    pageAscore: 37,
+    externalLinks: 1200,
+    notes: 'manual resource pool entry',
+    submitSource: 'manual_assistant'
+  });
+
+  assert.equal(saved.sourceUrl, 'https://directory.example/submit');
+  assert.equal(saved.resourceType, 'directory_submission');
+  assert.equal(saved.qualityLabel, 'high');
+
+  const resources = await service.listResources();
+  assert.equal(resources.length, 1);
+  assert.equal(resources[0].sourceUrl, 'https://directory.example/submit');
+  assert.equal(resources[0].resourceType, 'directory_submission');
+  assert.equal(resources[0].backlinkStatus, '');
+  assert.equal(resources[0].promotionProjectId, '');
+});
+
 test('successful backlink check upserts one verified resource', async () => {
   const service = createLinkAssistantService({
     store: createMemoryLinkAssistantStore(),
