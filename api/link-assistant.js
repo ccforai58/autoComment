@@ -95,6 +95,7 @@ function filterResourceRowsForQuery(rows, query = {}) {
   const resourceType = safeText(query.resourceType || query.resource_type);
   const qualityLabel = safeText(query.qualityLabel || query.quality_label);
   const discoveryTargetUrl = safeText(query.discoveryTargetUrl || query.discovery_target_url);
+  const submitSourceFilter = safeText(query.submitSource || query.submit_source);
   let minPageAscore = toOptionalNumber(query.minPageAscore);
   let maxPageAscore = toOptionalNumber(query.maxPageAscore);
   if (minPageAscore !== null && maxPageAscore !== null && minPageAscore > maxPageAscore) {
@@ -106,6 +107,14 @@ function filterResourceRowsForQuery(rows, query = {}) {
     if (promotionProjectId && safeText(rowValue(row, 'promotionProjectId', 'promotion_project_id')) !== promotionProjectId) return false;
     if (resourceType && safeText(rowValue(row, 'resourceType', 'resource_type')) !== resourceType) return false;
     if (qualityLabel && safeText(rowValue(row, 'qualityLabel', 'quality_label')) !== qualityLabel) return false;
+    if (submitSourceFilter) {
+      const rowSubmitSource = normalizeSubmitSource(rowValue(row, 'submitSource', 'submit_source'), '');
+      if (submitSourceFilter === 'other') {
+        if (rowSubmitSource === 'manual_assistant' || rowSubmitSource === 'batch_auto') return false;
+      } else if (normalizeSubmitSource(submitSourceFilter, '') !== rowSubmitSource) {
+        return false;
+      }
+    }
     if (discoveryTargetUrl && !resourceMatchesDiscoveryTarget(row, discoveryTargetUrl)) return false;
     const pageAscore = toOptionalNumber(rowValue(row, 'pageAscore', 'page_ascore'));
     if (minPageAscore !== null || maxPageAscore !== null) {
@@ -181,6 +190,42 @@ function extractFirstTagText(html, tagName) {
   return match ? stripHtmlTags(match[1]) : '';
 }
 
+function extractTagTexts(html, tagName, limit = 10) {
+  const result = [];
+  const pattern = new RegExp(`<${tagName}\\b[^>]*>([\\s\\S]*?)<\\/${tagName}>`, 'gi');
+  let match;
+  while ((match = pattern.exec(String(html || ''))) !== null && result.length < limit) {
+    const text = stripHtmlTags(match[1]);
+    if (text) result.push(text);
+  }
+  return result;
+}
+
+function extractImageAlts(html, limit = 12) {
+  const result = [];
+  const tags = String(html || '').match(/<img\b[^>]*>/gi) || [];
+  for (const tag of tags) {
+    const attrs = parseHtmlAttributes(tag);
+    const alt = collapseWhitespace(attrs.alt || attrs.title || '');
+    if (!alt) continue;
+    result.push(alt);
+    if (result.length >= limit) break;
+  }
+  return result;
+}
+
+function extractBodySummary(html) {
+  const bodyMatch = String(html || '').match(/<body\b[^>]*>([\s\S]*?)<\/body>/i);
+  const body = bodyMatch ? bodyMatch[1] : String(html || '');
+  const withoutNoise = body
+    .replace(/<script\b[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style\b[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<noscript\b[\s\S]*?<\/noscript>/gi, ' ')
+    .replace(/<nav\b[\s\S]*?<\/nav>/gi, ' ')
+    .replace(/<footer\b[\s\S]*?<\/footer>/gi, ' ');
+  return stripHtmlTags(withoutNoise).slice(0, 1200);
+}
+
 function parseMetadataKeywords(value) {
   const seen = new Set();
   const result = [];
@@ -203,6 +248,8 @@ function extractPromotionMetadataFromHtml(html, target) {
     || getMetaContent(html, (attrs) => String(attrs.property || '').toLowerCase() === 'og:description')
     || getMetaContent(html, (attrs) => String(attrs.name || '').toLowerCase() === 'twitter:description');
   const keywordsText = getMetaContent(html, (attrs) => String(attrs.name || '').toLowerCase() === 'keywords');
+  const ogTitle = getMetaContent(html, (attrs) => String(attrs.property || '').toLowerCase() === 'og:title');
+  const ogDescription = getMetaContent(html, (attrs) => String(attrs.property || '').toLowerCase() === 'og:description');
 
   return {
     targetUrl: target.targetUrl,
@@ -210,7 +257,12 @@ function extractPromotionMetadataFromHtml(html, target) {
     keywords: parseMetadataKeywords(keywordsText),
     pageTitle: collapseWhitespace(title),
     metaDescription: collapseWhitespace(description),
-    h1: extractFirstTagText(html, 'h1')
+    h1: extractFirstTagText(html, 'h1'),
+    h2Texts: extractTagTexts(html, 'h2', 10),
+    imageAlts: extractImageAlts(html, 12),
+    ogTitle: collapseWhitespace(ogTitle),
+    ogDescription: collapseWhitespace(ogDescription),
+    bodySummary: extractBodySummary(html)
   };
 }
 
@@ -341,6 +393,7 @@ function shapeResourceRow(row) {
     pageAscore: rowValue(row, 'pageAscore', 'page_ascore'),
     externalLinks: rowValue(row, 'externalLinks', 'external_links'),
     lastSeen: rowValue(row, 'lastSeen', 'last_seen'),
+    submitSource: normalizeSubmitSource(rowValue(row, 'submitSource', 'submit_source'), ''),
     semrushHeadersJson: rowValue(row, 'semrushHeadersJson', 'semrush_headers_json') || '[]',
     semrushHeaders: parseJsonArray(rowValue(row, 'semrushHeadersJson', 'semrush_headers_json')),
     semrushRowJson: rowValue(row, 'semrushRowJson', 'semrush_row_json') || '[]',
@@ -360,6 +413,13 @@ function shapeResourceRow(row) {
     createdAt: rowValue(row, 'createdAt', 'created_at'),
     updatedAt: rowValue(row, 'updatedAt', 'updated_at')
   };
+}
+
+function normalizeSubmitSource(value, fallback = 'batch_auto') {
+  const text = safeText(value || fallback);
+  if (text === 'manual_assistant') return 'manual_assistant';
+  if (text === 'batch_auto' || text === 'batch') return 'batch_auto';
+  return text || fallback;
 }
 
 function createMemoryLinkAssistantStore() {
@@ -497,11 +557,11 @@ function createMemoryLinkAssistantStore() {
         .map((resource) => ({
           ...resource,
           verifiedBacklinkId: null,
-          promotionProjectId: null,
-          targetUrl: '',
-          targetDomain: '',
-          targetDomainAuthority: null,
-          targetDomainTraffic: null,
+          promotionProjectId: resource.promotionProjectId || null,
+          targetUrl: resource.targetUrl || '',
+          targetDomain: resource.targetDomain || '',
+          targetDomainAuthority: resource.targetDomainAuthority || null,
+          targetDomainTraffic: resource.targetDomainTraffic || null,
           firstVerifiedAt: '',
           lastVerifiedAt: '',
           backlinkStatus: '',
@@ -595,9 +655,17 @@ function createMysqlLinkAssistantStore(db = database) {
     await ensureColumn('link_submission_records', 'latest_backlink_checked_at', "VARCHAR(40) DEFAULT ''");
     await ensureColumn('link_submission_records', 'latest_backlink_matched_href', 'TEXT DEFAULT NULL');
     await ensureColumn('link_submission_records', 'latest_backlink_reason', 'TEXT DEFAULT NULL');
+    await ensureColumn('link_submission_records', 'submit_source', "VARCHAR(40) DEFAULT 'batch_auto'");
     await ensureColumn('link_submission_records', 'raw_payload', 'JSON DEFAULT NULL');
     await ensureColumn('resource_pages', 'semrush_headers_json', 'TEXT DEFAULT NULL');
     await ensureColumn('resource_pages', 'semrush_row_json', 'MEDIUMTEXT DEFAULT NULL');
+    await ensureColumn('resource_pages', 'promotion_project_id', 'BIGINT UNSIGNED DEFAULT NULL');
+    await ensureColumn('resource_pages', 'target_url', 'TEXT DEFAULT NULL');
+    await ensureColumn('resource_pages', 'target_url_key', 'VARCHAR(768) DEFAULT NULL');
+    await ensureColumn('resource_pages', 'target_domain', "VARCHAR(255) DEFAULT ''");
+    await ensureColumn('resource_pages', 'target_domain_authority', 'DECIMAL(12,2) DEFAULT NULL');
+    await ensureColumn('resource_pages', 'target_domain_traffic', 'BIGINT DEFAULT NULL');
+    await ensureColumn('resource_pages', 'submit_source', "VARCHAR(40) DEFAULT ''");
     if (await hasColumn('link_submission_records', 'resource_id')) {
       await dropForeignKeysForColumn('link_submission_records', 'resource_id');
       await db.execute('ALTER TABLE link_submission_records MODIFY COLUMN resource_id BIGINT UNSIGNED DEFAULT NULL', []);
@@ -648,8 +716,15 @@ function createMysqlLinkAssistantStore(db = database) {
           page_ascore DECIMAL(10,2) DEFAULT NULL,
           external_links INT DEFAULT NULL,
           last_seen VARCHAR(80) DEFAULT '',
+          submit_source VARCHAR(40) DEFAULT '',
           semrush_headers_json TEXT DEFAULT NULL,
           semrush_row_json MEDIUMTEXT DEFAULT NULL,
+          promotion_project_id BIGINT UNSIGNED DEFAULT NULL,
+          target_url TEXT DEFAULT NULL,
+          target_url_key VARCHAR(768) DEFAULT NULL,
+          target_domain VARCHAR(255) DEFAULT '',
+          target_domain_authority DECIMAL(12,2) DEFAULT NULL,
+          target_domain_traffic BIGINT DEFAULT NULL,
           created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
           updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
           PRIMARY KEY (id),
@@ -694,6 +769,7 @@ function createMysqlLinkAssistantStore(db = database) {
           latest_backlink_checked_at VARCHAR(40) DEFAULT '',
           latest_backlink_matched_href TEXT DEFAULT NULL,
           latest_backlink_reason TEXT DEFAULT NULL,
+          submit_source VARCHAR(40) DEFAULT 'batch_auto',
           raw_payload JSON DEFAULT NULL,
           created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
           updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -798,8 +874,9 @@ function createMysqlLinkAssistantStore(db = database) {
         INSERT INTO resource_pages (
           source_url, source_url_key, source_domain, first_discovery_target_url, last_discovery_target_url,
           discovery_target_urls_json, source_title, resource_type, quality_label, topic_tags_json,
-          notes, page_ascore, external_links, last_seen, semrush_headers_json, semrush_row_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          notes, page_ascore, external_links, last_seen, submit_source, semrush_headers_json, semrush_row_json,
+          promotion_project_id, target_url, target_url_key, target_domain, target_domain_authority, target_domain_traffic
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON DUPLICATE KEY UPDATE
           source_url = VALUES(source_url),
           source_domain = VALUES(source_domain),
@@ -813,8 +890,15 @@ function createMysqlLinkAssistantStore(db = database) {
           page_ascore = COALESCE(VALUES(page_ascore), page_ascore),
           external_links = COALESCE(VALUES(external_links), external_links),
           last_seen = IF(VALUES(last_seen) = '', last_seen, VALUES(last_seen)),
+          submit_source = IF(VALUES(submit_source) = '', submit_source, VALUES(submit_source)),
           semrush_headers_json = IF(VALUES(semrush_headers_json) = '[]', semrush_headers_json, VALUES(semrush_headers_json)),
           semrush_row_json = IF(VALUES(semrush_row_json) = '[]', semrush_row_json, VALUES(semrush_row_json)),
+          promotion_project_id = COALESCE(VALUES(promotion_project_id), promotion_project_id),
+          target_url = IF(VALUES(target_url) IS NULL OR VALUES(target_url) = '', target_url, VALUES(target_url)),
+          target_url_key = IF(VALUES(target_url_key) IS NULL OR VALUES(target_url_key) = '', target_url_key, VALUES(target_url_key)),
+          target_domain = IF(VALUES(target_domain) = '', target_domain, VALUES(target_domain)),
+          target_domain_authority = COALESCE(VALUES(target_domain_authority), target_domain_authority),
+          target_domain_traffic = COALESCE(VALUES(target_domain_traffic), target_domain_traffic),
           updated_at = CURRENT_TIMESTAMP
       `, [
         resource.sourceUrl,
@@ -831,8 +915,15 @@ function createMysqlLinkAssistantStore(db = database) {
         resource.pageAscore,
         resource.externalLinks,
         resource.lastSeen,
+        normalizeSubmitSource(resource.submitSource, ''),
         resource.semrushHeadersJson,
-        resource.semrushRowJson
+        resource.semrushRowJson,
+        resource.promotionProjectId || null,
+        resource.targetUrl || null,
+        resource.targetUrlKey || null,
+        resource.targetDomain || '',
+        resource.targetDomainAuthority || null,
+        resource.targetDomainTraffic || null
       ]);
       return shapeResourceRow(await db.queryOne('SELECT * FROM resource_pages WHERE source_url_key = ?', [resource.sourceUrlKey]));
     },
@@ -889,6 +980,7 @@ function createMysqlLinkAssistantStore(db = database) {
             submit_result = ?,
             ai_content = ?,
             error_message = ?,
+            submit_source = ?,
             raw_payload = ?,
             updated_at = CURRENT_TIMESTAMP
           WHERE id = ?
@@ -905,6 +997,7 @@ function createMysqlLinkAssistantStore(db = database) {
           submission.submitResult,
           submission.aiContent,
           submission.errorMessage,
+          normalizeSubmitSource(submission.submitSource, 'batch_auto'),
           JSON.stringify(submission.rawPayload || {}),
           existingSubmission.id
         ]);
@@ -914,8 +1007,8 @@ function createMysqlLinkAssistantStore(db = database) {
         INSERT INTO link_submission_records (
           resource_id, source_url, source_domain, promotion_project_id, attempt_no, submit_mode, result,
           resource_page_id, target_url, target_domain, source_url_key, discovery_target_url,
-          submit_result, ai_content, error_message, raw_payload
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          submit_result, ai_content, error_message, submit_source, raw_payload
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `, [
         null,
         submission.sourceUrl,
@@ -932,6 +1025,7 @@ function createMysqlLinkAssistantStore(db = database) {
         submission.submitResult,
         submission.aiContent,
         submission.errorMessage,
+        normalizeSubmitSource(submission.submitSource, 'batch_auto'),
         JSON.stringify(submission.rawPayload || {})
       ]);
       return this.getSubmission(result.insertId);
@@ -1001,11 +1095,11 @@ function createMysqlLinkAssistantStore(db = database) {
         SELECT
           rp.*,
           vb.id AS verified_backlink_id,
-          vb.promotion_project_id,
-          vb.target_url,
-          vb.target_domain,
-          vb.target_domain_authority,
-          vb.target_domain_traffic,
+          COALESCE(vb.promotion_project_id, rp.promotion_project_id) AS promotion_project_id,
+          COALESCE(vb.target_url, rp.target_url) AS target_url,
+          COALESCE(vb.target_domain, rp.target_domain) AS target_domain,
+          COALESCE(vb.target_domain_authority, rp.target_domain_authority) AS target_domain_authority,
+          COALESCE(vb.target_domain_traffic, rp.target_domain_traffic) AS target_domain_traffic,
           vb.first_verified_at,
           vb.last_verified_at,
           vb.backlink_status,
@@ -1016,7 +1110,7 @@ function createMysqlLinkAssistantStore(db = database) {
           pp.h1
         FROM resource_pages rp
         LEFT JOIN verified_backlinks vb ON rp.id = vb.resource_page_id
-        LEFT JOIN link_promotion_projects pp ON pp.id = vb.promotion_project_id
+        LEFT JOIN link_promotion_projects pp ON pp.id = COALESCE(vb.promotion_project_id, rp.promotion_project_id)
         ORDER BY COALESCE(vb.last_verified_at, '') DESC, rp.updated_at DESC
       `, []);
       return rows.map(shapeResourceRow);
@@ -1159,6 +1253,7 @@ function createLinkAssistantService(options = {}) {
       submitResult: safeText(source.submitResult || source.result),
       aiContent: source.aiContent == null ? null : String(source.aiContent),
       errorMessage: source.errorMessage == null ? null : String(source.errorMessage),
+      submitSource: normalizeSubmitSource(source.submitSource || source.submit_source, 'batch_auto'),
       rawPayload: source
     }, currentIso());
     console.info('[link-assistant] submission saved', {
@@ -1167,6 +1262,7 @@ function createLinkAssistantService(options = {}) {
       targetDomain: project.targetDomain,
       sourceDomain: resource.sourceDomain,
       result: safeText(source.submitResult || source.result),
+      submitSource: normalizeSubmitSource(source.submitSource || source.submit_source, 'batch_auto'),
       hasTargetUrl: !!project.targetUrl,
       hasSourceUrl: !!resource.sourceUrl
     });
@@ -1176,7 +1272,8 @@ function createLinkAssistantService(options = {}) {
       promotionProjectId: project.id,
       resourcePageId,
       sourceUrl: resource.sourceUrl,
-      sourceDomain: resource.sourceDomain
+      sourceDomain: resource.sourceDomain,
+      submitSource: normalizeSubmitSource(submission.submitSource || rowValue(submission, 'submitSource', 'submit_source'), normalizeSubmitSource(source.submitSource || source.submit_source, 'batch_auto'))
     };
   }
 
@@ -1224,6 +1321,7 @@ function createLinkAssistantService(options = {}) {
       submitResult: safeText(rowValue(source, 'submitResult', 'submit_result', 'result')) || 'success',
       aiContent: source.aiContent == null ? null : String(source.aiContent),
       errorMessage: source.errorMessage == null ? null : String(source.errorMessage),
+      submitSource: normalizeSubmitSource(source.submitSource || source.submit_source, 'batch_auto'),
       semrushMeta: source.semrushMeta || source.semrush_meta || null,
       semrushHeaders: source.semrushHeaders || source.semrush_headers || null,
       semrushRow: source.semrushRow || source.semrush_row || null
@@ -1296,6 +1394,12 @@ function createLinkAssistantService(options = {}) {
     const rawPayload = parseJsonObject(rowValue(submission, 'rawPayload', 'raw_payload'));
     const sourceSemrushMeta = parseJsonObject(source.semrushMeta || source.semrush_meta);
     const submissionSemrushMeta = parseJsonObject(rawPayload.semrushMeta || rawPayload.semrush_meta);
+    const effectiveSubmitSource = normalizeSubmitSource(
+      rowValue(source, 'submitSource', 'submit_source') ||
+        rowValue(submission, 'submitSource', 'submit_source') ||
+        rowValue(rawPayload, 'submitSource', 'submit_source'),
+      'batch_auto'
+    );
     const resource = await store.upsertResourcePage(shapeResourcePage({
       sourceUrl: rowValue(submission, 'sourceUrl', 'source_url'),
       sourceTitle: firstPresent(
@@ -1331,6 +1435,7 @@ function createLinkAssistantService(options = {}) {
         rowValue(sourceSemrushMeta, 'lastSeen', 'last_seen'),
         rowValue(submissionSemrushMeta, 'lastSeen', 'last_seen')
       ),
+      submitSource: effectiveSubmitSource,
       semrushHeaders: firstPresent(
         rowValue(source, 'semrushHeaders', 'semrush_headers'),
         rowValue(rawPayload, 'semrushHeaders', 'semrush_headers'),
@@ -1370,6 +1475,7 @@ function createLinkAssistantService(options = {}) {
       promotionProjectId: rowValue(submission, 'promotionProjectId', 'promotion_project_id'),
       sourceDomain: resource.sourceDomain,
       targetDomain: target.targetDomain,
+      submitSource: effectiveSubmitSource,
       pageAscore: resource.pageAscore || null
     });
     return { submissionId: effectiveSubmissionId, syncedToResourceLibrary: true, resource, verifiedBacklink: verified };

@@ -1,8 +1,14 @@
 {
   "manifest_version": 3,
-  "name": "Auto Register Filler",
-  "version": "1.5.1",
+  "name": "BacklinkAssistant",
+  "version": "1.0.0",
   "description": "自动填充注册表单，并为当前网站生成推广文案。",
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
   "permissions": [
     "activeTab",
     "storage"
@@ -16,13 +22,18 @@
     "type": "module"
   },
   "action": {
-    "default_title": "Auto Register Filler - 网站自动填表与推广文案助手"
+    "default_title": "BacklinkAssistant - 网站自动填表与推广文案助手",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
   },
-  "options_page": "options.html",
   "content_scripts": [
     {
       "matches": ["<all_urls>"],
-      "js": ["extension-config.js", "illegal-site-filter.js", "lib/link-assistant-runtime-logic.js", "lib/link-assistant-form-detector.js", "content.js"],
+      "js": ["extension-config.js", "illegal-site-filter.js", "lib/link-assistant-runtime-logic.js", "lib/link-assistant-form-detector.js", "lib/manual-assistant-field-logic.js", "content.js"],
       "run_at": "document_idle"
     }
   ]

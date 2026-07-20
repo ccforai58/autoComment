@@ -2,8 +2,11 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const {
+  buildResourceExportPath,
+  buildResourceListPath,
   getFilteredResources,
   getPagedResources,
+  getSubmitSourceLabel,
   sortResources
 } = require('../../load-this-extension/resource-library');
 
@@ -49,4 +52,40 @@ test('getFilteredResources filters by promotion project id', () => {
 
   assert.deepEqual(getFilteredResources(rows, { promotionProjectId: '2' }).map((row) => row.id), ['b']);
   assert.deepEqual(getFilteredResources(rows, { promotionProjectId: '1' }).map((row) => row.id), ['a']);
+});
+
+test('getFilteredResources preserves submission source for visible resource rows', () => {
+  const rows = [
+    { id: 'manual', sourceUrl: 'https://manual.test/', submitSource: 'manual_assistant' },
+    { id: 'batch', sourceUrl: 'https://batch.test/', submit_source: 'batch_auto' }
+  ];
+
+  const filtered = getFilteredResources(rows, {});
+
+  assert.equal(filtered[0].submitSource, 'manual_assistant');
+  assert.equal(filtered[1].submitSource, 'batch_auto');
+});
+
+test('getFilteredResources filters by submit source', () => {
+  const rows = [
+    { id: 'manual', sourceUrl: 'https://manual.test/', submitSource: 'manual_assistant' },
+    { id: 'batch', sourceUrl: 'https://batch.test/', submit_source: 'batch_auto' },
+    { id: 'empty', sourceUrl: 'https://empty.test/', submitSource: '' },
+    { id: 'custom', sourceUrl: 'https://custom.test/', submitSource: 'imported' }
+  ];
+
+  assert.deepEqual(getFilteredResources(rows, { submitSource: 'manual_assistant' }).map((row) => row.id), ['manual']);
+  assert.deepEqual(getFilteredResources(rows, { submitSource: 'batch_auto' }).map((row) => row.id), ['batch']);
+  assert.deepEqual(getFilteredResources(rows, { submitSource: 'other' }).map((row) => row.id), ['empty', 'custom']);
+});
+
+test('resource library paths include submit source filter', () => {
+  assert.match(buildResourceListPath({ submitSource: 'manual_assistant' }), /submitSource=manual_assistant/);
+  assert.match(buildResourceExportPath({ submitSource: 'batch_auto' }), /submitSource=batch_auto/);
+});
+
+test('getSubmitSourceLabel renders compact Chinese labels', () => {
+  assert.equal(getSubmitSourceLabel('manual_assistant'), '手动助手');
+  assert.equal(getSubmitSourceLabel('batch_auto'), '批量自动');
+  assert.equal(getSubmitSourceLabel(''), '批量自动');
 });

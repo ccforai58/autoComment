@@ -10,6 +10,7 @@ const {
 const {
   stripGeneratedCopyMarkdownFences
 } = require('../lib/generated-copy-cleanup');
+const { buildUserPrompt } = require('../lib/generate-copy-prompt');
 
 test('generateWithModel falls back to chat completions when responses output is empty', async () => {
   const calls = [];
@@ -224,4 +225,34 @@ test('stripGeneratedCopyMarkdownFences removes wrapper fence without changing hr
 
   assert.equal(cleaned, 'Helpful note with <a href="https://example.com/\n">natural anchor</a> inside.');
   assert.match(cleaned, /href="https:\/\/example\.com\/\n">/);
+});
+
+test('manual assistant prompt includes homepage profile and field specs', () => {
+  const prompt = buildUserPrompt({
+    websiteUrl: 'https://directory.example/submit',
+    title: 'Submit a startup',
+    description: 'Directory submission page',
+    bodyText: 'Add your website to our directory.',
+    promotionWebsiteUrl: 'https://nameintoflowers.com/',
+    promotionWebsiteContent: 'Title: Name Into Flowers',
+    manualMode: true,
+    manualPageType: 'directory_submission',
+    homepageProfile: {
+      pageTitle: 'Name Into Flowers',
+      bodySummary: 'Create custom floral name artwork.'
+    },
+    manualFieldSpecs: [
+      { fieldId: 'mf_title_1234', role: 'title', label: 'Website name' },
+      { role: 'description', label: 'Short description' },
+      { role: 'website', label: 'URL' }
+    ]
+  });
+
+  assert.match(prompt, /Return one JSON object/);
+  assert.match(prompt, /Promoted homepage profile/);
+  assert.match(prompt, /Create custom floral name artwork/);
+  assert.match(prompt, /Website name/);
+  assert.match(prompt, /fieldId=mf_title_1234/);
+  assert.match(prompt, /fieldValuesById/);
+  assert.match(prompt, /shortDescription/);
 });

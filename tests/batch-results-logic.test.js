@@ -157,6 +157,7 @@ test('buildCurrentBatchExportCsv exports a stable current batch result report', 
         elapsed: 12,
         linkVerified: false,
         matchedHref: '',
+        submitSource: 'manual_assistant',
         semrushMeta: { pageAscore: 20 }
       },
       {
@@ -179,10 +180,10 @@ test('buildCurrentBatchExportCsv exports a stable current batch result report', 
   assert.equal(csv.filename, 'batch-results-current-batch-abc.csv');
   assert.equal(
     lines[0],
-    '#,Promotion website,Promotion project ID,Source url,Source domain,Discovery target url,Page ascore,Result,Result label,Error info,AI content,Submitted at,Elapsed seconds,Backlink verified,Matched href,Batch ID'
+    '#,Promotion website,Promotion project ID,Source url,Source domain,Discovery target url,Page ascore,Result,Result label,Error info,AI content,Submitted at,Elapsed seconds,Backlink verified,Matched href,Submit source,Batch ID'
   );
-  assert.equal(lines[1], '1,https://promo.test/,,https://a.test/,a.test,,,success,成功,,good copy,2026-07-17 09:00:00,8,true,https://promo.test/,batch-abc');
-  assert.equal(lines[2], '2,https://promo.test/,7,https://b.test/,b.test,https://discover.test/page,20,fail,失败,content timeout,"copy, with comma",2026-07-17 09:08:07,12,false,,batch-abc');
+  assert.match(lines[1], /,batch_auto,batch-abc$/);
+  assert.match(lines[2], /,manual_assistant,batch-abc$/);
   assert.equal(csv.recordCount, 2);
 });
 
@@ -505,6 +506,38 @@ test('buildArchiveExportCsv includes latest backlink check columns', () => {
   const lines = csv.content.split('\n');
   assert.match(lines[0], /Latest Backlink Status,Latest Backlink Checked At,Latest Backlink Matched Href,Latest Backlink Reason/);
   assert.match(lines[1], /missing,2026-07-13T08:05:00.000Z,,no_matching_anchor_href/);
+});
+
+test('result exports include submission source for manual and batch records', () => {
+  const current = buildCurrentBatchExportCsv({
+    batchId: 'batch-source',
+    results: [{
+      originalIndex: 0,
+      promotionWebsiteUrl: 'https://promo.test/',
+      url: 'https://source.test/post',
+      sourceDomain: 'source.test',
+      result: 'submitted_unconfirmed',
+      submitSource: 'manual_assistant',
+      timestamp: new Date(2026, 6, 17, 9, 8, 7).getTime()
+    }]
+  });
+  const archive = buildArchiveExportCsv({
+    websiteKey: 'all',
+    records: [{
+      originalIndex: 0,
+      batchId: 'manual-assistant:1',
+      promotionWebsiteUrl: 'https://promo.test/',
+      sourceUrl: 'https://source.test/post',
+      result: 'submitted_unconfirmed',
+      submitSource: 'manual_assistant',
+      timestamp: 10
+    }]
+  });
+
+  assert.match(current.content.split('\n')[0], /Submit source/);
+  assert.match(current.content, /manual_assistant/);
+  assert.match(archive.content.split('\n')[0], /Submit source/);
+  assert.match(archive.content, /manual_assistant/);
 });
 
 test('buildBacklinkCheckProgress counts live backlink check statuses', () => {

@@ -52,6 +52,20 @@ test('detectPageTypeFromSignals recognizes major manual assistant page types', (
 });
 
 test('scoreFieldRole maps labels and placeholders to stable field roles', () => {
+  const toolName = scoreFieldRole({
+    label: 'Tool Name *',
+    placeholder: 'e.g. ChatGPT',
+    type: 'text'
+  });
+  assert.equal(toolName.role, 'title');
+  assert.ok(toolName.score >= 45);
+
+  assert.deepEqual(scoreFieldRole({
+    label: 'Tagline',
+    placeholder: 'A short tagline for your tool',
+    type: 'text'
+  }).role, 'tagline');
+
   assert.deepEqual(scoreFieldRole({
     label: 'Website URL',
     name: 'site_url',
@@ -73,10 +87,32 @@ test('scoreFieldRole maps labels and placeholders to stable field roles', () => 
     label: 'Comment',
     tagName: 'textarea'
   }).role, 'comment');
+
+  assert.deepEqual(scoreFieldRole({
+    label: 'Pricing Model',
+    tagName: 'button',
+    role: 'combobox',
+    nearbyText: 'Free Paid Freemium'
+  }).role, 'pricingModel');
+});
+
+test('scoreFieldRole keeps select labels stronger than option text', () => {
+  const result = scoreFieldRole({
+    label: 'Category',
+    tagName: 'SELECT',
+    type: 'select-one',
+    nearbyText: 'Select a category Email Management Education Browser Extensions Productivity'
+  });
+
+  assert.equal(result.role, 'category');
+  assert.ok(result.score >= 45);
 });
 
 test('buildManualResourcePayload shapes compact resource pool data', () => {
   const payload = buildManualResourcePayload({
+    promotionProjectId: 12,
+    targetUrl: 'https://ainail.design/',
+    targetDomain: 'ainail.design',
     sourceUrl: 'https://Example.com/submit?utm_campaign=x',
     pageType: 'directory_submission',
     pageAscore: '42',
@@ -87,6 +123,9 @@ test('buildManualResourcePayload shapes compact resource pool data', () => {
   });
 
   assert.equal(payload.sourceUrl, 'https://example.com/submit');
+  assert.equal(payload.promotionProjectId, 12);
+  assert.equal(payload.targetUrl, 'https://ainail.design/');
+  assert.equal(payload.targetDomain, 'ainail.design');
   assert.equal(payload.resourceType, 'directory_submission');
   assert.equal(payload.pageAscore, 42);
   assert.equal(payload.externalLinks, 1200);

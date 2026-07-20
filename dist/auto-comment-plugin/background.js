@@ -41,6 +41,41 @@ try {
 }
 
 const DEBUG_LOG_API = 'http://127.0.0.1:3000/api/debug-log';
+const USER_ID_STORAGE_KEY = 'auto_comment_user_id';
+const DEFAULT_LOCAL_USER_ID = 'local-user';
+
+function ensureDefaultUserId() {
+  try {
+    chrome.storage.sync.get([USER_ID_STORAGE_KEY], (data) => {
+      const current = data && typeof data[USER_ID_STORAGE_KEY] === 'string'
+        ? data[USER_ID_STORAGE_KEY].trim()
+        : '';
+      if (current) return;
+      chrome.storage.sync.set({ [USER_ID_STORAGE_KEY]: DEFAULT_LOCAL_USER_ID }, () => {
+        const error = chrome.runtime && chrome.runtime.lastError ? chrome.runtime.lastError.message : '';
+        if (error) {
+          console.warn('[background][config] default user id init failed', { error });
+          return;
+        }
+        console.info('[background][config] default user id initialized', { userId: DEFAULT_LOCAL_USER_ID });
+      });
+    });
+  } catch (error) {
+    console.warn('[background][config] default user id init exception', {
+      message: error && error.message ? error.message : String(error)
+    });
+  }
+}
+
+chrome.runtime.onInstalled.addListener(() => {
+  ensureDefaultUserId();
+});
+
+chrome.runtime.onStartup.addListener(() => {
+  ensureDefaultUserId();
+});
+
+ensureDefaultUserId();
 
 function sendLocalDebugLog(source, payload) {
   try {
@@ -78,11 +113,131 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     });
     return true;
   }
+  if (message && message.type === 'OPEN_RESOURCE_LIBRARY') {
+    const url = chrome.runtime.getURL('resource-library.html');
+    chrome.tabs.create({ url, active: true }, (tab) => {
+      const error = chrome.runtime && chrome.runtime.lastError ? chrome.runtime.lastError.message : '';
+      if (error) {
+        console.warn('[background][manual-assistant] open resource library failed', {
+          senderTabId: sender && sender.tab ? sender.tab.id : null,
+          error
+        });
+        sendResponse({ ok: false, error });
+        return;
+      }
+      console.info('[background][manual-assistant] opened resource library', {
+        senderTabId: sender && sender.tab ? sender.tab.id : null,
+        tabId: tab && tab.id ? tab.id : null
+      });
+      sendResponse({ ok: true, tabId: tab && tab.id ? tab.id : null });
+    });
+    return true;
+  }
+  if (message && message.type === 'OPEN_BATCH_ARCHIVE') {
+    const url = chrome.runtime.getURL('batch.html#archive');
+    chrome.tabs.create({ url, active: true }, (tab) => {
+      const error = chrome.runtime && chrome.runtime.lastError ? chrome.runtime.lastError.message : '';
+      if (error) {
+        console.warn('[background][manual-assistant] open batch archive failed', {
+          senderTabId: sender && sender.tab ? sender.tab.id : null,
+          error
+        });
+        sendResponse({ ok: false, error });
+        return;
+      }
+      console.info('[background][manual-assistant] opened batch archive', {
+        senderTabId: sender && sender.tab ? sender.tab.id : null,
+        tabId: tab && tab.id ? tab.id : null
+      });
+      sendResponse({ ok: true, tabId: tab && tab.id ? tab.id : null });
+    });
+    return true;
+  }
+  if (message && message.type === 'OPEN_MANUAL_SUBMISSION_RECORDS') {
+    const url = chrome.runtime.getURL('batch.html#manual-records');
+    chrome.tabs.create({ url, active: true }, (tab) => {
+      const error = chrome.runtime && chrome.runtime.lastError ? chrome.runtime.lastError.message : '';
+      if (error) {
+        console.warn('[background][manual-assistant] open manual submission records failed', {
+          senderTabId: sender && sender.tab ? sender.tab.id : null,
+          error
+        });
+        sendResponse({ ok: false, error });
+        return;
+      }
+      console.info('[background][manual-assistant] opened manual submission records', {
+        senderTabId: sender && sender.tab ? sender.tab.id : null,
+        tabId: tab && tab.id ? tab.id : null
+      });
+      sendResponse({ ok: true, tabId: tab && tab.id ? tab.id : null });
+    });
+    return true;
+  }
 });
 
 /**
  * 将批量结果写入 storage（本地存储，由 batch.js 轮询读取）
  */
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message && message.type === 'LINK_ASSISTANT_API_REQUEST') {
+    (async () => {
+      const startedAt = Date.now();
+      try {
+        const apiBase = String(message.apiBase || 'http://127.0.0.1:3000/api').replace(/\/+$/, '');
+        const path = String(message.path || '');
+        if (!/^https?:\/\/(127\.0\.0\.1|localhost):3000\/api$/i.test(apiBase)) {
+          throw new Error('unsupported_api_base');
+        }
+        if (!path.startsWith('/')) {
+          throw new Error('invalid_api_path');
+        }
+        const options = message.options && typeof message.options === 'object' ? message.options : {};
+        const headers = options.headers && typeof options.headers === 'object' ? { ...options.headers } : {};
+        const response = await fetch(`${apiBase}${path}`, {
+          method: options.method || 'GET',
+          headers,
+          body: options.body
+        });
+        const text = await response.text();
+        let json = null;
+        try {
+          json = text ? JSON.parse(text) : null;
+        } catch (_) {}
+        console.info('[background][link-assistant-api] request complete', {
+          senderTabId: sender && sender.tab ? sender.tab.id : null,
+          path,
+          method: options.method || 'GET',
+          status: response.status,
+          ok: response.ok,
+          durationMs: Date.now() - startedAt
+        });
+        sendResponse({
+          success: true,
+          ok: response.ok,
+          status: response.status,
+          statusText: response.statusText,
+          json,
+          text: json ? '' : text
+        });
+      } catch (error) {
+        console.warn('[background][link-assistant-api] request failed', {
+          senderTabId: sender && sender.tab ? sender.tab.id : null,
+          path: message && message.path ? String(message.path) : '',
+          message: error && error.message ? error.message : String(error),
+          durationMs: Date.now() - startedAt
+        });
+        sendResponse({
+          success: false,
+          ok: false,
+          status: 0,
+          error: error && error.message ? error.message : String(error)
+        });
+      }
+    })();
+    return true;
+  }
+});
+
 async function persistBatchReport(message) {
   const { batchId, urlIndex, url: pageUrl = '', result, aiContent, errorMessage, promotionWebsiteUrl = '', promotionWebsiteKey = '', copyPromotionWebsiteKey = '', confirmedBy = '', confirmedAt = null, linkVerified = false, matchedHref = '', linkVerification = null } = message;
   console.log('[background] persistBatchReport >>>', { batchId, urlIndex, url: pageUrl, result, aiContentLen: aiContent ? aiContent.length : 0, errorMessage, time: new Date().toISOString() });

@@ -113,7 +113,7 @@
 
       .toolbar {
         display: grid;
-        grid-template-columns: minmax(190px, 1.2fr) minmax(160px, 0.9fr) minmax(150px, 0.9fr) minmax(118px, 0.7fr) minmax(118px, 0.7fr) auto auto auto;
+        grid-template-columns: minmax(180px, 1.1fr) minmax(150px, 0.9fr) minmax(150px, 0.9fr) minmax(120px, 0.7fr) minmax(112px, 0.65fr) minmax(112px, 0.65fr) minmax(104px, 0.55fr) minmax(104px, 0.55fr) auto auto auto;
         gap: 8px;
         align-items: center;
         padding: 8px;
@@ -156,7 +156,7 @@
 
       table {
         width: 100%;
-        min-width: 1240px;
+        min-width: 1320px;
         border-collapse: collapse;
       }
 
@@ -187,6 +187,22 @@
         color: #175cd3;
       }
 
+      .sort-label {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        white-space: nowrap;
+      }
+
+      .sort-indicator {
+        display: inline-flex;
+        width: 12px;
+        justify-content: center;
+        color: #175cd3;
+        font-size: 12px;
+        line-height: 1;
+      }
+
       tr:hover td { background: #f9fafb; }
 
       .num-cell {
@@ -196,6 +212,25 @@
 
       .url-cell {
         max-width: 300px;
+      }
+
+      .ascore-col,
+      .ascore-cell {
+        min-width: 78px;
+        width: 78px;
+        white-space: nowrap;
+      }
+
+      .submit-source-col,
+      .submit-source-cell {
+        min-width: 96px;
+        width: 96px;
+        white-space: nowrap;
+      }
+
+      .updated-cell {
+        min-width: 152px;
+        white-space: nowrap;
       }
 
       .url-cell a,
@@ -287,6 +322,12 @@
         <select id="promotionProjectFilter">
           <option value="">全部推广网站</option>
         </select>
+        <select id="submitSourceFilter">
+          <option value="">全部提交来源</option>
+          <option value="manual_assistant">手动助手</option>
+          <option value="batch_auto">批量自动</option>
+          <option value="other">其他/未标记</option>
+        </select>
         <select id="typeFilter">
           <option value="">全部类型</option>
           <option value="blog_comment">博客评论</option>
@@ -319,19 +360,20 @@
               <th>#</th>
               <th>Source url</th>
               <th>Discovery target url</th>
-              <th id="ascoreSortHeader" class="sortable" data-sort-field="pageAscore" aria-sort="none">AScore <span id="ascoreSortIndicator">↕</span></th>
+              <th id="ascoreSortHeader" class="sortable ascore-col" data-sort-field="pageAscore" aria-sort="none"><span class="sort-label">AScore <span id="ascoreSortIndicator" class="sort-indicator">↕</span></span></th>
               <th>类型</th>
               <th>评级</th>
               <th>标签</th>
               <th>备注</th>
               <th>来源域名</th>
+              <th class="submit-source-col">提交来源</th>
               <th>更新时间</th>
               <th>操作</th>
             </tr>
           </thead>
           <tbody id="resourceRows">
             <tr>
-              <td colspan="11" class="empty">正在加载...</td>
+              <td colspan="12" class="empty">正在加载...</td>
             </tr>
           </tbody>
         </table>

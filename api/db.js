@@ -26,7 +26,8 @@ function buildDbConfig() {
     waitForConnections: true,
     connectionLimit: 5,
     queueLimit: 0,
-    charset: 'utf8mb4'
+    charset: 'utf8mb4',
+    timezone: process.env.MYSQL_TIMEZONE || 'Z'
   };
 }
 

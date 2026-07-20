@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>推广网站设置</title>
+    <style>
+      :root {
+        color-scheme: light;
+        font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background: #f6f8fb;
+        color: #18212f;
+      }
+
+      * { box-sizing: border-box; }
+
+      body {
+        margin: 0;
+        background: #f6f8fb;
+      }
+
+      main {
+        width: min(1120px, calc(100vw - 32px));
+        margin: 0 auto;
+        padding: 22px 0 28px;
+      }
+
+      header {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 16px;
+        margin-bottom: 14px;
+      }
+
+      h1 {
+        margin: 0 0 6px;
+        font-size: 22px;
+        line-height: 1.25;
+      }
+
+      .subtitle {
+        margin: 0;
+        font-size: 13px;
+        color: #667085;
+      }
+
+      .status {
+        min-height: 22px;
+        margin: 0 0 14px;
+        font-size: 13px;
+        color: #475467;
+      }
+
+      .status[data-tone="success"] { color: #067647; }
+      .status[data-tone="error"] { color: #b42318; }
+
+      .header-actions,
+      .form-actions,
+      .project-actions {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+
+      button,
+      input,
+      select,
+      textarea {
+        font: inherit;
+      }
+
+      button {
+        border: 1px solid transparent;
+        border-radius: 7px;
+        cursor: pointer;
+        font-size: 13px;
+        font-weight: 700;
+        min-height: 36px;
+        padding: 8px 12px;
+        transition: background-color 0.16s ease, border-color 0.16s ease, color 0.16s ease, box-shadow 0.16s ease;
+      }
+
+      button:focus-visible,
+      input:focus-visible,
+      select:focus-visible,
+      textarea:focus-visible {
+        outline: 2px solid #2e90fa;
+        outline-offset: 2px;
+      }
+
+      button:disabled {
+        cursor: not-allowed;
+        opacity: 0.5;
+      }
+
+      .primary {
+        background: #1570ef;
+        color: #fff;
+        box-shadow: 0 8px 18px rgba(21, 112, 239, 0.18);
+      }
+
+      .primary:hover { background: #175cd3; }
+
+      .secondary {
+        background: #fff;
+        border-color: #d0d5dd;
+        color: #344054;
+      }
+
+      .secondary:hover { background: #f2f4f7; }
+
+      .danger {
+        background: #fff;
+        border-color: #fecdca;
+        color: #b42318;
+      }
+
+      .danger:hover { background: #fff5f4; }
+
+      .layout {
+        display: grid;
+        grid-template-columns: 300px minmax(0, 1fr);
+        gap: 14px;
+        align-items: start;
+      }
+
+      .panel {
+        background: #fff;
+        border: 1px solid #e4e7ec;
+        border-radius: 8px;
+      }
+
+      .panel-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 14px 16px;
+        border-bottom: 1px solid #e4e7ec;
+      }
+
+      .panel-title {
+        margin: 0;
+        font-size: 14px;
+        font-weight: 800;
+      }
+
+      .panel-body { padding: 16px; }
+
+      .active-strip {
+        display: grid;
+        gap: 4px;
+        margin-bottom: 12px;
+        padding: 12px;
+        border: 1px solid #b2ddff;
+        border-radius: 8px;
+        background: #eff8ff;
+      }
+
+      .active-strip strong {
+        font-size: 13px;
+        color: #175cd3;
+      }
+
+      .active-strip span {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        font-size: 12px;
+        color: #475467;
+      }
+
+      .project-list {
+        display: grid;
+        gap: 8px;
+      }
+
+      .project-item {
+        display: grid;
+        width: 100%;
+        gap: 4px;
+        padding: 10px 11px;
+        text-align: left;
+        background: #fff;
+        border: 1px solid #e4e7ec;
+        color: #344054;
+      }
+
+      .project-item:hover { background: #f9fafb; }
+
+      .project-item.selected {
+        border-color: #84caff;
+        background: #f0f9ff;
+      }
+
+      .project-item.active {
+        border-left: 4px solid #12b76a;
+      }
+
+      .project-title {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        font-weight: 800;
+      }
+
+      .project-subtitle {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        color: #667085;
+        font-size: 12px;
+      }
+
+      .empty-list {
+        padding: 14px 10px;
+        border: 1px dashed #d0d5dd;
+        border-radius: 8px;
+        color: #667085;
+        font-size: 13px;
+        text-align: center;
+      }
+
+      .form-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 12px;
+      }
+
+      label {
+        display: grid;
+        gap: 6px;
+        min-width: 0;
+        color: #344054;
+        font-size: 13px;
+        font-weight: 700;
+      }
+
+      .full { grid-column: 1 / -1; }
+
+      input,
+      select,
+      textarea {
+        width: 100%;
+        border: 1px solid #d0d5dd;
+        border-radius: 7px;
+        background: #fff;
+        color: #101828;
+        min-height: 38px;
+        padding: 8px 10px;
+      }
+
+      textarea {
+        min-height: 92px;
+        resize: vertical;
+      }
+
+      .field-hint {
+        margin-top: -2px;
+        color: #667085;
+        font-size: 12px;
+        font-weight: 500;
+        line-height: 1.35;
+      }
+
+      .url-row {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto;
+        gap: 8px;
+      }
+
+      .group-label {
+        grid-column: 1 / -1;
+        margin: 4px 0 -2px;
+        color: #175cd3;
+        font-size: 12px;
+        font-weight: 800;
+        text-transform: uppercase;
+      }
+
+      .form-actions {
+        justify-content: flex-end;
+        margin-top: 14px;
+        padding-top: 14px;
+        border-top: 1px solid #e4e7ec;
+      }
+
+      @media (max-width: 840px) {
+        main { width: min(100vw - 24px, 1120px); }
+        header,
+        .layout,
+        .form-grid,
+        .url-row {
+          grid-template-columns: 1fr;
+        }
+        header { display: grid; }
+        .header-actions,
+        .form-actions,
+        .project-actions {
+          justify-content: flex-start;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <div>
+          <h1>推广网站设置</h1>
+          <p class="subtitle">每个浏览器只选择一个当前推广网站；需要同时推广时，请打开新的浏览器实例。</p>
+        </div>
+        <div class="header-actions">
+          <button id="openResourceLibraryBtn" type="button" class="secondary">资源库</button>
+          <button id="refreshProjectsBtn" type="button" class="secondary" data-busy-lock="true">刷新</button>
+        </div>
+      </header>
+
+      <p id="settingsStatus" class="status" aria-live="polite"></p>
+
+      <section class="layout">
+        <aside class="panel">
+          <div class="panel-head">
+            <h2 class="panel-title">推广网站</h2>
+            <button id="newProjectBtn" type="button" class="secondary">新建</button>
+          </div>
+          <div class="panel-body">
+            <div class="active-strip">
+              <strong id="activeProjectDomain">未选择</strong>
+              <span id="activeProjectKeywords">请先选择一个推广网站</span>
+              <span id="activeProjectUrl"></span>
+            </div>
+            <div id="projectList" class="project-list"></div>
+          </div>
+        </aside>
+
+        <section class="panel">
+          <div class="panel-head">
+            <h2 class="panel-title">网站配置</h2>
+            <div class="project-actions">
+              <button id="setActiveProjectBtn" type="button" class="secondary">设为当前</button>
+              <button id="deleteProjectBtn" type="button" class="danger" data-busy-lock="true">删除</button>
+            </div>
+          </div>
+          <div class="panel-body">
+            <div class="form-grid">
+              <div class="group-label">推广目标</div>
+              <label class="full">
+                推广网址
+                <div class="url-row">
+                  <input id="targetUrlInput" type="url" placeholder="https://example.com/page" autocomplete="off" />
+                  <button id="fetchMetadataBtn" type="button" class="secondary" data-busy-lock="true">抓取信息</button>
+                </div>
+              </label>
+              <label class="full">关键词<textarea id="keywordsInput" placeholder="每行一个关键词，也可以用逗号分隔"></textarea></label>
+
+              <div class="group-label">网页信息</div>
+              <label class="full">网页 Title<input id="pageTitleInput" type="text" autocomplete="off" /></label>
+              <label class="full">Description<textarea id="metaDescriptionInput"></textarea></label>
+              <label class="full">H1<input id="h1Input" type="text" autocomplete="off" /></label>
+
+              <div class="group-label">提交偏好</div>
+              <label>评论作者<input id="commentAuthorInput" type="text" autocomplete="name" /></label>
+              <label>联系邮箱<input id="contactEmailInput" type="email" autocomplete="off" /></label>
+              <label>
+                默认提交模式
+                <select id="defaultSubmitModeInput">
+                  <option value="manual">手动</option>
+                  <option value="confirm">半自动</option>
+                  <option value="auto" selected>自动</option>
+                </select>
+              </label>
+              <label>
+                首页画像缓存时间（小时）
+                <input id="homepageProfileTtlHoursInput" type="number" min="1" max="168" step="1" inputmode="numeric" />
+                <span class="field-hint">手动助手生成并填充时使用，默认 24 小时，最长 168 小时。</span>
+              </label>
+            </div>
+
+            <div class="form-actions">
+              <button id="saveOnlyBtn" type="button" class="secondary" data-busy-lock="true">只保存</button>
+              <button id="saveProjectBtn" type="button" class="primary" data-busy-lock="true">保存并设为当前</button>
+            </div>
+          </div>
+        </section>
+      </section>
+    </main>
+
+    <script src="extension-config.js"></script>
+    <script src="link-assistant-settings.js"></script>
+  </body>
+</html>

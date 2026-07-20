@@ -3,6 +3,7 @@ const { findBlockedKeyword, loadBlockedKeywords } = require('./blocked-keywords'
 const { cancelModelRequest, generateWithModelQueued } = require('../lib/model-generate');
 const { stripGeneratedCopyMarkdownFences } = require('../lib/generated-copy-cleanup');
 const { ensurePromotionAnchor } = require('../lib/promotion-anchor-logic');
+const promptLogic = require('../lib/generate-copy-prompt');
 
 const POINTS_COST_PER_GENERATION = 1;
 
@@ -98,51 +99,49 @@ function appendRequiredOutputRules(skillTemplate) {
   return `${skillTemplate.trim()}\n${LINK_HREF_NEWLINE_RULE}`;
 }
 
-function buildUserPrompt({ websiteUrl, title, description, bodyText, promotionWebsiteUrl, promotionWebsiteContent, usedAnchorTexts, usedAnchorTextStats, pageLanguageHint, pageLanguageEvidence }) {
-  const usedAnchors = Array.isArray(usedAnchorTexts)
-    ? usedAnchorTexts.map((item) => String(item || '').trim()).filter(Boolean)
-    : [];
-  const overusedAnchors = Array.isArray(usedAnchorTextStats)
-    ? usedAnchorTextStats
-        .filter((item) => item && Number(item.count) >= 30)
-        .map((item) => String(item.text || '').trim())
-        .filter(Boolean)
-    : [];
-  const languageHint = String(pageLanguageHint || '').trim();
-  const languageEvidence = String(pageLanguageEvidence || '').trim();
-  const websiteContent = [
-    `【网站标题】${title || '(无标题)'}`,
-    `【网站 URL】${websiteUrl || '(无URL)'}`,
-    description ? `【网站描述】${description}` : '',
-    '【页面正文节选】',
-    bodyText || '(当前页面正文内容为空或无法提取)'
-  ]
-    .filter(Boolean)
-    .join('\n');
-  const languageInstruction = [
-    'The generated comment language MUST match the main language of the current page.',
-    'Infer the language from html lang, title, description, headings, and body text.',
-    'Do not default to English when clear non-English language evidence is present.',
-    'If the page is Japanese, write Japanese; if Spanish, write Spanish; if Polish, write Polish; if English, write English.',
-    'If uncertain, use English.',
-    'Return plain comment text only; do not use Markdown fences or code blocks.'
-  ].join(' ');
-  const languageContext = [
-    languageHint ? `Page language hint: ${languageHint}` : '',
-    languageEvidence ? `Page language evidence: ${languageEvidence}` : ''
-  ].filter(Boolean).join('\n');
+const buildUserPrompt = promptLogic.buildUserPrompt;
 
-  return [
-    languageInstruction,
-    languageContext,
-    promotionWebsiteUrl ? `Promoted website URL: ${promotionWebsiteUrl}` : '',
-    promotionWebsiteContent ? `Promoted website profile:\n${promotionWebsiteContent}` : '',
-    overusedAnchors.length ? `Overused anchor texts in the last 2 days. Do not use them: ${overusedAnchors.join(' | ')}` : '',
-    '下面是当前网站的内容，请根据 Skill 模板的要求，为该网站生成一份推广文案：',
-    '',
-    websiteContent,
-    usedAnchors.length ? `Already used anchor texts in this batch. Do not repeat them: ${usedAnchors.join(' | ')}` : ''
-  ].join('\n');
+function parseManualAssistantJson(text) {
+  const raw = stripGeneratedCopyMarkdownFences(text || '').trim();
+  const match = raw.match(/\{[\s\S]*\}/);
+  if (!match) return null;
+  try {
+    const parsed = JSON.parse(match[0]);
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function normalizeManualFieldValues(value) {
+  const source = value && typeof value === 'object' ? value : {};
+  const sourceById = source.fieldValuesById && typeof source.fieldValuesById === 'object'
+    ? source.fieldValuesById
+    : {};
+  const fieldValuesById = {};
+  for (const [key, item] of Object.entries(sourceById)) {
+    const fieldId = String(key || '').trim();
+    const text = String(item == null ? '' : item).trim();
+    if (fieldId && text) fieldValuesById[fieldId] = text;
+  }
+  const tags = Array.isArray(source.tags)
+    ? source.tags.map((item) => String(item || '').trim()).filter(Boolean)
+    : String(source.tags || '').split(/[,;\n]+/).map((item) => item.trim()).filter(Boolean);
+  return {
+    commentText: String(source.commentText || source.comment || source.message || '').trim(),
+    siteTitle: String(source.siteTitle || source.title || '').trim(),
+    tagline: String(source.tagline || source.slogan || '').trim(),
+    shortDescription: String(source.shortDescription || source.description || '').trim(),
+    longDescription: String(source.longDescription || source.body || '').trim(),
+    bio: String(source.bio || source.profileBio || '').trim(),
+    tags,
+    categorySuggestion: String(source.categorySuggestion || source.category || '').trim(),
+    pricingModel: String(source.pricingModel || source.pricing || source.priceModel || '').trim(),
+    authorName: String(source.authorName || source.author || '').trim(),
+    contactEmail: String(source.contactEmail || source.email || '').trim(),
+    websiteUrl: String(source.websiteUrl || source.url || '').trim(),
+    fieldValuesById
+  };
 }
 
 async function deductPoint(userId) {
@@ -185,7 +184,25 @@ module.exports = async function handler(req, res) {
   }
 
   const body = req.body || {};
-  const { userId, websiteUrl, title, description, bodyText, skillTemplate, promotionWebsiteUrl, promotionWebsiteContent, usedAnchorTexts, usedAnchorTextStats, aiRequestId, pageLanguageHint, pageLanguageEvidence } = body;
+  const {
+    userId,
+    websiteUrl,
+    title,
+    description,
+    bodyText,
+    skillTemplate,
+    promotionWebsiteUrl,
+    promotionWebsiteContent,
+    usedAnchorTexts,
+    usedAnchorTextStats,
+    aiRequestId,
+    pageLanguageHint,
+    pageLanguageEvidence,
+    manualMode,
+    manualPageType,
+    manualFieldSpecs,
+    homepageProfile
+  } = body;
 
   if (!userId) {
     return res.status(400).json({ success: false, error: '缺少 userId 参数' });
@@ -216,7 +233,9 @@ module.exports = async function handler(req, res) {
     const baseTemplate = skillTemplate && skillTemplate.trim()
       ? skillTemplate.trim()
       : getDefaultSkillTemplateV2();
-    const template = appendRequiredOutputRules(baseTemplate);
+    const isManualMode = manualMode === true;
+    const shouldRequireHtmlAnchor = !isManualMode || String(manualPageType || '').trim() === 'blog_comment';
+    const template = shouldRequireHtmlAnchor ? appendRequiredOutputRules(baseTemplate) : baseTemplate.trim();
     const userPrompt = buildUserPrompt({
       websiteUrl,
       title,
@@ -227,13 +246,21 @@ module.exports = async function handler(req, res) {
       usedAnchorTexts,
       usedAnchorTextStats,
       pageLanguageHint,
-      pageLanguageEvidence
+      pageLanguageEvidence,
+      manualMode: isManualMode,
+      manualPageType,
+      manualFieldSpecs,
+      homepageProfile
     });
     const generatedText = await generateWithModelQueued(template, userPrompt, {
       requestId: aiRequestId
     });
-    const cleanedGeneratedText = stripGeneratedCopyMarkdownFences(generatedText);
-    const anchored = ensurePromotionAnchor(cleanedGeneratedText, {
+    const manualJson = isManualMode ? parseManualAssistantJson(generatedText) : null;
+    const fieldValues = normalizeManualFieldValues(manualJson);
+    const cleanedGeneratedText = manualJson
+      ? (fieldValues.commentText || fieldValues.longDescription || fieldValues.shortDescription || fieldValues.bio)
+      : stripGeneratedCopyMarkdownFences(generatedText);
+    const anchored = shouldRequireHtmlAnchor ? ensurePromotionAnchor(cleanedGeneratedText, {
       promotionUrl: promotionWebsiteUrl || websiteUrl,
       promotionContent: promotionWebsiteContent || '',
       pageTitle: title || '',
@@ -245,7 +272,15 @@ module.exports = async function handler(req, res) {
             .map((item) => String(item.text || '').trim())
             .filter(Boolean)
         : []
-    });
+    }) : {
+      text: cleanedGeneratedText,
+      anchorText: '',
+      anchorSource: '',
+      anchorWasDuplicate: false,
+      anchorRewritten: false,
+      hrefNewlinePreserved: false,
+      changed: false
+    };
     if (anchored.changed) {
       console.log('[generate-copy] promotion anchor normalized', {
         anchorText: anchored.anchorText,
@@ -276,6 +311,7 @@ module.exports = async function handler(req, res) {
     return res.status(200).json({
       success: true,
       text: anchored.text,
+      fieldValues: isManualMode ? { ...fieldValues, commentText: anchored.text || fieldValues.commentText } : null,
       anchorText: anchored.anchorText,
       anchorSource: anchored.anchorSource,
       anchorWasDuplicate: anchored.anchorWasDuplicate,

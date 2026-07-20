@@ -678,6 +678,12 @@ async function init() {
   await loadBatchCheckboxSettings();
   bindEvents();
   await renderArchive();
+  const initialHash = String(window.location.hash || '').toLowerCase();
+  if (initialHash === '#archive') {
+    setResultsView('archive');
+  } else if (initialHash === '#manual-records' || initialHash === '#current') {
+    setResultsView('current');
+  }
   await restoreBatchRuntimeState().catch((error) => {
     console.warn('[batch][runtime] restore failed:', error);
     return false;
@@ -689,7 +695,13 @@ async function init() {
 async function loadUserId() {
   return new Promise((resolve) => {
     chrome.storage.sync.get(['auto_comment_user_id'], (data) => {
-      userId = data.auto_comment_user_id || '';
+      userId = data && typeof data.auto_comment_user_id === 'string' && data.auto_comment_user_id.trim()
+        ? data.auto_comment_user_id.trim()
+        : 'local-user';
+      if (!data || !data.auto_comment_user_id) {
+        chrome.storage.sync.set({ auto_comment_user_id: userId }, () => resolve());
+        return;
+      }
       resolve();
     });
   });
@@ -2074,6 +2086,14 @@ async function openNextTab() {
         batchId,
         urlIndex,
         url,
+        promotionProject: currentPromotionProject,
+        promotionProjectId: currentPromotionProject && currentPromotionProject.id ? currentPromotionProject.id : null,
+        targetUrl: currentPromotionProject && currentPromotionProject.targetUrl ? currentPromotionProject.targetUrl : currentPromotionWebsiteUrl || '',
+        targetDomain: currentPromotionProject && currentPromotionProject.targetDomain ? currentPromotionProject.targetDomain : '',
+        promotionWebsiteUrl: currentPromotionWebsiteUrl || '',
+        promotionWebsiteKey: normalizePromotionWebsiteKey(currentPromotionWebsiteUrl || (currentPromotionProject && currentPromotionProject.targetUrl) || ''),
+        semrushMeta: item.semrushMeta || null,
+        discoveryTargetUrl: item.semrushMeta && item.semrushMeta.targetUrl ? item.semrushMeta.targetUrl : '',
         createdAt: Date.now()
       }
     }, () => {
@@ -3173,6 +3193,7 @@ async function renderArchive() {
     const aiDisplayText = formatAiContentForDisplay(aiText);
     const shortBatch = record.batchId ? String(record.batchId).slice(0, 8) : '--';
 	    const display = getResultDisplayLocal(record);
+	    const sourceDisplay = getSubmitSourceDisplayLocal(record);
 	    const latestBacklinkDisplay = getLatestBacklinkStatusDisplayLocal(record);
 	    const archiveDisplayTimeSource = record.latestBacklinkCheckedAt || record.timestamp || '';
 	    const latestBacklinkTime = archiveDisplayTimeSource ? formatTime(new Date(archiveDisplayTimeSource)) : '--';
@@ -3182,14 +3203,15 @@ async function renderArchive() {
       <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(websiteLabel)}">${escapeHtml(shortWebsite)}</td>
       <td style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(sourceUrl)}">${escapeHtml(shortSource)}</td>
       <td><span class="result-badge ${display.cssClass}" title="${escapeHtml(display.categoryText)}">${escapeHtml(display.text)}</span></td>
+      <td><span class="result-badge ${sourceDisplay.cssClass}" title="${escapeHtml(sourceDisplay.value)}">${escapeHtml(sourceDisplay.text)}</span></td>
       <td><span class="result-badge ${latestBacklinkDisplay.cssClass}" title="${escapeHtml(latestBacklinkDisplay.title || record.latestBacklinkReason || '')}">${escapeHtml(latestBacklinkDisplay.text)}</span></td>
 	      <td style="font-size:11px;color:#9ca3af;white-space:nowrap;" title="${escapeHtml(record.latestBacklinkCheckedAt || record.timestamp || '')}">${escapeHtml(latestBacklinkTime)}</td>
       <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(record.errorMessage || '')}">${escapeHtml(record.errorMessage || '--')}</td>
 	      <td class="ai-content-cell" title="${escapeHtml(aiDisplayText)}">${escapeHtml(aiDisplayText || '--')}</td>
 	      <td style="font-size:11px;color:#9ca3af;white-space:nowrap;" title="${escapeHtml(record.batchId || '')}">${escapeHtml(shortBatch)}</td>
-	    `;
+    `;
     attachManualReviewTargetCell(tr.children[2], record, 'archive', tr);
-    attachAiContentContextMenu(tr.children[7], record, tr);
+    attachAiContentContextMenu(tr.children[8], record, tr);
     archiveTableBody.appendChild(tr);
   }
 }
@@ -3604,6 +3626,17 @@ function getResultDisplayLocal(resultOrRecord) {
     categoryText: value || '未知',
     cssClass: value || 'unknown'
   };
+}
+
+function getSubmitSourceDisplayLocal(record) {
+  const value = String(record && (record.submitSource || record.submit_source) || '').trim();
+  if (value === 'manual_assistant') {
+    return { value, text: '手动助手', cssClass: 'manual-source' };
+  }
+  if (value === 'batch_auto' || value === 'batch') {
+    return { value: 'batch_auto', text: '批量自动', cssClass: 'batch-source' };
+  }
+  return { value: value || 'batch_auto', text: value || '批量自动', cssClass: 'batch-source' };
 }
 
 function getLatestBacklinkStatusDisplayLocal(record) {
@@ -4696,6 +4729,7 @@ function renderStatsImpl() {
   for (const r of displayRecords) {
     const tr = document.createElement('tr');
     const display = getResultDisplayLocal(r);
+    const sourceDisplay = getSubmitSourceDisplayLocal(r);
     tr.className = 'url-' + display.cssClass;
 
     const elapsedStr = r.elapsed != null ? r.elapsed + 's' : '--';
@@ -4720,6 +4754,7 @@ function renderStatsImpl() {
       <td style="color:#9ca3af;width:40px;text-align:center;">${r.originalIndex + 1}</td>
       <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(r.url)}">${escapeHtml(shortUrl)}</td>
       <td><span class="result-badge ${display.cssClass}" title="${escapeHtml(display.categoryText)}">${escapeHtml(display.text)}</span></td>
+      <td><span class="result-badge ${sourceDisplay.cssClass}" title="${escapeHtml(sourceDisplay.value)}">${escapeHtml(sourceDisplay.text)}</span></td>
     `;
     tr.className = `url-${display.cssClass}`;
 
@@ -4739,7 +4774,7 @@ function renderStatsImpl() {
       <td style="font-size:11px;color:#9ca3af;white-space:nowrap;">${elapsedStr}</td>
       <td style="font-size:11px;color:#9ca3af;white-space:nowrap;">${timeStr}</td>
     `;
-    const renderedAiCell = tr.children[4];
+    const renderedAiCell = tr.children[5];
     if (r.aiContent && renderedAiCell) {
       renderedAiCell.addEventListener('click', () => {
         renderedAiCell.classList.toggle('expanded');

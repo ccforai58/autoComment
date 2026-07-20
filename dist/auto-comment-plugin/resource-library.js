@@ -36,6 +36,13 @@
     ['low', '偏低']
   ];
 
+  const SUBMIT_SOURCE_FILTER_OPTIONS = [
+    ['', '全部提交来源'],
+    ['manual_assistant', '手动助手'],
+    ['batch_auto', '批量自动'],
+    ['other', '其他/未标记']
+  ];
+
   function getApiBase() {
     if (root.AUTO_COMMENT_CONFIG && root.AUTO_COMMENT_CONFIG.API_BASE) {
       return String(root.AUTO_COMMENT_CONFIG.API_BASE).replace(/\/+$/, '');
@@ -130,6 +137,22 @@
 
   function normalizeSortDir(value) {
     return safeText(value).toLowerCase() === 'asc' ? 'asc' : 'desc';
+  }
+
+  function normalizeSubmitSourceForFilter(value) {
+    const text = safeText(value);
+    if (!text) return '';
+    if (text === 'manual_assistant') return 'manual_assistant';
+    if (text === 'batch' || text === 'batch_auto') return 'batch_auto';
+    if (text === 'other') return 'other';
+    return text;
+  }
+
+  function getSubmitSourceLabel(value) {
+    const normalized = normalizeSubmitSourceForFilter(value);
+    if (normalized === 'manual_assistant') return '手动助手';
+    if (normalized === 'batch_auto') return '批量自动';
+    return normalized ? normalized : '批量自动';
   }
 
   function toSortableNumber(value) {
@@ -247,6 +270,7 @@
       notes: safeText(source.notes),
       externalLinks: source.externalLinks ?? source.external_links ?? '',
       lastSeen: safeText(source.lastSeen || source.last_seen),
+      submitSource: safeText(source.submitSource || source.submit_source),
       targetUrl: safeText(source.targetUrl || source.target_url),
       targetDomain: safeText(source.targetDomain || source.target_domain),
       updatedAt: safeText(source.updatedAt || source.updated_at),
@@ -261,6 +285,7 @@
     const qualityLabel = safeText(filters.qualityLabel);
     const discoveryTargetUrl = safeText(filters.discoveryTargetUrl);
     const promotionProjectId = safeText(filters.promotionProjectId);
+    const submitSource = normalizeSubmitSourceForFilter(filters.submitSource);
     let minPageAscore = normalizeOptionalNumber(filters.minPageAscore);
     let maxPageAscore = normalizeOptionalNumber(filters.maxPageAscore);
     if (minPageAscore !== null && maxPageAscore !== null && minPageAscore > maxPageAscore) {
@@ -273,6 +298,14 @@
       if (promotionProjectId && String(resource.promotionProjectId) !== promotionProjectId) return false;
       if (resourceType && resource.resourceType !== resourceType) return false;
       if (qualityLabel && resource.qualityLabel !== qualityLabel) return false;
+      if (submitSource) {
+        const rowSubmitSource = normalizeSubmitSourceForFilter(resource.submitSource);
+        if (submitSource === 'other') {
+          if (rowSubmitSource === 'manual_assistant' || rowSubmitSource === 'batch_auto') return false;
+        } else if (rowSubmitSource !== submitSource) {
+          return false;
+        }
+      }
       if (!matchesDiscoveryTarget(resource, discoveryTargetUrl)) return false;
       if (minPageAscore !== null || maxPageAscore !== null) {
         const pageAscore = toSortableNumber(resource.pageAscore);
@@ -306,6 +339,7 @@
     const resourceType = safeText(input.resourceType);
     const qualityLabel = safeText(input.qualityLabel);
     const promotionProjectId = safeText(input.promotionProjectId);
+    const submitSource = normalizeSubmitSourceForFilter(input.submitSource);
     const minPageAscore = safeText(input.minPageAscore);
     const maxPageAscore = safeText(input.maxPageAscore);
     if (format === 'management') params.set('format', 'management');
@@ -314,6 +348,7 @@
     if (qualityLabel) params.set('qualityLabel', qualityLabel);
     if (selectedDiscoveryTargetUrl) params.set('discoveryTargetUrl', selectedDiscoveryTargetUrl);
     if (promotionProjectId) params.set('promotionProjectId', promotionProjectId);
+    if (submitSource) params.set('submitSource', submitSource);
     if (minPageAscore) params.set('minPageAscore', minPageAscore);
     if (maxPageAscore) params.set('maxPageAscore', maxPageAscore);
     const query = params.toString();
@@ -329,6 +364,7 @@
     const qualityLabel = safeText(input.qualityLabel);
     const discoveryTargetUrl = safeText(input.discoveryTargetUrl);
     const promotionProjectId = safeText(input.promotionProjectId);
+    const submitSource = normalizeSubmitSourceForFilter(input.submitSource);
     const minPageAscore = safeText(input.minPageAscore);
     const maxPageAscore = safeText(input.maxPageAscore);
     params.set('page', String(page));
@@ -338,6 +374,7 @@
     if (qualityLabel) params.set('qualityLabel', qualityLabel);
     if (discoveryTargetUrl) params.set('discoveryTargetUrl', discoveryTargetUrl);
     if (promotionProjectId) params.set('promotionProjectId', promotionProjectId);
+    if (submitSource) params.set('submitSource', submitSource);
     if (minPageAscore) params.set('minPageAscore', minPageAscore);
     if (maxPageAscore) params.set('maxPageAscore', maxPageAscore);
     return `/link-assistant/resources?${params.toString()}`;
@@ -466,6 +503,7 @@
       qualityLabel: getEl('qualityFilter') ? getEl('qualityFilter').value : '',
       discoveryTargetUrl: getEl('discoveryTargetFilter') ? getEl('discoveryTargetFilter').value : '',
       promotionProjectId: getEl('promotionProjectFilter') ? getEl('promotionProjectFilter').value : '',
+      submitSource: getEl('submitSourceFilter') ? getEl('submitSourceFilter').value : '',
       minPageAscore: getEl('minAscoreInput') ? getEl('minAscoreInput').value : '',
       maxPageAscore: getEl('maxAscoreInput') ? getEl('maxAscoreInput').value : ''
     };
@@ -499,6 +537,14 @@
     const selected = select.value;
     const options = [['', '全部推广网站']].concat(state.projects.map((project) => [String(project.id), getProjectLabel(project)]));
     select.innerHTML = buildOptions(options, selected);
+    select.value = selected;
+  }
+
+  function syncSubmitSourceOptions() {
+    const select = getEl('submitSourceFilter');
+    if (!select) return;
+    const selected = select.value;
+    select.innerHTML = buildOptions(SUBMIT_SOURCE_FILTER_OPTIONS, selected);
     select.value = selected;
   }
 
@@ -551,7 +597,16 @@
   function formatTime(value) {
     if (!value) return '';
     const date = new Date(value);
-    return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString();
+    if (Number.isNaN(date.getTime())) return String(value);
+    return new Intl.DateTimeFormat(undefined, {
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: false
+    }).format(date);
   }
 
   function renderSummary(rows) {
@@ -566,6 +621,7 @@
     if (typeof document === 'undefined') return;
     syncDiscoveryOptions();
     syncProjectOptions();
+    syncSubmitSourceOptions();
     const rowsNode = getEl('resourceRows');
     if (!rowsNode) return;
     const filteredRows = getFilteredResources(state.resources, getCurrentFilters());
@@ -583,7 +639,7 @@
     renderSummary(paged.rows);
 
     if (!sortedRows.length) {
-      rowsNode.innerHTML = '<tr><td colspan="11" class="empty">暂无匹配资源</td></tr>';
+      rowsNode.innerHTML = '<tr><td colspan="12" class="empty">暂无匹配资源</td></tr>';
       return;
     }
 
@@ -604,13 +660,14 @@
           <td class="url-cell">
             <span title="${escapeHtml(discoveryTargets.join('\n'))}">${escapeHtml(discoveryLabel)}</span>
           </td>
-          <td>${escapeHtml(resource.pageAscore == null ? '' : resource.pageAscore)}</td>
+          <td class="ascore-cell">${escapeHtml(resource.pageAscore == null ? '' : resource.pageAscore)}</td>
           <td><select data-field="resourceType">${buildOptions(RESOURCE_TYPE_OPTIONS, resource.resourceType)}</select></td>
           <td><select data-field="qualityLabel">${buildOptions(QUALITY_OPTIONS, resource.qualityLabel)}</select></td>
           <td><input data-field="topicTags" type="text" value="${escapeHtml(resource.topicTags.join(', '))}" placeholder="seo, blog"></td>
           <td><textarea data-field="notes" placeholder="备注">${escapeHtml(resource.notes)}</textarea></td>
           <td>${escapeHtml(resource.sourceDomain)}</td>
-          <td>
+          <td class="submit-source-cell">${escapeHtml(getSubmitSourceLabel(resource.submitSource))}</td>
+          <td class="updated-cell">
             <span>${escapeHtml(saving ? '保存中...' : formatTime(resource.updatedAt))}</span>
             <small>${escapeHtml(resource.lastSeen ? `Last seen: ${resource.lastSeen}` : '')}</small>
           </td>
@@ -765,7 +822,7 @@
       state.pagination.page = 1;
       loadResources().catch((error) => setStatus(getDisplayErrorMessage(error), 'error'));
     };
-    ['keywordInput', 'typeFilter', 'qualityFilter', 'discoveryTargetFilter', 'promotionProjectFilter', 'minAscoreInput', 'maxAscoreInput'].forEach((id) => {
+    ['keywordInput', 'typeFilter', 'qualityFilter', 'discoveryTargetFilter', 'promotionProjectFilter', 'submitSourceFilter', 'minAscoreInput', 'maxAscoreInput'].forEach((id) => {
       const el = getEl(id);
       if (!el) return;
       el.addEventListener(id === 'keywordInput' || id === 'minAscoreInput' || id === 'maxAscoreInput' ? 'input' : 'change', reloadFromFirstPage);
@@ -827,6 +884,7 @@
     getFilteredResources,
     getPagedResources,
     getResourceDiscoveryTargets,
+    getSubmitSourceLabel,
     matchesDiscoveryTarget,
     normalizePage,
     normalizePageSize,

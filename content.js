@@ -6,10 +6,18 @@
   const DEFAULT_USERNAME = '';
 
   async function fillInputs() {
-    const WEBSITE = await getWebsiteUrl();
+    const autofillProfile = await getInitialAutofillProfileForContent();
+    if (!autofillProfile.ready) {
+      manualAssistantLog('initial_autofill.skipped', {
+        reason: autofillProfile.source || 'not_ready',
+        promotionProjectId: autofillProfile.promotionProjectId || ''
+      });
+      return;
+    }
+    const WEBSITE = autofillProfile.website || '';
+    const EMAIL = autofillProfile.email || '';
+    const USERNAME = autofillProfile.name || '';
     const userProfile = await getUserProfile();
-    const EMAIL = userProfile.email;
-    const USERNAME = userProfile.name;
     const PASSWORD = userProfile.password;
     const allInputs = Array.from(document.querySelectorAll('input'));
     const allTextareas = Array.from(document.querySelectorAll('textarea'));
@@ -552,12 +560,14 @@
   async function rememberSuccessfulBatchAiCopy(text, source) {
     const value = String(text || '').trim();
     if (!isUsableGeneratedCopy(value)) return;
+    const promotionWebsiteKey = source && source.promotionWebsiteKey ? String(source.promotionWebsiteKey) : '';
     await setBatchAiReuseState({
       latestCopy: {
         text: value,
         key: getReusableCopyKey(value),
         sourceUrl: source && source.url ? source.url : location.href,
         urlIndex: source && source.urlIndex !== undefined ? source.urlIndex : null,
+        promotionWebsiteKey,
         savedAt: Date.now()
       },
       previousReuseKey: '',
@@ -593,9 +603,30 @@
 
   async function getBatchAiCopyAfterGenerationFailure(error, source) {
     const state = await getBatchAiReuseState();
+    const logic = getLinkAssistantRuntimeLogicLocal();
+    const currentPromotionWebsiteKey = source && source.promotionWebsiteKey ? String(source.promotionWebsiteKey) : '';
+    const latestCopy = state.latestCopy || null;
+    const canReuse = !logic || typeof logic.canReuseAiCopyForPromotion !== 'function'
+      ? (!currentPromotionWebsiteKey || (latestCopy && latestCopy.promotionWebsiteKey === currentPromotionWebsiteKey))
+      : logic.canReuseAiCopyForPromotion({
+          currentPromotionWebsiteKey,
+          reusableCopy: latestCopy
+        });
+    if (!canReuse) {
+      await setBatchAiReuseState({
+        firstGenerationFailed: true,
+        warning: 'promotion_copy_reuse_blocked',
+        lastError: error && error.message ? error.message : String(error || 'AI generation failed')
+      });
+      logBatchSubmit('ai.generate_failed_reuse_blocked_project_mismatch', {
+        currentPromotionWebsiteKey,
+        reusablePromotionWebsiteKey: latestCopy && latestCopy.promotionWebsiteKey ? latestCopy.promotionWebsiteKey : ''
+      });
+      return { action: 'fail_first_generation', reusableCopy: null, reuseCount: 0, reuseKey: '', warning: 'promotion_copy_reuse_blocked' };
+    }
     const decision = buildAiReuseStateLocal({
       aiOk: false,
-      reusableCopy: state.latestCopy || null,
+      reusableCopy: latestCopy,
       previousReuseKey: state.previousReuseKey || '',
       previousReuseCount: state.previousReuseCount || 0
     });
@@ -1170,19 +1201,23 @@
     return targets;
   }
 
-  async function generatePromotionCopyWithRetry(maxAttempts = 3) {
+  async function generatePromotionCopyWithRetry(maxAttempts = 3, options = {}) {
+    const promotionInputs = options && options.promotionInputs ? options.promotionInputs : null;
     let lastError = null;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
         console.log('[content] generating AI comment copy, attempt:', attempt);
-        const text = await generatePromotionCopyWithQwen();
+        const text = await generatePromotionCopyWithQwen(promotionInputs, options);
         if (isUsableGeneratedCopy(text)) {
           lastGeneratedPromotionCopy = String(text).trim();
-          lastGeneratedPromotionCopyKey = await getGenerationCacheKey();
+          lastGeneratedPromotionCopyKey = promotionInputs
+            ? `${getCurrentDomain()}::${promotionInputs.promotionWebsiteKey}`
+            : await getGenerationCacheKey();
           if (maxAttempts <= 1 && _batchCtx) {
             await rememberSuccessfulBatchAiCopy(lastGeneratedPromotionCopy, {
               url: _batchCtx.url,
-              urlIndex: _batchCtx.urlIndex
+              urlIndex: _batchCtx.urlIndex,
+              promotionWebsiteKey: promotionInputs ? promotionInputs.promotionWebsiteKey : ''
             });
           }
           return lastGeneratedPromotionCopy;
@@ -1202,7 +1237,8 @@
       });
       const reuseDecision = await getBatchAiCopyAfterGenerationFailure(lastError || new Error('AI copy generation failed'), {
         url: _batchCtx.url,
-        urlIndex: _batchCtx.urlIndex
+        urlIndex: _batchCtx.urlIndex,
+        promotionWebsiteKey: promotionInputs ? promotionInputs.promotionWebsiteKey : ''
       });
       if (reuseDecision.action === 'reuse') {
         return reuseDecision.reusableCopy.text;
@@ -1224,7 +1260,10 @@
   const DEFAULT_LOCAL_USER_ID = 'local-user';
   const PROMPT_FIELD_VALUES_STORAGE_KEY = 'auto_fill_prompt_field_values';
   const AI_REUSE_STATE_STORAGE_KEY = 'batch_ai_reuse_state_v1';
+  const MANUAL_HOMEPAGE_PROFILE_CACHE_KEY = 'manual_homepage_profile_cache_v1';
+  const MANUAL_HOMEPAGE_PROFILE_TTL_HOURS_KEY = 'manual_homepage_profile_cache_ttl_hours';
   let activeAiRequestId = '';
+  let lastGeneratedManualFieldValues = null;
 
   // ====== 批量任务设置（从 storage.local 读取）======
   const BATCH_SETTINGS_KEY = 'batch_task_settings';
@@ -1232,7 +1271,9 @@
   const BATCH_PENDING_TASK_KEY = 'batch_pending_task';
   const BATCH_RUNTIME_STATE_KEY = 'batch_runtime_state_v1';
   const BATCH_RUNTIME_STATE_BY_PROMOTION_KEY = 'batch_runtime_state_by_promotion_v1';
+  const BATCH_RUNTIME_STATE_PROMOTION_PREFIX = 'batch_runtime_state_promotion_v1:';
   const BATCH_ACTIVE_TASK_KEY = 'batch_active_task_v1';
+  const BACKLINK_ARCHIVE_KEY = 'backlink_submission_archive';
   const CURRENT_PROMOTION_PROJECT_ID_KEY = 'current_promotion_project_id';
   const MANUAL_ASSISTANT_ICON_ID = 'auto-comment-manual-assistant-icon';
   const MANUAL_ASSISTANT_MODAL_ID = 'auto-comment-manual-resource-modal';
@@ -1263,6 +1304,45 @@
 
   function getLinkAssistantFormDetectorLocal() {
     return window.AutoCommentLinkAssistantFormDetector || null;
+  }
+
+  function getManualAssistantFieldLogicLocal() {
+    return window.AutoCommentManualAssistantFieldLogic || null;
+  }
+
+  function normalizeHomepageProfileCacheTtlHoursLocal(value) {
+    const logic = getLinkAssistantRuntimeLogicLocal();
+    if (logic && typeof logic.normalizeHomepageProfileCacheTtlHours === 'function') {
+      return logic.normalizeHomepageProfileCacheTtlHours(value);
+    }
+    const number = Number(value);
+    if (!Number.isFinite(number) || number <= 0) return 24;
+    return Math.min(168, Math.max(1, Math.round(number)));
+  }
+
+  function isHomepageProfileCacheFreshLocal(input = {}) {
+    const logic = getLinkAssistantRuntimeLogicLocal();
+    if (logic && typeof logic.isHomepageProfileCacheFresh === 'function') {
+      return logic.isHomepageProfileCacheFresh(input);
+    }
+    const cachedAtMs = Date.parse(input.cachedAt || '');
+    if (!Number.isFinite(cachedAtMs)) return false;
+    const ttlHours = normalizeHomepageProfileCacheTtlHoursLocal(input.ttlHours);
+    const now = Number.isFinite(Number(input.now)) ? Number(input.now) : Date.now();
+    return now - cachedAtMs >= 0 && now - cachedAtMs <= ttlHours * 60 * 60 * 1000;
+  }
+
+  function buildHomepageProfileTextLocal(profile) {
+    const logic = getLinkAssistantRuntimeLogicLocal();
+    if (logic && typeof logic.buildHomepageProfileText === 'function') {
+      return logic.buildHomepageProfileText(profile);
+    }
+    return [
+      profile && profile.pageTitle ? `Title: ${profile.pageTitle}` : '',
+      profile && profile.metaDescription ? `Description: ${profile.metaDescription}` : '',
+      profile && profile.h1 ? `H1: ${profile.h1}` : '',
+      profile && profile.bodySummary ? `Homepage summary: ${profile.bodySummary}` : ''
+    ].filter(Boolean).join('\n');
   }
 
   function sanitizeLogDetailsLocal(details) {
@@ -1303,6 +1383,7 @@
       'panel.open',
       'generate.done',
       'submit.recorded',
+      'submit.local_synced',
       'resource.saved',
       'backlink.detected',
       'error'
@@ -1312,14 +1393,60 @@
   }
 
   function contentLinkAssistantApiJson(path, options = {}) {
-    return fetch(`${API_BASE}${path}`, {
+    const headers = {
+      'Content-Type': 'application/json',
+      ...(options.headers || {})
+    };
+    const body = options.body ? JSON.stringify(options.body) : undefined;
+    const requestOptions = {
       method: options.method || 'GET',
-      headers: {
-        'Content-Type': 'application/json',
-        ...(options.headers || {})
-      },
-      body: options.body ? JSON.stringify(options.body) : undefined
-    }).then(async (response) => {
+      headers,
+      body
+    };
+    const parsePayload = (text) => {
+      try {
+        return text ? JSON.parse(text) : {};
+      } catch (_) {
+        return {};
+      }
+    };
+    if (typeof chrome !== 'undefined' && chrome.runtime && typeof chrome.runtime.sendMessage === 'function') {
+      return chrome.runtime.sendMessage({
+        type: 'LINK_ASSISTANT_API_REQUEST',
+        apiBase: API_BASE,
+        path,
+        options: requestOptions
+      }).then((bridged) => {
+        if (!bridged || bridged.success === false) {
+          throw new Error((bridged && bridged.error) || 'LINK_ASSISTANT_API_REQUEST_FAILED');
+        }
+        const payload = bridged.json != null ? bridged.json : parsePayload(bridged.text || '');
+        if (!bridged.ok || payload.success === false) {
+          const error = new Error(payload.message || payload.error || `HTTP ${bridged.status}`);
+          error.status = bridged.status;
+          error.payload = payload;
+          throw error;
+        }
+        return payload;
+      }).catch((error) => {
+        manualAssistantLog('error', {
+          operation: 'link_assistant_api_bridge',
+          path,
+          message: error && error.message ? error.message : String(error)
+        });
+        return fetch(`${API_BASE}${path}`, requestOptions).then(async (response) => {
+          const payload = await response.json().catch(() => ({}));
+          if (!response.ok || payload.success === false) {
+            const fetchError = new Error(payload.message || payload.error || `HTTP ${response.status}`);
+            fetchError.status = response.status;
+            fetchError.payload = payload;
+            throw fetchError;
+          }
+          return payload;
+        });
+      });
+    }
+    return fetch(`${API_BASE}${path}`, requestOptions).then(async (response) => {
       const payload = await response.json().catch(() => ({}));
       if (!response.ok || payload.success === false) {
         const error = new Error(payload.message || payload.error || `HTTP ${response.status}`);
@@ -1329,6 +1456,103 @@
       }
       return payload;
     });
+  }
+
+  async function getManualHomepageProfileTtlHours() {
+    if (typeof chrome === 'undefined' || !chrome.storage || !chrome.storage.local) return 24;
+    const data = await new Promise((resolve) => chrome.storage.local.get([MANUAL_HOMEPAGE_PROFILE_TTL_HOURS_KEY], resolve));
+    return normalizeHomepageProfileCacheTtlHoursLocal(data[MANUAL_HOMEPAGE_PROFILE_TTL_HOURS_KEY]);
+  }
+
+  function getManualHomepageProfileCacheId(project) {
+    const source = project || {};
+    return String(source.id || source.targetUrlKey || normalizePromotionWebsiteKey(source.targetUrl || '') || '').trim();
+  }
+
+  async function getManualHomepageProfileCacheMap() {
+    if (typeof chrome === 'undefined' || !chrome.storage || !chrome.storage.local) return {};
+    const data = await new Promise((resolve) => chrome.storage.local.get([MANUAL_HOMEPAGE_PROFILE_CACHE_KEY], resolve));
+    return data[MANUAL_HOMEPAGE_PROFILE_CACHE_KEY] && typeof data[MANUAL_HOMEPAGE_PROFILE_CACHE_KEY] === 'object'
+      ? data[MANUAL_HOMEPAGE_PROFILE_CACHE_KEY]
+      : {};
+  }
+
+  async function saveManualHomepageProfileToCache(cacheId, profile) {
+    if (!cacheId || typeof chrome === 'undefined' || !chrome.storage || !chrome.storage.local) return;
+    const cache = await getManualHomepageProfileCacheMap();
+    cache[cacheId] = profile;
+    await new Promise((resolve) => chrome.storage.local.set({ [MANUAL_HOMEPAGE_PROFILE_CACHE_KEY]: cache }, resolve));
+  }
+
+  async function getManualHomepageProfileForProject(project, options = {}) {
+    if (!project || !project.targetUrl) return null;
+    const cacheId = getManualHomepageProfileCacheId(project);
+    const ttlHours = await getManualHomepageProfileTtlHours();
+    if (!options.forceRefresh && cacheId) {
+      const cache = await getManualHomepageProfileCacheMap();
+      const cached = cache[cacheId];
+      if (cached && isHomepageProfileCacheFreshLocal({ cachedAt: cached.cachedAt, ttlHours })) {
+        manualAssistantLog('homepage_profile.cache_hit', {
+          projectId: project.id || '',
+          targetDomain: project.targetDomain || '',
+          ttlHours
+        });
+        return cached;
+      }
+    }
+    manualAssistantLog('homepage_profile.fetch_start', {
+      projectId: project.id || '',
+      targetDomain: project.targetDomain || '',
+      ttlHours
+    });
+    try {
+      const payload = await contentLinkAssistantApiJson('/link-assistant/projects/fetch-metadata', {
+        method: 'POST',
+        body: { targetUrl: project.targetUrl }
+      });
+      const metadata = payload.metadata || {};
+      const profile = {
+        ...metadata,
+        projectId: project.id || null,
+        targetUrl: metadata.targetUrl || project.targetUrl,
+        targetDomain: metadata.targetDomain || project.targetDomain || '',
+        keywords: Array.isArray(metadata.keywords) && metadata.keywords.length ? metadata.keywords : (project.keywords || []),
+        pageTitle: metadata.pageTitle || project.pageTitle || '',
+        metaDescription: metadata.metaDescription || project.metaDescription || '',
+        h1: metadata.h1 || project.h1 || '',
+        cachedAt: new Date().toISOString(),
+        ttlHours
+      };
+      if (cacheId) await saveManualHomepageProfileToCache(cacheId, profile);
+      manualAssistantLog('homepage_profile.fetch_done', {
+        projectId: project.id || '',
+        targetDomain: profile.targetDomain || '',
+        status: profile.fetchStatus || '',
+        hasSummary: !!profile.bodySummary,
+        h2Count: Array.isArray(profile.h2Texts) ? profile.h2Texts.length : 0,
+        imageAltCount: Array.isArray(profile.imageAlts) ? profile.imageAlts.length : 0
+      });
+      return profile;
+    } catch (error) {
+      manualAssistantLog('error', {
+        operation: 'homepage_profile_fetch',
+        projectId: project.id || '',
+        targetDomain: project.targetDomain || '',
+        message: error && error.message ? error.message : String(error)
+      });
+      return {
+        projectId: project.id || null,
+        targetUrl: project.targetUrl,
+        targetDomain: project.targetDomain || '',
+        keywords: project.keywords || [],
+        pageTitle: project.pageTitle || '',
+        metaDescription: project.metaDescription || '',
+        h1: project.h1 || '',
+        cachedAt: '',
+        fetchStatus: 'fallback',
+        fetchError: error && error.message ? error.message : String(error)
+      };
+    }
   }
 
   async function getCurrentPromotionProjectIdLocal() {
@@ -1352,16 +1576,26 @@
         ? logic.normalizeCurrentProjectResponse({ currentPromotionProjectId, response })
         : { project: null, missingReason: currentPromotionProjectId ? 'runtime_logic_unavailable' : 'missing_current_promotion_project_id' };
       if (normalized.project) return normalized.project;
+      if (currentPromotionProjectId) {
+        manualAssistantLog('warn', {
+          operation: 'load_project_missing_current',
+          promotionProjectId: currentPromotionProjectId,
+          reason: normalized.missingReason || 'not_found'
+        });
+        return null;
+      }
       if (!options.createFromLegacy) return null;
     } catch (error) {
       manualAssistantLog('error', {
         operation: 'load_project',
+        promotionProjectId: currentPromotionProjectId || '',
         message: error && error.message ? error.message : String(error)
       });
+      if (currentPromotionProjectId) return null;
       if (!options.createFromLegacy) return null;
     }
 
-    const legacyUrl = await getWebsiteUrl();
+    const legacyUrl = await getLegacyWebsiteUrlFromStorage();
     if (!legacyUrl) return null;
     return {
       id: null,
@@ -1883,12 +2117,56 @@
     ].join('\n');
   }
 
-  async function getQwenSkillTemplate() {
-    const [promotionWebsiteUrl, promotionWebsiteContent] = await Promise.all([
-      getWebsiteUrl(),
+  function buildPromotionWebsiteContentFromProjectLocal(project, legacyContent) {
+    const source = project && typeof project === 'object' ? project : {};
+    const parts = [];
+    if (source.pageTitle) parts.push(`Title: ${source.pageTitle}`);
+    if (source.metaDescription) parts.push(`Description: ${source.metaDescription}`);
+    if (source.h1) parts.push(`H1: ${source.h1}`);
+    if (Array.isArray(source.keywords) && source.keywords.length) {
+      parts.push(`Keywords: ${source.keywords.join(', ')}`);
+    }
+    return parts.join('\n') || String(legacyContent || '').trim();
+  }
+
+  async function getPromotionCopyInputsForContent(projectOverride) {
+    const currentPromotionProjectId = await getCurrentPromotionProjectIdLocal();
+    if (projectOverride && typeof projectOverride === 'object') {
+      const legacyContent = await getWebsiteContent();
+      const promotionWebsiteUrl = projectOverride.targetUrl || '';
+      const promotionWebsiteContent = buildPromotionWebsiteContentFromProjectLocal(projectOverride, legacyContent);
+      return {
+        project: projectOverride,
+        promotionWebsiteUrl,
+        promotionWebsiteContent,
+        promotionWebsiteKey: normalizePromotionWebsiteKey(promotionWebsiteUrl),
+        projectId: projectOverride.id || null,
+        targetDomain: projectOverride.targetDomain || normalizePromotionWebsiteKey(promotionWebsiteUrl)
+      };
+    }
+    const [project, legacyUrl, legacyContent] = await Promise.all([
+      loadCurrentPromotionProjectForContent({ createFromLegacy: true }).catch(() => null),
+      getLegacyWebsiteUrlFromStorage(),
       getWebsiteContent()
     ]);
-    return buildQwenSkillTemplate(promotionWebsiteUrl, promotionWebsiteContent);
+    const canUseLegacy = !currentPromotionProjectId;
+    const promotionWebsiteUrl = project && project.targetUrl ? project.targetUrl : (canUseLegacy ? legacyUrl : '');
+    const promotionWebsiteContent = project
+      ? buildPromotionWebsiteContentFromProjectLocal(project, legacyContent)
+      : (canUseLegacy ? legacyContent : '');
+    return {
+      project,
+      promotionWebsiteUrl,
+      promotionWebsiteContent,
+      promotionWebsiteKey: normalizePromotionWebsiteKey(promotionWebsiteUrl),
+      projectId: project && project.id ? project.id : (currentPromotionProjectId || null),
+      targetDomain: project && project.targetDomain ? project.targetDomain : normalizePromotionWebsiteKey(promotionWebsiteUrl)
+    };
+  }
+
+  async function getQwenSkillTemplate(inputs) {
+    const source = inputs || await getPromotionCopyInputsForContent();
+    return buildQwenSkillTemplate(source.promotionWebsiteUrl, source.promotionWebsiteContent);
   }
 
   function pickLegacyPromptValue(values, keywords) {
@@ -1902,8 +2180,8 @@
     return entry ? String(entry[1] || '').trim() : '';
   }
 
-  // 从 chrome.storage.sync 中异步获取推广网站地址
-  function getWebsiteUrl() {
+  // 从 chrome.storage.sync 中异步获取旧版推广网站地址，仅作为多项目配置不可用时的 fallback
+  function getLegacyWebsiteUrlFromStorage() {
     return new Promise((resolve) => {
       if (typeof chrome === 'undefined' || !chrome.storage || !chrome.storage.sync) {
         resolve('');
@@ -1928,6 +2206,79 @@
         resolve(savedUrl || legacyUrl);
       });
     });
+  }
+
+  // 获取当前浏览器实例选择的推广网站地址；优先使用多项目配置，避免 AI/填表误读旧站点。
+  async function getWebsiteUrl() {
+    const currentPromotionProjectId = await getCurrentPromotionProjectIdLocal();
+    const project = await loadCurrentPromotionProjectForContent({ createFromLegacy: false }).catch(() => null);
+    if (project && project.targetUrl) return project.targetUrl;
+    if (currentPromotionProjectId) return '';
+    return getLegacyWebsiteUrlFromStorage();
+  }
+
+  async function getInitialAutofillProfileForContent() {
+    const logic = getLinkAssistantRuntimeLogicLocal();
+    const [currentPromotionProjectId, userProfile] = await Promise.all([
+      getCurrentPromotionProjectIdLocal(),
+      getUserProfile()
+    ]);
+    const project = await loadCurrentPromotionProjectForContent({ createFromLegacy: false }).catch((error) => {
+      manualAssistantLog('error', {
+        operation: 'initial_autofill_load_project',
+        promotionProjectId: currentPromotionProjectId || '',
+        message: error && error.message ? error.message : String(error)
+      });
+      return null;
+    });
+    const legacyUrl = currentPromotionProjectId ? '' : await getLegacyWebsiteUrlFromStorage();
+    const fallbackProfile = project && project.targetUrl
+      ? {
+          ready: true,
+          website: project.targetUrl,
+          name: project.commentAuthor || userProfile.name || '',
+          email: project.contactEmail || userProfile.email || '',
+          source: 'current_project',
+          promotionProjectId: project.id || null,
+          targetDomain: project.targetDomain || ''
+        }
+      : currentPromotionProjectId
+        ? {
+            ready: false,
+            website: '',
+            name: '',
+            email: '',
+            source: 'current_project_pending',
+            promotionProjectId: currentPromotionProjectId,
+            targetDomain: ''
+          }
+        : {
+            ready: !!(legacyUrl || userProfile.name || userProfile.email),
+            website: legacyUrl,
+            name: userProfile.name || '',
+            email: userProfile.email || '',
+            source: legacyUrl || userProfile.name || userProfile.email ? 'legacy' : 'empty',
+            promotionProjectId: null,
+            targetDomain: ''
+          };
+    const profile = logic && typeof logic.selectInitialAutofillProfile === 'function'
+      ? logic.selectInitialAutofillProfile({
+          currentPromotionProjectId,
+          project,
+          legacyUrl,
+          userProfile
+        })
+      : fallbackProfile;
+    manualAssistantLog('initial_autofill.profile', {
+      ready: !!profile.ready,
+      source: profile.source || '',
+      promotionProjectId: profile.promotionProjectId || '',
+      targetDomain: profile.targetDomain || '',
+      hasWebsite: !!profile.website,
+      hasName: !!profile.name,
+      hasEmail: !!profile.email
+    });
+    return profile;
   }
 
   function getWebsiteContent() {
@@ -2151,15 +2502,18 @@
     });
   }
 
-  async function getGenerationCacheKey() {
-    const promotionWebsiteUrl = await getWebsiteUrl();
-    return getCurrentDomain() + '::' + normalizePromotionWebsiteKey(promotionWebsiteUrl);
+  async function getGenerationCacheKey(promotionInputsOverride = null) {
+    const promotionInputs = promotionInputsOverride || await getPromotionCopyInputsForContent();
+    return getCurrentDomain() + '::' + promotionInputs.promotionWebsiteKey;
   }
 
-  async function recordGenerationTime(content) {
-    const cacheKey = await getGenerationCacheKey();
+  async function recordGenerationTime(content, promotionInputsOverride = null) {
+    const cacheKey = promotionInputsOverride
+      ? `${getCurrentDomain()}::${promotionInputsOverride.promotionWebsiteKey}`
+      : await getGenerationCacheKey();
     const currentDomain = getCurrentDomain();
-    const promotionWebsiteUrl = await getWebsiteUrl();
+    const promotionInputs = promotionInputsOverride || await getPromotionCopyInputsForContent();
+    const promotionWebsiteUrl = promotionInputs.promotionWebsiteUrl;
 
     return new Promise((resolve) => {
       if (typeof chrome === 'undefined' || !chrome.storage || !chrome.storage.local) {
@@ -2174,7 +2528,9 @@
           content: content || '',
           domain: currentDomain,
           promotionWebsiteUrl,
-          promotionWebsiteKey: normalizePromotionWebsiteKey(promotionWebsiteUrl)
+          promotionWebsiteKey: promotionInputs.promotionWebsiteKey,
+          promotionProjectId: promotionInputs.projectId || null,
+          targetDomain: promotionInputs.targetDomain || ''
         };
 
         const sevenDaysAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
@@ -2211,8 +2567,8 @@
     });
   }
 
-  async function getCachedPromotionCopy() {
-    const cacheKey = await getGenerationCacheKey();
+  async function getCachedPromotionCopy(promotionInputsOverride = null) {
+    const cacheKey = await getGenerationCacheKey(promotionInputsOverride);
     return new Promise((resolve) => {
       if (typeof chrome === 'undefined' || !chrome.storage || !chrome.storage.local) {
         resolve('');
@@ -2230,10 +2586,10 @@
     });
   }
 
-  async function getReusablePromotionCopy() {
-    const cached = await getCachedPromotionCopy();
+  async function getReusablePromotionCopy(promotionInputsOverride = null) {
+    const cached = await getCachedPromotionCopy(promotionInputsOverride);
     if (isUsableGeneratedCopy(cached)) return cached;
-    const currentKey = await getGenerationCacheKey();
+    const currentKey = await getGenerationCacheKey(promotionInputsOverride);
     if (lastGeneratedPromotionCopyKey && lastGeneratedPromotionCopyKey === currentKey && isUsableGeneratedCopy(lastGeneratedPromotionCopy)) {
       return lastGeneratedPromotionCopy;
     }
@@ -2262,13 +2618,97 @@
   let autoGeneratedOnce = false;
 
   // 批处理模式上下文（由 BATCH_HANDLE 消息注入）
-  let _batchCtx = null; // { batchId, urlIndex, url }
+  let _batchCtx = null; // { batchId, urlIndex, url, promotionProject, promotionWebsiteUrl, promotionWebsiteKey }
   let runningBatchTaskKey = null;
 
-  function setBatchContext(batchId, urlIndex, url) {
-    _batchCtx = { batchId, urlIndex, url };
+  function normalizeBatchPromotionContextLocal(input = {}) {
+    const logic = getLinkAssistantRuntimeLogicLocal();
+    if (logic && typeof logic.normalizeBatchPromotionContext === 'function') {
+      return logic.normalizeBatchPromotionContext(input);
+    }
+    const project = input.promotionProject && typeof input.promotionProject === 'object'
+      ? input.promotionProject
+      : {
+          id: input.promotionProjectId || null,
+          targetUrl: input.targetUrl || input.promotionWebsiteUrl || '',
+          targetDomain: input.targetDomain || '',
+          keywords: input.keywords || [],
+          pageTitle: input.pageTitle || '',
+          metaDescription: input.metaDescription || '',
+          h1: input.h1 || '',
+          commentAuthor: input.commentAuthor || '',
+          contactEmail: input.contactEmail || '',
+          defaultSubmitMode: input.defaultSubmitMode || 'auto'
+        };
+    const promotionWebsiteUrl = project.targetUrl || input.targetUrl || input.promotionWebsiteUrl || '';
+    return {
+      batchId: String(input.batchId || ''),
+      urlIndex: input.urlIndex === undefined ? null : Number(input.urlIndex),
+      url: input.url || '',
+      promotionProject: project,
+      promotionProjectId: project.id || input.promotionProjectId || null,
+      promotionWebsiteUrl,
+      promotionWebsiteKey: normalizePromotionWebsiteKey(promotionWebsiteUrl),
+      targetUrl: promotionWebsiteUrl,
+      targetDomain: project.targetDomain || input.targetDomain || '',
+      semrushMeta: input.semrushMeta || null,
+      discoveryTargetUrl: input.discoveryTargetUrl || ''
+    };
+  }
+
+  function setBatchContext(batchId, urlIndex, url, options = {}) {
+    _batchCtx = normalizeBatchPromotionContextLocal({
+      ...(options || {}),
+      batchId,
+      urlIndex,
+      url
+    });
+    logBatchSubmit('task.context_locked', {
+      batchId: _batchCtx.batchId,
+      urlIndex: _batchCtx.urlIndex,
+      promotionProjectId: _batchCtx.promotionProjectId || null,
+      promotionWebsiteKey: _batchCtx.promotionWebsiteKey || '',
+      targetDomain: _batchCtx.targetDomain || ''
+    });
     removeManualAssistantIcon();
     activateQwenProgressTabForBatch();
+  }
+
+  async function getBatchPromotionInputsForContent() {
+    if (_batchCtx && (_batchCtx.promotionProject || _batchCtx.promotionWebsiteUrl || _batchCtx.targetUrl)) {
+      const project = _batchCtx.promotionProject || {
+        id: _batchCtx.promotionProjectId || null,
+        targetUrl: _batchCtx.promotionWebsiteUrl || _batchCtx.targetUrl || '',
+        targetDomain: _batchCtx.targetDomain || '',
+        keywords: []
+      };
+      const inputs = await getPromotionCopyInputsForContent(project);
+      const promotionWebsiteUrl = inputs.promotionWebsiteUrl || _batchCtx.promotionWebsiteUrl || _batchCtx.targetUrl || '';
+      return {
+        ...inputs,
+        promotionWebsiteUrl,
+        promotionWebsiteKey: inputs.promotionWebsiteKey || _batchCtx.promotionWebsiteKey || normalizePromotionWebsiteKey(promotionWebsiteUrl),
+        projectId: inputs.projectId || _batchCtx.promotionProjectId || null,
+        targetDomain: inputs.targetDomain || _batchCtx.targetDomain || '',
+        project
+      };
+    }
+    return getPromotionCopyInputsForContent();
+  }
+
+  async function getBatchPromotionWebsiteUrl() {
+    const inputs = await getBatchPromotionInputsForContent();
+    return inputs.promotionWebsiteUrl || '';
+  }
+
+  function getBatchFillOverridesFromInputs(inputs) {
+    const project = inputs && inputs.project ? inputs.project : {};
+    return {
+      website: inputs && inputs.promotionWebsiteUrl ? inputs.promotionWebsiteUrl : '',
+      targetUrl: inputs && inputs.promotionWebsiteUrl ? inputs.promotionWebsiteUrl : '',
+      author: project.commentAuthor || '',
+      email: project.contactEmail || ''
+    };
   }
 
   function getBatchTaskKey(batchId, urlIndex) {
@@ -2339,7 +2779,7 @@
       urlIndex: pending.urlIndex,
       url: pending.url
     });
-    setBatchContext(pending.batchId, pending.urlIndex, pending.url);
+    setBatchContext(pending.batchId, pending.urlIndex, pending.url, pending);
     handleBatchTask(pending.batchId, pending.urlIndex, pending.url).catch((err) => {
       console.warn('[content] pending batch task failed:', err);
     });
@@ -2347,7 +2787,8 @@
 
   async function persistBatchSubmitContext(batchId, urlIndex, url, result, aiContent, errorMessage) {
     if (typeof chrome === 'undefined' || !chrome.storage) return;
-    const promotionWebsiteUrl = await getWebsiteUrl();
+    const promotionInputs = await getBatchPromotionInputsForContent();
+    const promotionWebsiteUrl = promotionInputs.promotionWebsiteUrl || '';
     await new Promise((resolve) => {
       chrome.storage.local.set({
         batchSubmitCtx: {
@@ -2357,9 +2798,10 @@
           result,
           aiContent: aiContent || null,
           errorMessage: errorMessage || null,
+          promotionProjectId: promotionInputs.projectId || null,
           promotionWebsiteUrl,
-          promotionWebsiteKey: normalizePromotionWebsiteKey(promotionWebsiteUrl),
-          copyPromotionWebsiteKey: normalizePromotionWebsiteKey(promotionWebsiteUrl),
+          promotionWebsiteKey: promotionInputs.promotionWebsiteKey || normalizePromotionWebsiteKey(promotionWebsiteUrl),
+          copyPromotionWebsiteKey: promotionInputs.promotionWebsiteKey || normalizePromotionWebsiteKey(promotionWebsiteUrl),
           confirmedBy: (result === 'success' || result === 'success_pending_moderation') ? BATCH_SUCCESS_CONFIRMATION_MARKER : '',
           confirmedAt: (result === 'success' || result === 'success_pending_moderation') ? Date.now() : null,
           timestamp: Date.now()
@@ -2537,7 +2979,8 @@
       await writePendingResult(batchId, urlIndex, url, 'success', aiContent, null);
     } catch (_) {}
     if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.sendMessage) {
-      const promotionWebsiteUrl = await getWebsiteUrl();
+      const promotionInputs = await getBatchPromotionInputsForContent();
+      const promotionWebsiteUrl = promotionInputs.promotionWebsiteUrl || '';
       await new Promise((resolve) => {
         chrome.runtime.sendMessage({
           type: 'BATCH_HANDLE_CONFIRM',
@@ -2547,8 +2990,8 @@
           aiContent,
           result: 'success',
           promotionWebsiteUrl,
-          promotionWebsiteKey: normalizePromotionWebsiteKey(promotionWebsiteUrl),
-          copyPromotionWebsiteKey: normalizePromotionWebsiteKey(promotionWebsiteUrl),
+          promotionWebsiteKey: promotionInputs.promotionWebsiteKey || normalizePromotionWebsiteKey(promotionWebsiteUrl),
+          copyPromotionWebsiteKey: promotionInputs.promotionWebsiteKey || normalizePromotionWebsiteKey(promotionWebsiteUrl),
           confirmedBy: BATCH_SUCCESS_CONFIRMATION_MARKER,
           confirmedAt: Date.now()
         }).then(resolve).catch(resolve);
@@ -2570,8 +3013,13 @@
     console.log('[AutoComment] handleBatchTaskForAutoMode _batchCtx:', _batchCtx);
 
     try {
+      const promotionInputs = await getBatchPromotionInputsForContent();
+      const fillOverrides = getBatchFillOverridesFromInputs(promotionInputs);
+      const promotionWebsiteForSubmit = promotionInputs.promotionWebsiteUrl || '';
+      let form = findCommentForm();
+      let ta = findLikelyCommentTextarea({ allowGenericFallback: true });
       // 尝试获取缓存的文案或之前生成的文案
-      let promotionText = await getReusablePromotionCopy();
+      let promotionText = await getReusablePromotionCopy(promotionInputs);
       if (!isUsableGeneratedCopy(promotionText)) {
         promotionText = '';
       }
@@ -2587,8 +3035,8 @@
         await new Promise(resolve => setTimeout(resolve, 2000));
 
         // 检查评论表单是否存在
-        const form = findCommentForm();
-        const ta = findLikelyCommentTextarea({ allowGenericFallback: true });
+        form = findCommentForm();
+        ta = findLikelyCommentTextarea({ allowGenericFallback: true });
 
         if (!form || !ta) {
           console.log('[AutoComment] handleBatchTaskForAutoMode 评论框不存在，结束任务');
@@ -2603,7 +3051,7 @@
 
         // 生成 AI 文案
         console.log('[AutoComment] handleBatchTaskForAutoMode 生成AI文案...');
-        promotionText = await generatePromotionCopyWithRetry(3);
+        promotionText = await generatePromotionCopyWithRetry(3, { promotionInputs });
         if (!promotionText) {
           console.log('[AutoComment] handleBatchTaskForAutoMode blocked generated copy, skip current URL');
           await writePendingResult(batchId, urlIndex, url, 'skipped', null, 'blocked_keyword');
@@ -2619,18 +3067,17 @@
         throw new Error('comment textarea fill failed');
       }
 
-      let fillCheck = await ensureAllCommentFormFieldsFilled(promotionText);
+      let fillCheck = await ensureAllCommentFormFieldsFilled(promotionText, false, fillOverrides);
       if (!fillCheck.success && (fillCheck.missingFields || []).includes('comment')) {
         const latestTextarea = findLikelyCommentTextarea({ allowGenericFallback: true });
         if (fillSpecificCommentTextarea(latestTextarea, promotionText)) {
-          fillCheck = await ensureAllCommentFormFieldsFilled(promotionText);
+          fillCheck = await ensureAllCommentFormFieldsFilled(promotionText, false, fillOverrides);
         }
       }
       if (!fillCheck.success) {
         throw new Error('form fill failed: ' + (fillCheck.missingFields || []).join(', '));
       }
 
-      const promotionWebsiteForSubmit = await getWebsiteUrl();
       assertCommentReadyForSubmit(promotionText, form, ta, promotionWebsiteForSubmit);
 
       const manualCheckBeforeSubmit = detectManualRequiredChallenge();
@@ -2880,16 +3327,27 @@
     console.log('[AutoComment] initOnPageReady 开始');
     // 只恢复提交后的补确认上下文；正式批处理执行只由 BATCH_HANDLE 触发。
     await restoreBatchContext();
+    if (await restoreManualSubmitOriginalUrlIfNeeded()) return;
 
-    fillInputs();
+    const suppressLegacyAutomation = await shouldSuppressLegacyPageAutomationForCurrentPage();
+    if (suppressLegacyAutomation) {
+      console.info('[AutoComment][batch] suppress legacy page automation', {
+        url: safeLogUrlLocal(location.href),
+        hasBatchContext: Boolean(_batchCtx)
+      });
+    } else {
+      fillInputs();
+    }
     setupFormSubmitListener();
     setupManualAssistantSubmitWatcher();
-    runManualAssistantScan({ scroll: false }).catch((error) => {
-      manualAssistantLog('error', {
-        operation: 'initial_scan',
-        message: error && error.message ? error.message : String(error)
+    if (!suppressLegacyAutomation) {
+      runManualAssistantScan({ scroll: false }).catch((error) => {
+        manualAssistantLog('error', {
+          operation: 'initial_scan',
+          message: error && error.message ? error.message : String(error)
+        });
       });
-    });
+    }
     refreshManualAssistantAvailability();
     tryStartPendingBatchTaskFromStorage();
 
@@ -2899,15 +3357,17 @@
       }
     });
 
-    getAutoGenerateQwenOnPageLoadSetting().then((shouldAutoGenerate) => {
-      if (shouldAutoGenerate) {
-        triggerCommentFormFlow().then(() => {
-          autoGeneratePromotionOnPageLoad();
-        });
-      }
-    });
+    if (!suppressLegacyAutomation) {
+      getAutoGenerateQwenOnPageLoadSetting().then((shouldAutoGenerate) => {
+        if (shouldAutoGenerate) {
+          triggerCommentFormFlow().then(() => {
+            autoGeneratePromotionOnPageLoad();
+          });
+        }
+      });
 
-    observeDynamicElements();
+      observeDynamicElements();
+    }
   }
 
   let hasNotifiedCommentBox = false;
@@ -3024,24 +3484,54 @@
     ];
 
     for (const selector of selectors) {
-      const form = document.querySelector(selector);
-      if (form && getCommentTextareaFromForm(form)) {
-        return form;
-      }
+      const forms = Array.from(document.querySelectorAll(selector));
+      const visibleForm = forms.find((form) => getVisibleCommentTextareaFromForm(form));
+      if (visibleForm) return visibleForm;
+      const fallbackForm = forms.find((form) => getCommentTextareaFromForm(form));
+      if (fallbackForm) return fallbackForm;
     }
 
     return null;
   }
 
+  function isElementVisibleForSelection(el) {
+    if (!el) return false;
+    const style = window.getComputedStyle(el);
+    if (!style || style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse') return false;
+    const rect = typeof el.getBoundingClientRect === 'function' ? el.getBoundingClientRect() : null;
+    if (rect && rect.width > 0 && rect.height > 0) return true;
+    return !!(el.offsetWidth || el.offsetHeight || (el.getClientRects && el.getClientRects().length));
+  }
+
+  function getCommentTextareasFromForm(form) {
+    if (!form) return [];
+    const selectors = [
+      'textarea#comment',
+      'textarea[name="comment"]',
+      'textarea[id*="comment" i]',
+      'textarea[name*="comment" i]'
+    ];
+    const seen = new Set();
+    const result = [];
+    for (const selector of selectors) {
+      try {
+        form.querySelectorAll(selector).forEach((item) => {
+          if (seen.has(item)) return;
+          seen.add(item);
+          result.push(item);
+        });
+      } catch (_) {}
+    }
+    return result;
+  }
+
+  function getVisibleCommentTextareaFromForm(form) {
+    return getCommentTextareasFromForm(form).find(isElementVisibleForSelection) || null;
+  }
+
   function getCommentTextareaFromForm(form) {
-    if (!form) return null;
-    return (
-      form.querySelector('textarea#comment') ||
-      form.querySelector('textarea[name="comment"]') ||
-      form.querySelector('textarea[id*="comment" i]') ||
-      form.querySelector('textarea[name*="comment" i]') ||
-      null
-    );
+    const textareas = getCommentTextareasFromForm(form);
+    return textareas.find(isElementVisibleForSelection) || textareas[0] || null;
   }
 
   function findLikelyCommentTextarea(options) {
@@ -3100,7 +3590,8 @@
 
     for (const selector of standardSelectors) {
       try {
-        const ta = document.querySelector(selector);
+        const matches = Array.from(document.querySelectorAll(selector));
+        const ta = matches.find(isElementVisibleForSelection) || matches[0] || null;
         if (ta && !commentTextareas.includes(ta)) {
           commentTextareas.push(ta);
           const form = ta.form || (ta.closest && ta.closest('form'));
@@ -3534,7 +4025,29 @@
   }
 
   // 查找评论表单
+  function findVisibleKeywordCommentForm() {
+    const forms = Array.from(document.querySelectorAll('form'));
+    const matched = forms.filter((form) => {
+      const text = safeLowerStringLocal(form.textContent || '');
+      const className = safeLowerStringLocal(form.className || '');
+      const id = safeLowerStringLocal(form.id || '');
+      const action = safeLowerStringLocal(form.action || '');
+      return text.includes('comment') || text.includes('respond') ||
+        className.includes('comment') || className.includes('respond') ||
+        id.includes('comment') || id.includes('respond') ||
+        action.includes('comment');
+    });
+    return matched.find((form) => getVisibleCommentTextareaFromForm(form)) ||
+      matched.find((form) => getCommentTextareaFromForm(form)) ||
+      null;
+  }
+
   function findCommentForm() {
+    const visibleKeywordCommentForm = findVisibleKeywordCommentForm();
+    if (visibleKeywordCommentForm) {
+      console.log('[AutoComment] visible-prioritized keyword comment form:', visibleKeywordCommentForm.id, visibleKeywordCommentForm.className);
+      return visibleKeywordCommentForm;
+    }
     // ── 方案A：直接用 WordPress 标准 form 选择器 ─────────────
     const formSelectors = [
       '#commentform',
@@ -3547,7 +4060,10 @@
     ];
     for (const sel of formSelectors) {
       try {
-        const el = document.querySelector(sel);
+        const forms = Array.from(document.querySelectorAll(sel)).filter((item) => item && item.tagName === 'FORM');
+        const el = forms.find((form) => getVisibleCommentTextareaFromForm(form)) ||
+          forms.find((form) => getCommentTextareaFromForm(form)) ||
+          forms[0];
         if (el && el.tagName === 'FORM') {
           console.log('[AutoComment] 方案A找到表单:', sel);
           return el;
@@ -3579,7 +4095,11 @@
     for (const sel of areaSelectors) {
       const area = document.querySelector(sel);
       if (area) {
-        const f = area.querySelector('form') || (area.closest ? area.closest('form') : null);
+        const areaForms = Array.from(area.querySelectorAll('form'));
+        const f = areaForms.find((form) => getVisibleCommentTextareaFromForm(form)) ||
+          areaForms.find((form) => getCommentTextareaFromForm(form)) ||
+          area.querySelector('form') ||
+          (area.closest ? area.closest('form') : null);
         if (f) {
           console.log('[AutoComment] 方案C通过评论区域找到表单:', sel);
           return f;
@@ -3589,6 +4109,7 @@
 
     // ── 方案D：直接找页面所有表单中含 comment/respond 关键词的 ─
     const allForms = Array.from(document.querySelectorAll('form'));
+    const matchedForms = [];
     for (const f of allForms) {
       const text = safeLowerStringLocal(f.textContent || '');
       const cls = safeLowerStringLocal(f.className || '');
@@ -5230,11 +5751,12 @@
   // ============================================================
   //  确保评论表单所有必填字段都被正确填入，并在提交前验证
   // ============================================================
-  async function ensureAllCommentFormFieldsFilled(commentText, skipCommentValidation = false) {
+  async function ensureAllCommentFormFieldsFilled(commentText, skipCommentValidation = false, overrides = {}) {
+    const fillOverrides = overrides && typeof overrides === 'object' ? overrides : {};
     const userProfile = await getUserProfile();
-    const WEBSITE = await getWebsiteUrl();
-    const USERNAME = userProfile.name || '';
-    const EMAIL = userProfile.email || '';
+    const WEBSITE = (fillOverrides.website || fillOverrides.targetUrl || '').trim() || await getWebsiteUrl();
+    const USERNAME = (fillOverrides.author || fillOverrides.name || '').trim() || userProfile.name || '';
+    const EMAIL = (fillOverrides.email || '').trim() || userProfile.email || '';
 
     console.log('[AutoComment] ===== ensureAllCommentFormFieldsFilled 开始 =====');
     console.log('[AutoComment] 将填入 - Name:', USERNAME, '| Email:', EMAIL, '| Website:', WEBSITE, '| skipComment:', skipCommentValidation);
@@ -5266,7 +5788,10 @@
     ];
     for (const sel of formSelectors) {
       try {
-        const el = document.querySelector(sel);
+        const forms = Array.from(document.querySelectorAll(sel)).filter((item) => item && item.tagName === 'FORM');
+        const el = forms.find((item) => getVisibleCommentTextareaFromForm(item)) ||
+          forms.find((item) => getCommentTextareaFromForm(item)) ||
+          forms[0];
         if (el && el.tagName === 'FORM') {
           form = el;
           console.log('[AutoComment] 通过选择器找到表单:', sel);
@@ -5309,7 +5834,11 @@
       for (const sel of areaSelectors) {
         const area = document.querySelector(sel);
         if (area) {
-          const f = area.querySelector('form') || (area.closest ? area.closest('form') : null);
+          const areaForms = Array.from(area.querySelectorAll('form'));
+          const f = areaForms.find((item) => getVisibleCommentTextareaFromForm(item)) ||
+            areaForms.find((item) => getCommentTextareaFromForm(item)) ||
+            area.querySelector('form') ||
+            (area.closest ? area.closest('form') : null);
           if (f) {
             form = f;
             console.log('[AutoComment] 通过评论区域找到表单:', sel);
@@ -5392,7 +5921,9 @@
     ];
     for (const sel of nameSelectors) {
       try {
-        const el = form.querySelector(sel);
+        const matches = Array.from(form.querySelectorAll(sel));
+        const el = matches.find((item) => item && item.tagName === 'INPUT' && isVisibleFormField(item)) ||
+          matches.find((item) => item && item.tagName === 'INPUT' && (item.type || '').toLowerCase() !== 'hidden');
         if (el && el.tagName === 'INPUT' && el.closest('form') === form) {
           nameInput = el;
           console.log('[AutoComment] 通过选择器找到 nameInput:', sel, { name: nameInput.name, id: nameInput.id, type: nameInput.type });
@@ -5435,8 +5966,12 @@
     // ── 步骤6：找 Website 输入框 ─────────────────────────────
     let websiteInput = null;
     const urlSelectors = [
+      '#authorUrl', 'input[name="authorUrl"]', 'input[name="author_url"]',
+      'input[id*="authorurl" i]', 'input[name*="authorurl" i]',
       '#url', 'input[name="url"]', 'input[type="url"]',
       'input[id="website"]', 'input[name="website"]',
+      'input[id*="website" i]', 'input[name*="website" i]',
+      'input[id*="url" i]', 'input[name*="url" i]',
       'input[placeholder*="website" i]', 'input[placeholder*="网站" i]',
       'input[placeholder*="url" i]'
     ];
@@ -5518,7 +6053,7 @@
     console.log('[AutoComment] 缺失字段:', missingFields);
     console.log('[AutoComment] ===== ensureAllCommentFormFieldsFilled 结束 =====');
 
-    return { success: missingFields.length === 0, missingFields };
+    return { success: missingFields.length === 0, missingFields, form, commentTextarea };
   }
 
   // 收集当前页面内容 + 调用后端生成推广文案
@@ -5613,13 +6148,17 @@
     cancelActiveAiRequest('beforeunload');
   });
 
-  async function generatePromotionCopyWithQwen() {
-    const QWEN_SKILL_TEMPLATE = await getQwenSkillTemplate();
-    const [promotionWebsiteUrl, promotionWebsiteContent, usedAnchorTexts] = await Promise.all([
-      getWebsiteUrl(),
-      getWebsiteContent(),
+  async function generatePromotionCopyWithQwen(promotionInputsOverride = null, options = {}) {
+    const [promotionInputs, usedAnchorTexts] = await Promise.all([
+      promotionInputsOverride || getPromotionCopyInputsForContent(),
       getUsedAnchorTextsForCurrentBatch()
     ]);
+    const promotionWebsiteUrl = promotionInputs.promotionWebsiteUrl;
+    const promotionWebsiteContent = promotionInputs.promotionWebsiteContent;
+    const QWEN_SKILL_TEMPLATE = await getQwenSkillTemplate(promotionInputs);
+    if (!promotionWebsiteUrl) {
+      throw new Error('Current promotion project is not loaded. Please reopen promotion settings and select the project again.');
+    }
 
     // 检查用户ID是否配置
     const userId = await getUserId();
@@ -5656,6 +6195,10 @@
       titleLength: title.length,
       bodyTextLength: bodyText.length,
       usedAnchorCount: usedAnchorTexts.length,
+      promotionProjectId: promotionInputs.projectId || null,
+      targetDomain: promotionInputs.targetDomain || '',
+      manualMode: options.manualAssistant === true,
+      manualPageType: options.manualPageType || '',
       pageLanguageHint: languagePayload.pageLanguageHint
     });
     const controller = new AbortController();
@@ -5681,6 +6224,10 @@
           aiRequestId,
           pageLanguageHint: languagePayload.pageLanguageHint,
           pageLanguageEvidence: languagePayload.pageLanguageEvidence,
+          manualMode: options.manualAssistant === true,
+          manualPageType: options.manualPageType || '',
+          manualFieldSpecs: Array.isArray(options.manualFieldSpecs) ? options.manualFieldSpecs : [],
+          homepageProfile: promotionInputs.homepageProfile || null,
           skillTemplate: QWEN_SKILL_TEMPLATE
         })
       });
@@ -5719,8 +6266,11 @@
         hrefNewlinePreserved: !!data.hrefNewlinePreserved
       });
     }
+    lastGeneratedManualFieldValues = data && data.fieldValues && typeof data.fieldValues === 'object'
+      ? data.fieldValues
+      : null;
     lastGeneratedPromotionCopy = aiText;
-    lastGeneratedPromotionCopyKey = await getGenerationCacheKey();
+    lastGeneratedPromotionCopyKey = await getGenerationCacheKey(promotionInputs);
     return aiText;
   }
 
@@ -5728,6 +6278,94 @@
   let qwenPanelEl = null;
   let qwenProgressTimer = null;
   let qwenPanelRequestedMode = 'manual';
+  const QWEN_PANEL_POSITION_STORAGE_KEY = 'auto_comment_qwen_panel_position_v1';
+
+  function clampPanelPositionLocal(left, top, panel) {
+    const rect = panel && typeof panel.getBoundingClientRect === 'function'
+      ? panel.getBoundingClientRect()
+      : { width: 382, height: 520 };
+    const margin = 8;
+    const maxLeft = Math.max(margin, window.innerWidth - rect.width - margin);
+    const maxTop = Math.max(margin, window.innerHeight - rect.height - margin);
+    return {
+      left: Math.min(Math.max(margin, Number(left) || margin), maxLeft),
+      top: Math.min(Math.max(margin, Number(top) || margin), maxTop)
+    };
+  }
+
+  function setQwenPanelPositionLocal(panel, left, top) {
+    const pos = clampPanelPositionLocal(left, top, panel);
+    panel.style.left = `${pos.left}px`;
+    panel.style.top = `${pos.top}px`;
+    panel.style.right = 'auto';
+    panel.style.bottom = 'auto';
+    return pos;
+  }
+
+  function saveQwenPanelPositionLocal(pos) {
+    if (!pos || typeof chrome === 'undefined' || !chrome.storage || !chrome.storage.local) return;
+    chrome.storage.local.set({
+      [QWEN_PANEL_POSITION_STORAGE_KEY]: {
+        left: Math.round(pos.left),
+        top: Math.round(pos.top),
+        updatedAt: Date.now()
+      }
+    }, () => {});
+  }
+
+  function installQwenPanelDraggingLocal(panel, handle) {
+    if (!panel || !handle || handle._autoCommentDragInstalled) return;
+    handle._autoCommentDragInstalled = true;
+    handle.style.cursor = 'move';
+    handle.style.userSelect = 'none';
+
+    if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local) {
+      chrome.storage.local.get([QWEN_PANEL_POSITION_STORAGE_KEY], (data) => {
+        const saved = data && data[QWEN_PANEL_POSITION_STORAGE_KEY];
+        if (saved && Number.isFinite(Number(saved.left)) && Number.isFinite(Number(saved.top)) && panel.parentNode) {
+          setQwenPanelPositionLocal(panel, saved.left, saved.top);
+        }
+      });
+    }
+
+    let dragging = null;
+    handle.addEventListener('pointerdown', (event) => {
+      if (event.button !== 0) return;
+      if (event.target && event.target.closest && event.target.closest('button, a, input, textarea, select')) return;
+      const rect = panel.getBoundingClientRect();
+      dragging = {
+        pointerId: event.pointerId,
+        offsetX: event.clientX - rect.left,
+        offsetY: event.clientY - rect.top
+      };
+      panel.style.right = 'auto';
+      panel.style.bottom = 'auto';
+      try { handle.setPointerCapture(event.pointerId); } catch (_) {}
+      event.preventDefault();
+    });
+
+    handle.addEventListener('pointermove', (event) => {
+      if (!dragging || dragging.pointerId !== event.pointerId) return;
+      setQwenPanelPositionLocal(panel, event.clientX - dragging.offsetX, event.clientY - dragging.offsetY);
+    });
+
+    function finishDrag(event) {
+      if (!dragging || dragging.pointerId !== event.pointerId) return;
+      const rect = panel.getBoundingClientRect();
+      const pos = setQwenPanelPositionLocal(panel, rect.left, rect.top);
+      saveQwenPanelPositionLocal(pos);
+      try { handle.releasePointerCapture(event.pointerId); } catch (_) {}
+      dragging = null;
+    }
+
+    handle.addEventListener('pointerup', finishDrag);
+    handle.addEventListener('pointercancel', finishDrag);
+    window.addEventListener('resize', () => {
+      if (!panel.parentNode) return;
+      const rect = panel.getBoundingClientRect();
+      setQwenPanelPositionLocal(panel, rect.left, rect.top);
+    });
+  }
 
   function formatCompactBatchEtaLocal(ms) {
     const value = Number(ms);
@@ -5858,13 +6496,72 @@
     scan: null,
     currentProject: null,
     currentText: '',
+    currentTextPromotionKey: '',
     lastSubmissionId: null,
     lastSubmitRecordKey: '',
     lastSubmitRecordedAt: 0,
     selectedCandidateIndex: 0,
     existingBacklink: null,
+    pageTypeOverride: '',
     nativeWatcherInstalled: false
   };
+  const MANUAL_ASSISTANT_RESTORE_CONTEXT_KEY = 'manual_assistant_submit_restore_context';
+  const MANUAL_ASSISTANT_FIELD_SELECTOR = 'input, textarea, select, button[role="combobox"], [role="combobox"]';
+
+  function getManualAssistantProjectKey(project) {
+    return project && project.targetUrl ? normalizePromotionWebsiteKey(project.targetUrl) : '';
+  }
+
+  function normalizeManualPageTypeLocal(value) {
+    const logic = getManualAssistantFieldLogicLocal();
+    if (logic && typeof logic.normalizeManualPageType === 'function') {
+      return logic.normalizeManualPageType(value);
+    }
+    const text = String(value || '').trim().toLowerCase();
+    if (text === 'blog_comment') return 'blog_comment';
+    if (text === 'directory' || text === 'directory_submission') return 'directory_submission';
+    if (text === 'media' || text === 'media_submission') return 'media_submission';
+    if (text === 'profile' || text === 'profile_link') return 'profile_link';
+    return 'generic_form';
+  }
+
+  function getEffectiveManualPageType(scanInput) {
+    const scan = scanInput || manualAssistantState.scan || {};
+    return normalizeManualPageTypeLocal(manualAssistantState.pageTypeOverride || scan.pageType || 'generic_form');
+  }
+
+  function clearManualAssistantTextForProjectChange(reason = '') {
+    manualAssistantState.currentText = '';
+    manualAssistantState.currentTextPromotionKey = '';
+    lastGeneratedPromotionCopy = '';
+    lastGeneratedPromotionCopyKey = '';
+    if (qwenPanelEl && qwenPanelEl._qwenTextarea) {
+      qwenPanelEl._qwenTextarea.value = '';
+    }
+    manualAssistantLog('manual_text.cleared', { reason });
+  }
+
+  function setManualAssistantTextForProject(text, projectOrInputs) {
+    const source = projectOrInputs || {};
+    const promotionKey = source.promotionWebsiteKey || getManualAssistantProjectKey(source);
+    manualAssistantState.currentText = text || '';
+    manualAssistantState.currentTextPromotionKey = promotionKey || '';
+    lastGeneratedPromotionCopy = text || '';
+    lastGeneratedPromotionCopyKey = promotionKey ? `${getCurrentDomain()}::${promotionKey}` : '';
+  }
+
+  function getManualAssistantTextForProject(project, textarea) {
+    const promotionKey = getManualAssistantProjectKey(project);
+    if (
+      promotionKey &&
+      manualAssistantState.currentTextPromotionKey &&
+      manualAssistantState.currentTextPromotionKey !== promotionKey
+    ) {
+      clearManualAssistantTextForProjectChange('text_project_mismatch_before_manual_submit');
+      return '';
+    }
+    return (textarea && textarea.value) || manualAssistantState.currentText || '';
+  }
 
   function getElementLabelTextLocal(field) {
     if (!field) return '';
@@ -5898,9 +6595,14 @@
     if (!field || field.disabled) return false;
     const tag = (field.tagName || '').toLowerCase();
     const type = (field.type || '').toLowerCase();
-    if (!['input', 'textarea', 'select'].includes(tag)) return false;
-    if (['hidden', 'button', 'submit', 'reset', 'image', 'file'].includes(type)) return false;
+    const ariaRole = (field.getAttribute && field.getAttribute('role') || '').toLowerCase();
+    const ariaHasPopup = (field.getAttribute && field.getAttribute('aria-haspopup') || '').toLowerCase();
+    const isCombo = ariaRole === 'combobox' || ariaHasPopup === 'listbox';
+    if (!['input', 'textarea', 'select'].includes(tag) && !isCombo) return false;
+    if (['hidden', 'image', 'file'].includes(type)) return false;
+    if (!isCombo && ['button', 'submit', 'reset'].includes(type)) return false;
     if (!isVisibleFormField(field)) return false;
+    if (tag === 'button' && !isCombo) return false;
     return true;
   }
 
@@ -5914,10 +6616,17 @@
         name: field.name || '',
         id: field.id || '',
         placeholder: field.placeholder || '',
-        label: context
+        label: context,
+        ariaLabel: field.getAttribute && field.getAttribute('aria-label') || '',
+        nearbyText: field.textContent || '',
+        role: field.getAttribute && field.getAttribute('role') || ''
       });
     }
     const text = `${field.name || ''} ${field.id || ''} ${field.placeholder || ''} ${context}`.toLowerCase();
+    if (/tagline|tag line|slogan|one[-\s]?liner/.test(text)) return { role: 'tagline', score: 72, reasons: ['fallback_tagline'] };
+    if (/pricing model|pricing|price model|free|freemium/.test(text)) return { role: 'pricingModel', score: 72, reasons: ['fallback_pricing'] };
+    if (/category|categories|topic/.test(text)) return { role: 'category', score: 72, reasons: ['fallback_category'] };
+    if (/tool name|product name|app name|ai tool name/.test(text)) return { role: 'title', score: 70, reasons: ['fallback_tool_title'] };
     if (/mail|email|e-mail|邮箱/.test(text)) return { role: 'email', score: 80, reasons: ['fallback_email'] };
     if (/url|website|site|link|网址|链接/.test(text)) return { role: 'website', score: 75, reasons: ['fallback_url'] };
     if (/comment|message|content|description|bio|简介|评论|留言|描述/.test(text)) return { role: 'comment', score: 70, reasons: ['fallback_text'] };
@@ -5942,9 +6651,22 @@
       return detector.detectPageTypeFromSignals(signals);
     }
     if (signals.hasCommentForm || signals.roles.includes('comment')) return { pageType: 'blog_comment', confidence: 0.72, reasons: ['comment_field'] };
-    if (signals.hasProfileFields) return { pageType: 'profile', confidence: 0.62, reasons: ['profile_fields'] };
-    if (signals.hasDirectoryFields) return { pageType: 'directory', confidence: 0.58, reasons: ['directory_fields'] };
-    return { pageType: 'generic', confidence: 0.35, reasons: ['fallback'] };
+    if (signals.hasProfileFields) return { pageType: 'profile_link', confidence: 0.62, reasons: ['profile_fields'] };
+    if (signals.hasDirectoryFields) return { pageType: 'directory_submission', confidence: 0.58, reasons: ['directory_fields'] };
+    return { pageType: 'generic_form', confidence: 0.35, reasons: ['fallback'] };
+  }
+
+  function shouldKeepManualFormCandidate(fields, scored) {
+    const inputFields = Array.isArray(fields) ? fields : [];
+    const scoredFields = Array.isArray(scored) ? scored : [];
+    const usefulRoles = new Set(scoredFields.filter((item) => item.score >= 45).map((item) => item.role));
+    const anyDetectedRole = scoredFields.some((item) => item.role && item.role !== 'unknown' && item.score > 0);
+    const hasStructuredField = inputFields.some((field) => {
+      const tag = (field.tagName || '').toLowerCase();
+      const type = (field.type || '').toLowerCase();
+      return tag === 'textarea' || tag === 'select' || type === 'url' || type === 'email';
+    });
+    return usefulRoles.size || inputFields.length >= 2 || anyDetectedRole || hasStructuredField;
   }
 
   function collectManualAssistantCandidates() {
@@ -5957,20 +6679,20 @@
         form: commentForm,
         root: commentForm,
         score: 95,
-        fields: Array.from(commentForm.querySelectorAll('input, textarea, select')).filter(isManualCandidateField)
+        fields: Array.from(commentForm.querySelectorAll(MANUAL_ASSISTANT_FIELD_SELECTOR)).filter(isManualCandidateField)
       });
     }
 
     const forms = Array.from(document.querySelectorAll('form'));
     for (const form of forms) {
       if (commentForm && form === commentForm) continue;
-      const fields = Array.from(form.querySelectorAll('input, textarea, select')).filter(isManualCandidateField);
+      const fields = Array.from(form.querySelectorAll(MANUAL_ASSISTANT_FIELD_SELECTOR)).filter(isManualCandidateField);
       if (!fields.length) continue;
       const scored = fields.map((field) => ({ field, ...scoreManualFieldRole(field) }));
       scored.forEach((item) => allFields.push(item));
       const usefulScore = scored.reduce((sum, item) => sum + Math.max(0, item.score || 0), 0);
       const usefulRoles = new Set(scored.filter((item) => item.score >= 45).map((item) => item.role));
-      if (usefulRoles.size || usefulScore >= 80) {
+      if (usefulScore >= 80 || shouldKeepManualFormCandidate(fields, scored)) {
         candidates.push({
           kind: 'form',
           form,
@@ -5981,14 +6703,17 @@
       }
     }
 
-    const looseFields = Array.from(document.querySelectorAll('input, textarea, select')).filter((field) => {
+    const looseFields = Array.from(document.querySelectorAll(MANUAL_ASSISTANT_FIELD_SELECTOR)).filter((field) => {
       if (!isManualCandidateField(field)) return false;
       if (field.closest && field.closest('form')) return false;
       return true;
     });
     const looseScored = looseFields.map((field) => ({ field, ...scoreManualFieldRole(field) }));
     looseScored.forEach((item) => allFields.push(item));
-    const looseUseful = looseScored.filter((item) => item.score >= 45);
+    const looseUseful = looseScored.filter((item) => item.score > 0);
+    if (!looseUseful.length && looseScored.length >= 2) {
+      looseUseful.push(...looseScored);
+    }
     if (looseUseful.length) {
       const root = looseUseful[0].field.closest('section, article, main, div') || looseUseful[0].field;
       candidates.push({
@@ -6013,7 +6738,7 @@
     return {
       candidates: deduped.slice(0, 8),
       allFields,
-      pageType: pageType.pageType || 'generic',
+      pageType: normalizeManualPageTypeLocal(pageType.pageType || 'generic_form'),
       confidence: pageType.confidence || 0,
       reasons: pageType.reasons || [],
       sourceUrl: source.sourceUrl,
@@ -6024,8 +6749,19 @@
 
   async function runManualAssistantScan(options = {}) {
     const scroll = options.scroll === true;
+    const previousProjectKey = getManualAssistantProjectKey(manualAssistantState.currentProject);
     const project = await loadCurrentPromotionProjectForContent({ createFromLegacy: true }).catch(() => null);
+    const nextProjectKey = getManualAssistantProjectKey(project);
     manualAssistantState.currentProject = project;
+    if (
+      nextProjectKey &&
+      (
+        (previousProjectKey && previousProjectKey !== nextProjectKey) ||
+        (manualAssistantState.currentTextPromotionKey && manualAssistantState.currentTextPromotionKey !== nextProjectKey)
+      )
+    ) {
+      clearManualAssistantTextForProjectChange('scan_project_changed');
+    }
     const scan = collectManualAssistantCandidates();
     manualAssistantState.scan = scan;
     if (scroll && scan.candidates.length) {
@@ -6042,6 +6778,130 @@
       confidence: scan.confidence,
       projectId: project && project.id ? project.id : '',
       existingBacklink: !!(manualAssistantState.existingBacklink && manualAssistantState.existingBacklink.success)
+    });
+    return scan;
+  }
+
+  async function refreshManualAssistantProjectQuietly(reason = '') {
+    const previousProjectId = manualAssistantState.currentProject && manualAssistantState.currentProject.id
+      ? String(manualAssistantState.currentProject.id)
+      : '';
+    const previousProjectKey = getManualAssistantProjectKey(manualAssistantState.currentProject);
+    const project = await loadCurrentPromotionProjectForContent({ createFromLegacy: true }).catch((error) => {
+      manualAssistantLog('error', {
+        operation: 'refresh_project',
+        reason,
+        message: error && error.message ? error.message : String(error)
+      });
+      return null;
+    });
+    const nextProjectKey = getManualAssistantProjectKey(project);
+    const projectChanged = !!nextProjectKey && (
+      (!!previousProjectKey && previousProjectKey !== nextProjectKey) ||
+      (!!manualAssistantState.currentTextPromotionKey && manualAssistantState.currentTextPromotionKey !== nextProjectKey)
+    );
+    manualAssistantState.currentProject = project;
+    if (projectChanged) {
+      clearManualAssistantTextForProjectChange('project_refresh_changed');
+    }
+    manualAssistantState.existingBacklink = await detectManualAssistantExistingBacklink(project).catch(() => (
+      { success: false, reason: 'detect_failed', matchedHref: '' }
+    ));
+    manualAssistantLog('project.refresh', {
+      reason,
+      previousProjectId,
+      projectId: project && project.id ? String(project.id) : '',
+      targetDomain: project && project.targetDomain ? project.targetDomain : '',
+      projectChanged
+    });
+    if (qwenPanelEl && qwenPanelEl.parentNode && typeof qwenPanelEl._manualAssistantRefresh === 'function') {
+      qwenPanelEl._manualAssistantRefresh();
+    }
+    return project;
+  }
+
+  async function ensureManualAssistantCurrentProject(reason = '') {
+    const project = await refreshManualAssistantProjectQuietly(reason || 'manual_operation');
+    if (!project || !project.targetUrl) {
+      throw new Error('Please select a promotion website before using the manual assistant.');
+    }
+    manualAssistantLog('manual_project.locked', {
+      reason,
+      projectId: project.id || '',
+      targetDomain: project.targetDomain || '',
+      targetUrlKey: normalizePromotionWebsiteKey(project.targetUrl)
+    });
+    return project;
+  }
+
+  async function buildManualPromotionInputsForProject(project) {
+    const inputs = await getPromotionCopyInputsForContent(project);
+    const homepageProfile = await getManualHomepageProfileForProject(project);
+    const homepageProfileText = buildHomepageProfileTextLocal(homepageProfile);
+    return {
+      ...inputs,
+      homepageProfile,
+      promotionWebsiteContent: homepageProfileText || inputs.promotionWebsiteContent
+    };
+  }
+
+  function refreshManualAssistantDomScanQuietly(reason = '') {
+    const previousSourceUrlKey = manualAssistantState.scan && manualAssistantState.scan.sourceUrlKey;
+    const scan = collectManualAssistantCandidates();
+    manualAssistantState.scan = scan;
+    if (manualAssistantState.selectedCandidateIndex >= scan.candidates.length) {
+      manualAssistantState.selectedCandidateIndex = 0;
+    }
+    manualAssistantLog('scan.dom_refresh', {
+      reason,
+      previousSourceUrlKey: previousSourceUrlKey || '',
+      candidateCount: scan.candidates.length,
+      pageType: scan.pageType,
+      confidence: scan.confidence
+    });
+    return scan;
+  }
+
+  function shouldRevealBeforeManualGenerate(scan) {
+    const source = scan || {};
+    if (!source.candidates || !source.candidates.length) return true;
+    if (normalizeManualPageTypeLocal(source.pageType) === 'blog_comment') return true;
+    const fieldCount = source.candidates.reduce((sum, candidate) => (
+      sum + (candidate && Array.isArray(candidate.fields) ? candidate.fields.length : 0)
+    ), 0);
+    if (fieldCount <= 1) {
+      const text = `${document.title || ''} ${document.body && document.body.innerText ? document.body.innerText.slice(0, 3000) : ''}`.toLowerCase();
+      return /(comment|reply|respond|leave a reply|leave a comment|post comment|add comment)/.test(text);
+    }
+    return false;
+  }
+
+  async function prepareManualAssistantScanForGeneration(options = {}) {
+    let scan = refreshManualAssistantDomScanQuietly(options.reason || 'before_generate_prepare_initial');
+    let revealAttempted = false;
+    let revealSuccess = false;
+    if (shouldRevealBeforeManualGenerate(scan)) {
+      revealAttempted = true;
+      revealSuccess = await triggerCommentFormFlowForBatch(2800).catch((error) => {
+        manualAssistantLog('error', {
+          operation: 'manual_generate_reveal_fields',
+          message: error && error.message ? error.message : String(error)
+        });
+        return false;
+      });
+      await new Promise((resolve) => setTimeout(resolve, 220));
+      scan = refreshManualAssistantDomScanQuietly('before_generate_after_reveal');
+    }
+    if (options.scroll === true && scan.candidates.length) {
+      const candidate = scan.candidates[manualAssistantState.selectedCandidateIndex] || scan.candidates[0];
+      scrollManualCandidateIntoView(candidate);
+    }
+    manualAssistantLog('scan.generate_prepare', {
+      candidateCount: scan.candidates.length,
+      pageType: scan.pageType,
+      revealAttempted,
+      revealSuccess,
+      selectedCandidateIndex: manualAssistantState.selectedCandidateIndex
     });
     return scan;
   }
@@ -6109,6 +6969,31 @@
       });
     }
     return false;
+  }
+
+  async function shouldSuppressLegacyPageAutomationForCurrentPage() {
+    if (typeof chrome === 'undefined' || !chrome.storage || !chrome.storage.local) {
+      return Boolean(_batchCtx);
+    }
+    const data = await new Promise((resolve) => chrome.storage.local.get([
+      BATCH_ACTIVE_TASK_KEY,
+      BATCH_PENDING_TASK_KEY,
+      'batchSubmitCtx',
+      'batchCtx'
+    ], resolve));
+    const logic = getLinkAssistantRuntimeLogicLocal();
+    if (logic && typeof logic.shouldSuppressLegacyPageAutomation === 'function') {
+      return logic.shouldSuppressLegacyPageAutomation({
+        currentUrl: location.href,
+        hasBatchContext: Boolean(_batchCtx),
+        pendingTask: data[BATCH_PENDING_TASK_KEY],
+        activeTask: data[BATCH_ACTIVE_TASK_KEY],
+        batchSubmitCtx: data.batchSubmitCtx,
+        batchCtx: data.batchCtx,
+        activeSuppressMs: BATCH_ACTIVE_GLOBAL_SUPPRESS_MS
+      });
+    }
+    return isBatchAssistantActiveNow();
   }
 
   function removeManualAssistantIcon() {
@@ -6206,6 +7091,28 @@
     }
   }
 
+  function bindManualAssistantProjectRefreshWatchers() {
+    if (bindManualAssistantProjectRefreshWatchers._bound) return;
+    bindManualAssistantProjectRefreshWatchers._bound = true;
+    if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.onChanged) {
+      chrome.storage.onChanged.addListener((changes, areaName) => {
+        if (areaName !== 'local' || !changes || !changes[CURRENT_PROMOTION_PROJECT_ID_KEY]) return;
+        if (!qwenPanelEl || !qwenPanelEl.parentNode) return;
+        refreshManualAssistantProjectQuietly('storage_current_project_changed').catch(() => {});
+      });
+    }
+    window.addEventListener('focus', () => {
+      if (!qwenPanelEl || !qwenPanelEl.parentNode) return;
+      refreshManualAssistantProjectQuietly('window_focus').catch(() => {});
+    });
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState !== 'visible') return;
+      if (!qwenPanelEl || !qwenPanelEl.parentNode) return;
+      refreshManualAssistantProjectQuietly('visibility_visible').catch(() => {});
+    });
+  }
+  bindManualAssistantProjectRefreshWatchers();
+
   function getManualAssistantProjectProfile(project) {
     const source = project || {};
     return getUserProfile().then((legacy) => ({
@@ -6221,56 +7128,287 @@
     if (!candidate) return [];
     if (Array.isArray(candidate.fields) && candidate.fields.length) return candidate.fields.filter(isManualCandidateField);
     const root = candidate.root || candidate.form;
-    return root ? Array.from(root.querySelectorAll('input, textarea, select')).filter(isManualCandidateField) : [];
+    return root ? Array.from(root.querySelectorAll(MANUAL_ASSISTANT_FIELD_SELECTOR)).filter(isManualCandidateField) : [];
   }
 
-  async function fillManualAssistantFields(commentText) {
+  function buildManualFieldSpecs(candidate) {
+    const logic = getManualAssistantFieldLogicLocal();
+    return getCandidateFields(candidate).slice(0, 24).map((field, index) => {
+      const scored = scoreManualFieldRole(field);
+      const rawSpec = {
+        role: scored && scored.role ? scored.role : 'unknown',
+        score: scored && scored.score ? scored.score : 0,
+        label: getElementLabelTextLocal(field).slice(0, 180),
+        tagName: (field.tagName || '').toLowerCase(),
+        type: (field.type || '').toLowerCase(),
+        name: field.name || '',
+        id: field.id || '',
+        placeholder: field.placeholder || ''
+      };
+      const spec = logic && typeof logic.normalizeManualFieldSpec === 'function'
+        ? logic.normalizeManualFieldSpec(rawSpec, index)
+        : { ...rawSpec, fieldId: `mf_${rawSpec.role}_${index}` };
+      try {
+        field.dataset.autoCommentManualFieldId = spec.fieldId;
+      } catch (_) {}
+      return spec;
+    });
+  }
+
+  function pickManualAiFieldValue(fieldSpecOrRole, fieldValues, profile, commentText) {
+    const logic = getManualAssistantFieldLogicLocal();
+    if (logic && typeof logic.chooseManualFieldValue === 'function') {
+      return logic.chooseManualFieldValue(
+        typeof fieldSpecOrRole === 'string' ? { role: fieldSpecOrRole } : fieldSpecOrRole,
+        fieldValues,
+        profile,
+        commentText
+      );
+    }
+    const role = typeof fieldSpecOrRole === 'string' ? fieldSpecOrRole : (fieldSpecOrRole && fieldSpecOrRole.role);
+    const values = fieldValues && typeof fieldValues === 'object' ? fieldValues : {};
+    const tagText = Array.isArray(values.tags) ? values.tags.join(', ') : (values.tags || '');
+    if (role === 'email') return values.contactEmail || profile.email;
+    if (role === 'website' || role === 'websiteUrl' || role === 'url') return values.websiteUrl || profile.website;
+    if (role === 'name' || role === 'author') return values.authorName || profile.author || profile.title;
+    if (role === 'title') return values.siteTitle || profile.title || profile.author;
+    if (role === 'category') return values.categorySuggestion || '';
+    if (role === 'tags' || role === 'tag') return tagText;
+    if (role === 'description') return values.shortDescription || values.longDescription || profile.description || commentText;
+    if (role === 'bio' || role === 'profileBio') return values.bio || values.longDescription || values.shortDescription || profile.description || commentText;
+    if (role === 'comment' || role === 'message' || role === 'content') return values.commentText || commentText;
+    return '';
+  }
+
+  function getManualChoiceOptionMatcher() {
+    const logic = getManualAssistantFieldLogicLocal();
+    if (logic && typeof logic.selectBestManualChoiceOption === 'function') {
+      return logic.selectBestManualChoiceOption;
+    }
+    return (desiredValue, options) => {
+      const desired = String(desiredValue || '').trim().toLowerCase();
+      if (!desired || !Array.isArray(options)) return null;
+      const matchedIndex = options.findIndex((option) => {
+        const text = String(option && (option.text || option.value) || '').trim().toLowerCase();
+        return text === desired || text.includes(desired) || desired.includes(text);
+      });
+      if (matchedIndex < 0) return null;
+      const match = options[matchedIndex] || {};
+      return { index: matchedIndex, value: match.value || '', text: match.text || '', score: 60 };
+    };
+  }
+
+  function isManualCustomChoiceField(field) {
+    if (!field || !field.getAttribute) return false;
+    const role = String(field.getAttribute('role') || '').toLowerCase();
+    const hasPopup = String(field.getAttribute('aria-haspopup') || '').toLowerCase();
+    return role === 'combobox' || hasPopup === 'listbox';
+  }
+
+  function getVisibleManualChoiceOptions(field) {
+    const controlledId = field && field.getAttribute ? field.getAttribute('aria-controls') : '';
+    const selectors = [
+      '[role="option"]',
+      '[cmdk-item]',
+      '[data-radix-collection-item]',
+      '[data-value]',
+      '[role="listbox"] button',
+      '[role="listbox"] [role="button"]',
+      '[data-slot="command-item"]'
+    ];
+    const roots = [];
+    if (controlledId && typeof CSS !== 'undefined' && CSS.escape) {
+      try {
+        const controlled = document.getElementById(controlledId) || document.querySelector(`#${CSS.escape(controlledId)}`);
+        if (controlled) roots.push(controlled);
+      } catch (_) {}
+    }
+    roots.push(document);
+    const seen = new Set();
+    const output = [];
+    for (const root of roots) {
+      const nodes = Array.from(root.querySelectorAll(selectors.join(',')));
+      for (const node of nodes) {
+        if (!node || seen.has(node) || node === field || !isVisibleFormField(node)) continue;
+        seen.add(node);
+        const disabled = node.disabled || String(node.getAttribute && node.getAttribute('aria-disabled') || '').toLowerCase() === 'true';
+        if (disabled) continue;
+        const text = String(node.textContent || node.getAttribute && node.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
+        const value = String(node.getAttribute && (node.getAttribute('data-value') || node.getAttribute('value')) || '').trim();
+        if (!text && !value) continue;
+        if ((text || value).length > 180) continue;
+        output.push({ element: node, text, value });
+      }
+      if (output.length) break;
+    }
+    return output;
+  }
+
+  async function waitForVisibleManualChoiceOptions(field, timeoutMs = 1200) {
+    const startedAt = Date.now();
+    let options = getVisibleManualChoiceOptions(field);
+    while (!options.length && Date.now() - startedAt < timeoutMs) {
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      options = getVisibleManualChoiceOptions(field);
+    }
+    return options;
+  }
+
+  async function setManualAssistantCustomChoiceValue(field, value, spec = {}) {
+    const text = String(value || '').trim();
+    if (!field || !text || !isManualCustomChoiceField(field)) return false;
+    const matcher = getManualChoiceOptionMatcher();
+    try {
+      field.scrollIntoView && field.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      field.focus && field.focus();
+      field.click && field.click();
+    } catch (_) {}
+    const options = await waitForVisibleManualChoiceOptions(field, 1200);
+    const match = matcher(text, options);
+    if (!match || !options[match.index] || !options[match.index].element) {
+      manualAssistantLog('fill.choice.no_match', {
+        role: spec && spec.role ? spec.role : '',
+        optionCount: options.length,
+        desiredLength: text.length
+      });
+      return false;
+    }
+    const option = options[match.index];
+    try {
+      option.element.scrollIntoView && option.element.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      try {
+        option.element.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true }));
+        option.element.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true }));
+      } catch (_) {}
+      option.element.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+      option.element.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
+      option.element.click();
+      option.element.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+      manualAssistantLog('fill.choice.selected', {
+        role: spec && spec.role ? spec.role : '',
+        optionCount: options.length,
+        score: match.score || 0
+      });
+      return true;
+    } catch (error) {
+      manualAssistantLog('error', {
+        operation: 'manual_fill_choice',
+        role: spec && spec.role ? spec.role : '',
+        message: error && error.message ? error.message : String(error)
+      });
+      return false;
+    }
+  }
+
+  async function setManualAssistantFieldValue(field, value, spec = {}) {
+    if (!field) return false;
+    const tag = (field.tagName || '').toLowerCase();
+    if (tag === 'select') {
+      const text = String(value || '').trim();
+      const options = Array.from(field.options || []).map((option) => ({
+        element: option,
+        value: String(option.value || '').trim(),
+        text: String(option.textContent || '').trim()
+      }));
+      const matched = getManualChoiceOptionMatcher()(text, options);
+      const match = matched && options[matched.index] ? options[matched.index].element : null;
+      if (match) {
+        setValue(field, match.value);
+        return true;
+      }
+      return false;
+    }
+    if (isManualCustomChoiceField(field)) {
+      return setManualAssistantCustomChoiceValue(field, value, spec);
+    }
+    setValue(field, value);
+    return true;
+  }
+
+  function collectManualAssistantFinalFieldSnapshot(candidateInput) {
     const scan = manualAssistantState.scan || collectManualAssistantCandidates();
     manualAssistantState.scan = scan;
-    const project = manualAssistantState.currentProject || await loadCurrentPromotionProjectForContent({ createFromLegacy: true });
+    const candidate = candidateInput || scan.candidates[manualAssistantState.selectedCandidateIndex] || scan.candidates[0] || null;
+    const fields = getCandidateFields(candidate).slice(0, 24);
+    const specs = buildManualFieldSpecs(candidate);
+    const logic = getManualAssistantFieldLogicLocal();
+    if (logic && typeof logic.collectManualFinalFieldSnapshot === 'function') {
+      return logic.collectManualFinalFieldSnapshot(fields, specs);
+    }
+    const outputFields = fields.map((field, index) => ({
+      fieldId: specs[index] && specs[index].fieldId ? specs[index].fieldId : `mf_${index}`,
+      role: specs[index] && specs[index].role ? specs[index].role : 'unknown',
+      label: specs[index] && specs[index].label ? specs[index].label : '',
+      value: String(field.value || '').trim()
+    })).filter((item) => item.value);
+    return { fields: outputFields, fieldValuesById: {}, fieldValuesByRole: {}, commentText: '' };
+  }
+
+  async function fillManualAssistantFields(commentText, options = {}) {
+    const scan = manualAssistantState.scan || collectManualAssistantCandidates();
+    manualAssistantState.scan = scan;
+    const project = options.project || await ensureManualAssistantCurrentProject('fill_fields');
     manualAssistantState.currentProject = project;
     const profile = await getManualAssistantProjectProfile(project);
+    const fieldValues = options.fieldValues || lastGeneratedManualFieldValues || {};
     const candidate = scan.candidates[manualAssistantState.selectedCandidateIndex] || scan.candidates[0] || null;
     let blogFill = null;
-    if (scan.pageType === 'blog_comment' || (candidate && candidate.kind === 'blog_comment')) {
-      await triggerCommentFormFlowWithTimeout(6000).catch(() => false);
-      blogFill = await ensureAllCommentFormFieldsFilled(commentText || '', true).catch((error) => ({
+    const effectivePageType = getEffectiveManualPageType(scan);
+    if (effectivePageType === 'blog_comment' || (candidate && candidate.kind === 'blog_comment')) {
+      const candidateForm = candidate && candidate.form ? candidate.form : findCommentForm();
+      const hasVisibleCommentTextarea = !!getVisibleCommentTextareaFromForm(candidateForm);
+      if (!hasVisibleCommentTextarea) {
+        await triggerCommentFormFlowForBatch(6000).catch(() => false);
+      }
+      blogFill = await ensureAllCommentFormFieldsFilled(commentText || '', true, profile).catch((error) => ({
         success: false,
         error: error && error.message ? error.message : String(error)
       }));
     }
     const fields = getCandidateFields(candidate);
+    const fieldSpecs = buildManualFieldSpecs(candidate);
     let filledCount = 0;
-    for (const field of fields) {
-      const scored = scoreManualFieldRole(field);
-      if (!scored || scored.score < 45) continue;
-      const role = scored.role;
-      let value = '';
-      if (role === 'email') value = profile.email;
-      else if (role === 'website' || role === 'websiteUrl' || role === 'url') value = profile.website;
-      else if (role === 'name' || role === 'author' || role === 'title') value = profile.author || profile.title;
-      else if (role === 'description' || role === 'bio' || role === 'profileBio') value = profile.description || commentText;
-      else if (role === 'comment' || role === 'message' || role === 'content') value = commentText;
+    for (let index = 0; index < fields.length; index += 1) {
+      const field = fields[index];
+      const spec = fieldSpecs[index] || {};
+      const logic = getManualAssistantFieldLogicLocal();
+      if (logic && typeof logic.shouldAttemptManualFieldFill === 'function' && !logic.shouldAttemptManualFieldFill(spec)) {
+        continue;
+      }
+      const role = spec.role;
+      const value = pickManualAiFieldValue(spec, fieldValues, profile, commentText);
       if (!value) continue;
       const current = field.value == null ? '' : String(field.value).trim();
       if (current && !['comment', 'message', 'content', 'description', 'bio'].includes(role)) continue;
-      setValue(field, value);
-      filledCount += 1;
+      if (await setManualAssistantFieldValue(field, value, spec)) filledCount += 1;
     }
     manualAssistantLog('fill.done', {
-      pageType: scan.pageType,
+      pageType: effectivePageType,
       fieldCount: fields.length,
       filledCount,
+      fieldSpecCount: fieldSpecs.length,
+      aiFieldValueByIdCount: fieldValues && fieldValues.fieldValuesById && typeof fieldValues.fieldValuesById === 'object'
+        ? Object.keys(fieldValues.fieldValuesById).length
+        : 0,
+      hasAiFieldValues: !!(fieldValues && Object.keys(fieldValues).length),
       usedBlogFill: !!blogFill,
-      blogFillSuccess: blogFill ? !!blogFill.success : false
+      blogFillSuccess: blogFill ? !!blogFill.success : false,
+      projectId: project && project.id ? project.id : '',
+      targetDomain: project && project.targetDomain ? project.targetDomain : ''
     });
     return { filledCount, blogFill, candidate };
   }
 
   function buildManualSubmissionPayload(input = {}) {
     const scan = manualAssistantState.scan || collectManualAssistantCandidates();
-    const project = manualAssistantState.currentProject || {};
+    const project = input.project || manualAssistantState.currentProject || {};
     const now = new Date().toISOString();
+    const pageType = normalizeManualPageTypeLocal(input.pageType || getEffectiveManualPageType(scan));
+    const candidate = scan.candidates && scan.candidates.length
+      ? (scan.candidates[manualAssistantState.selectedCandidateIndex] || scan.candidates[0])
+      : null;
+    const finalSnapshot = input.finalSnapshot || collectManualAssistantFinalFieldSnapshot(candidate);
+    const finalCommentText = finalSnapshot && finalSnapshot.commentText ? finalSnapshot.commentText : '';
     return {
       promotionProjectId: project.id || null,
       targetUrl: project.targetUrl || '',
@@ -6278,27 +7416,270 @@
       sourceUrl: scan.sourceUrl || location.href,
       sourceTitle: document.title || '',
       discoveryTargetUrl: scan.sourceUrl || location.href,
-      resourceType: input.pageType || scan.pageType || 'generic',
+      resourceType: pageType,
       submitMode: 'manual',
       submitResult: input.result || 'submitted_unconfirmed',
-      aiContent: input.aiContent == null ? (manualAssistantState.currentText || null) : input.aiContent,
+      aiContent: finalCommentText || (input.aiContent == null ? (manualAssistantState.currentText || null) : input.aiContent),
       errorMessage: input.errorMessage || null,
       submitSource: 'manual_assistant',
-      pageType: input.pageType || scan.pageType || 'generic',
+      pageType,
+      manualPageTypeOverride: manualAssistantState.pageTypeOverride || '',
+      manualFinalFields: finalSnapshot && finalSnapshot.fields ? finalSnapshot.fields : [],
+      manualFinalFieldValuesById: finalSnapshot && finalSnapshot.fieldValuesById ? finalSnapshot.fieldValuesById : {},
+      manualFinalFieldValuesByRole: finalSnapshot && finalSnapshot.fieldValuesByRole ? finalSnapshot.fieldValuesByRole : {},
       detectorVersion: getLinkAssistantFormDetectorLocal() && getLinkAssistantFormDetectorLocal().DETECTOR_VERSION || 'manual-assistant-detector-unavailable',
       submissionSourceUrl: scan.sourceUrl || location.href,
       stableSourceUrlReason: scan.sourceReason || '',
       detectedExistingBacklink: !!(manualAssistantState.existingBacklink && manualAssistantState.existingBacklink.success),
       existingBacklinkHref: manualAssistantState.existingBacklink && manualAssistantState.existingBacklink.matchedHref || '',
       manualAssistantRecordedAt: now,
-      fieldCandidateCount: scan.candidates ? scan.candidates.length : 0
+      fieldCandidateCount: scan.candidates ? scan.candidates.length : 0,
+      manualFinalFieldCount: finalSnapshot && finalSnapshot.fields ? finalSnapshot.fields.length : 0
     };
   }
 
+  function getPromotionRuntimeStorageKeyLocal(promotionKey) {
+    const key = String(promotionKey || '').trim();
+    return key ? `${BATCH_RUNTIME_STATE_PROMOTION_PREFIX}${encodeURIComponent(key)}` : '';
+  }
+
+  function normalizeManualArchiveSourceKey(url) {
+    const text = String(url || '').trim();
+    if (!text) return '';
+    try {
+      const parsed = new URL(/^https?:\/\//i.test(text) ? text : `https://${text}`);
+      parsed.hash = '';
+      parsed.hostname = parsed.hostname.toLowerCase();
+      parsed.pathname = parsed.pathname.replace(/\/+$/, '') || '/';
+      return parsed.href.toLowerCase();
+    } catch (_) {
+      return text.replace(/#.*$/, '').replace(/\/+$/, '').toLowerCase();
+    }
+  }
+
+  function isLikelyManualSubmitRedirect(beforeUrl, currentUrl) {
+    const before = String(beforeUrl || '').trim();
+    const current = String(currentUrl || '').trim();
+    if (!before || !current || before === current) return false;
+    try {
+      const a = new URL(before);
+      const b = new URL(current);
+      if (a.origin !== b.origin) return false;
+      if (a.pathname === b.pathname && a.search === b.search) return true;
+      const currentText = `${b.pathname} ${b.search} ${b.hash}`.toLowerCase();
+      return /(comment|reply|respond|moderation|preview|thank|success|submitted)/.test(currentText);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  async function setManualSubmitRestoreContext(context) {
+    if (typeof chrome === 'undefined' || !chrome.storage || !chrome.storage.local) return;
+    await new Promise((resolve) => chrome.storage.local.set({
+      [MANUAL_ASSISTANT_RESTORE_CONTEXT_KEY]: {
+        beforeUrl: context.beforeUrl || location.href,
+        sourceUrl: context.sourceUrl || location.href,
+        sourceUrlKey: normalizeManualArchiveSourceKey(context.sourceUrl || location.href),
+        promotionProjectId: context.promotionProjectId || null,
+        targetDomain: context.targetDomain || '',
+        createdAt: Date.now()
+      }
+    }, resolve));
+  }
+
+  async function clearManualSubmitRestoreContext() {
+    if (typeof chrome === 'undefined' || !chrome.storage || !chrome.storage.local) return;
+    await new Promise((resolve) => chrome.storage.local.remove([MANUAL_ASSISTANT_RESTORE_CONTEXT_KEY], resolve));
+  }
+
+  async function restoreManualSubmitOriginalUrlIfNeeded() {
+    if (typeof chrome === 'undefined' || !chrome.storage || !chrome.storage.local) return false;
+    const data = await new Promise((resolve) => chrome.storage.local.get([MANUAL_ASSISTANT_RESTORE_CONTEXT_KEY], resolve));
+    const ctx = data && data[MANUAL_ASSISTANT_RESTORE_CONTEXT_KEY];
+    if (!ctx || !ctx.beforeUrl) return false;
+    const ageMs = Date.now() - Number(ctx.createdAt || 0);
+    if (ageMs > 30000) {
+      await clearManualSubmitRestoreContext();
+      return false;
+    }
+    if (!isLikelyManualSubmitRedirect(ctx.beforeUrl, location.href)) return false;
+    manualAssistantLog('manual_submit.restore', {
+      beforeUrlKey: normalizeManualArchiveSourceKey(ctx.beforeUrl),
+      currentUrlKey: normalizeManualArchiveSourceKey(location.href),
+      promotionProjectId: ctx.promotionProjectId || '',
+      ageMs
+    });
+    await clearManualSubmitRestoreContext();
+    try {
+      window.location.replace(ctx.beforeUrl);
+    } catch (_) {
+      window.location.href = ctx.beforeUrl;
+    }
+    return true;
+  }
+
+  function getManualArchiveMergeKey(record) {
+    const promotionKey = record.promotionWebsiteKey || normalizePromotionWebsiteKey(record.promotionWebsiteUrl || record.targetUrl || '');
+    const sourceKey = normalizeManualArchiveSourceKey(record.sourceUrl || record.url || '');
+    if (!sourceKey) return `manual::${record.id || record.batchId || ''}:${record.originalIndex || ''}:${record.timestamp || ''}`;
+    return `${promotionKey}::${sourceKey}`;
+  }
+
+  function mergeManualArchiveRecords(records) {
+    const byKey = new Map();
+    for (const record of Array.isArray(records) ? records : []) {
+      const key = getManualArchiveMergeKey(record);
+      const current = byKey.get(key);
+      if (!current || Number(record.timestamp || 0) >= Number(current.timestamp || 0)) {
+        byKey.set(key, record);
+      }
+    }
+    return Array.from(byKey.values()).sort((a, b) => Number(b.timestamp || 0) - Number(a.timestamp || 0));
+  }
+
+  function getManualResultBucket(result) {
+    const value = String(result || '').trim();
+    if (value === 'success' || value === 'success_pending_moderation') return 'success';
+    if (value === 'submitted_unconfirmed' || value === 'manual_required') return 'manual';
+    if (value === 'skipped_existing_submission' || value === 'source_hit_skip') return 'skipped';
+    return 'fail';
+  }
+
+  async function syncManualAssistantSubmissionToBatchRecords(payload, response = {}) {
+    if (typeof chrome === 'undefined' || !chrome.storage || !chrome.storage.local || !payload) return { ok: false, reason: 'storage_unavailable' };
+    const timestamp = Date.now();
+    const promotionWebsiteUrl = payload.targetUrl || '';
+    const promotionWebsiteKey = normalizePromotionWebsiteKey(promotionWebsiteUrl);
+    const batchId = `manual-assistant:${payload.promotionProjectId || promotionWebsiteKey}`;
+    const sourceUrl = payload.sourceUrl || location.href;
+    const sourceDomain = (() => {
+      try {
+        return new URL(sourceUrl).hostname.replace(/^www\./i, '').toLowerCase();
+      } catch (_) {
+        return '';
+      }
+    })();
+    const data = await new Promise((resolve) => chrome.storage.local.get([
+      'batchResults',
+      'batchReportedUrls',
+      BACKLINK_ARCHIVE_KEY,
+      BATCH_RUNTIME_STATE_BY_PROMOTION_KEY
+    ], resolve));
+    const batchResults = Array.isArray(data.batchResults) ? data.batchResults : [];
+    const archiveRecords = Array.isArray(data[BACKLINK_ARCHIVE_KEY]) ? data[BACKLINK_ARCHIVE_KEY] : [];
+    const existingManualResults = batchResults.filter((item) => String(item.batchId || '') === batchId);
+    const existingIndex = existingManualResults.findIndex((item) =>
+      normalizeManualArchiveSourceKey(item.url || item.sourceUrl || '') === normalizeManualArchiveSourceKey(sourceUrl)
+    );
+    const originalIndex = existingIndex >= 0
+      ? Number(existingManualResults[existingIndex].originalIndex || existingIndex)
+      : existingManualResults.length;
+    const record = {
+      id: `${batchId}:${originalIndex}:${timestamp}`,
+      batchId,
+      urlIndex: originalIndex,
+      originalIndex,
+      backendSubmissionId: response.submissionId || response.id || manualAssistantState.lastSubmissionId || null,
+      promotionProjectId: payload.promotionProjectId || null,
+      targetUrl: payload.targetUrl || promotionWebsiteUrl,
+      targetDomain: payload.targetDomain || '',
+      promotionWebsiteUrl,
+      promotionWebsiteKey,
+      copyPromotionWebsiteKey: promotionWebsiteKey,
+      url: sourceUrl,
+      sourceUrl,
+      sourceDomain,
+      discoveryTargetUrl: payload.discoveryTargetUrl || sourceUrl,
+      result: payload.submitResult || 'submitted_unconfirmed',
+      aiContent: payload.aiContent || null,
+      errorMessage: payload.errorMessage || '',
+      linkVerified: false,
+      matchedHref: payload.existingBacklinkHref || '',
+      elapsed: 0,
+      timestamp,
+      submitSource: 'manual_assistant',
+      manualAssistantRecordedAt: payload.manualAssistantRecordedAt || new Date(timestamp).toISOString()
+    };
+
+    const nextBatchResults = batchResults.filter((item) => {
+      if (String(item.batchId || '') !== batchId) return true;
+      return normalizeManualArchiveSourceKey(item.url || item.sourceUrl || '') !== normalizeManualArchiveSourceKey(sourceUrl);
+    });
+    nextBatchResults.push(record);
+    nextBatchResults.sort((a, b) => Number(a.timestamp || 0) - Number(b.timestamp || 0));
+    while (nextBatchResults.length > 500) nextBatchResults.shift();
+
+    const nextArchiveRecords = mergeManualArchiveRecords([...archiveRecords, record]).slice(0, 5000);
+    const manualRecords = nextBatchResults.filter((item) => String(item.batchId || '') === batchId);
+    const counts = manualRecords.reduce((acc, item) => {
+      const bucket = getManualResultBucket(item.result);
+      acc[bucket] = (acc[bucket] || 0) + 1;
+      return acc;
+    }, {});
+    const snapshot = {
+      batchId,
+      status: 'manual',
+      totalCount: manualRecords.length,
+      batchStartedAt: Math.min(...manualRecords.map((item) => Number(item.timestamp || timestamp))),
+      currentIndex: manualRecords.length,
+      parsedUrls: manualRecords.map((item) => ({
+        url: item.sourceUrl || item.url || '',
+        sourceDomain: item.sourceDomain || ''
+      })),
+      localResults: manualRecords.slice(-200),
+      localResultCount: manualRecords.length,
+      currentPromotionWebsiteUrl: promotionWebsiteUrl,
+      currentPromotionWebsiteKey: promotionWebsiteKey,
+      currentPromotionProjectId: payload.promotionProjectId || null,
+      successCount: counts.success || 0,
+      failCount: counts.fail || 0,
+      skippedCount: counts.skipped || 0,
+      noCommentBoxCount: 0,
+      manualRequiredCount: counts.manual || 0,
+      blockedIllegalCount: 0,
+      pendingCount: 0,
+      updatedAt: timestamp
+    };
+    const promotionStorageKey = getPromotionRuntimeStorageKeyLocal(promotionWebsiteKey);
+    const snapshotsByPromotion = data[BATCH_RUNTIME_STATE_BY_PROMOTION_KEY] && typeof data[BATCH_RUNTIME_STATE_BY_PROMOTION_KEY] === 'object'
+      ? { ...data[BATCH_RUNTIME_STATE_BY_PROMOTION_KEY] }
+      : {};
+    if (promotionWebsiteKey && promotionWebsiteKey !== '__unconfigured__') {
+      snapshotsByPromotion[promotionWebsiteKey] = snapshot;
+    }
+
+    const update = {
+      batchResults: nextBatchResults,
+      batchReportedUrls: Array.from(new Set([
+        ...(Array.isArray(data.batchReportedUrls) ? data.batchReportedUrls : []),
+        `${batchId}:${originalIndex}`
+      ])).slice(-500),
+      [BACKLINK_ARCHIVE_KEY]: nextArchiveRecords,
+      [BATCH_RUNTIME_STATE_BY_PROMOTION_KEY]: snapshotsByPromotion,
+      ...(promotionStorageKey ? { [promotionStorageKey]: snapshot } : {}),
+      [BATCH_RUNTIME_STATE_KEY]: snapshot
+    };
+    await new Promise((resolve, reject) => {
+      chrome.storage.local.set(update, () => {
+        const error = chrome.runtime && chrome.runtime.lastError;
+        if (error) reject(new Error(error.message || String(error)));
+        else resolve();
+      });
+    });
+    manualAssistantLog('submit.local_synced', {
+      batchId,
+      sourceUrl,
+      promotionProjectId: payload.promotionProjectId || '',
+      localResultCount: manualRecords.length,
+      archiveCount: nextArchiveRecords.length
+    });
+    return { ok: true, batchId, localResultCount: manualRecords.length };
+  }
+
   async function recordManualAssistantSubmission(input = {}) {
-    const project = manualAssistantState.currentProject || await loadCurrentPromotionProjectForContent({ createFromLegacy: true });
+    const project = input.project || await ensureManualAssistantCurrentProject('record_submission');
     manualAssistantState.currentProject = project;
-    const payload = buildManualSubmissionPayload(input);
+    const payload = buildManualSubmissionPayload({ ...input, project });
     if (!payload.targetUrl) {
       throw new Error('请先配置推广网站');
     }
@@ -6314,10 +7695,22 @@
     manualAssistantState.lastSubmitRecordKey = recordKey;
     manualAssistantState.lastSubmitRecordedAt = now;
     manualAssistantState.lastSubmissionId = response.submissionId || response.id || null;
+    await syncManualAssistantSubmissionToBatchRecords(payload, response).catch((error) => {
+      manualAssistantLog('error', {
+        operation: 'submit_local_sync',
+        sourceUrl: payload.sourceUrl,
+        promotionProjectId: payload.promotionProjectId || '',
+        message: error && error.message ? error.message : String(error)
+      });
+    });
     manualAssistantLog('submit.recorded', {
       submissionId: manualAssistantState.lastSubmissionId,
       result: payload.submitResult,
       pageType: payload.pageType,
+      manualFinalFieldCount: payload.manualFinalFieldCount || 0,
+      manualFinalRoles: Array.isArray(payload.manualFinalFields)
+        ? payload.manualFinalFields.map((field) => field.role).filter(Boolean).slice(0, 12)
+        : [],
       projectId: payload.promotionProjectId,
       sourceUrl: payload.sourceUrl
     });
@@ -6331,7 +7724,7 @@
     const submissionId = submission.submissionId || submission.id || manualAssistantState.lastSubmissionId;
     if (!submissionId) throw new Error('未找到提交记录，无法同步检测结果');
     const scan = manualAssistantState.scan || collectManualAssistantCandidates();
-    const project = manualAssistantState.currentProject || {};
+    const project = await ensureManualAssistantCurrentProject('sync_backlink_success');
     const payload = {
       submissionId,
       promotionProjectId: project.id || null,
@@ -6359,7 +7752,7 @@
   }
 
   async function handleManualAssistantDetectCurrentPage() {
-    const project = manualAssistantState.currentProject || await loadCurrentPromotionProjectForContent({ createFromLegacy: true });
+    const project = await ensureManualAssistantCurrentProject('detect_current_page');
     manualAssistantState.currentProject = project;
     const hit = await detectManualAssistantExistingBacklink(project);
     manualAssistantState.existingBacklink = hit;
@@ -6424,10 +7817,33 @@
       return { wrap, input };
     }
 
+    function makeComboField(label, value, options) {
+      const field = makeField(label, value);
+      const listId = `auto-comment-resource-type-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      const datalist = document.createElement('datalist');
+      datalist.id = listId;
+      (options || []).forEach((item) => {
+        const option = document.createElement('option');
+        option.value = item.value;
+        if (item.label) option.label = item.label;
+        datalist.appendChild(option);
+      });
+      field.input.setAttribute('list', listId);
+      field.input.setAttribute('autocomplete', 'off');
+      field.wrap.appendChild(datalist);
+      return field;
+    }
+
     const sourceUrl = makeField('可提交地址', scan.sourceUrl || location.href);
     const pageAscore = makeField('Page ascore', '', 'number');
     const traffic = makeField('流量', '', 'number');
-    const resourceType = makeField('类型', scan.pageType || 'generic');
+    const resourceType = makeComboField('类型', getEffectiveManualPageType(scan), [
+      { value: 'blog_comment', label: '博客评论' },
+      { value: 'directory_submission', label: '导航站/目录提交' },
+      { value: 'media_submission', label: '媒体站/投稿' },
+      { value: 'profile_link', label: '个人资料/Profile' },
+      { value: 'generic_form', label: '通用表单' }
+    ]);
     const qualityLabel = makeField('等级', '');
     const notes = makeField('备注', '', 'textarea');
     const status = document.createElement('div');
@@ -6463,11 +7879,17 @@
       save.disabled = true;
       status.textContent = '正在保存...';
       try {
+        const selectedResourceType = (resourceType.input.value || '').trim() || 'generic_form';
+        const project = await ensureManualAssistantCurrentProject('save_resource');
+        manualAssistantState.currentProject = project;
         const detector = getLinkAssistantFormDetectorLocal();
         const payload = detector && typeof detector.buildManualResourcePayload === 'function'
           ? detector.buildManualResourcePayload({
+            promotionProjectId: project && project.id ? project.id : null,
+            targetUrl: project && project.targetUrl ? project.targetUrl : '',
+            targetDomain: project && project.targetDomain ? project.targetDomain : '',
             sourceUrl: sourceUrl.input.value,
-            pageType: resourceType.input.value,
+            pageType: selectedResourceType,
             pageAscore: pageAscore.input.value,
             traffic: traffic.input.value,
             qualityLabel: qualityLabel.input.value,
@@ -6477,9 +7899,12 @@
             submitSource: 'manual_assistant'
           })
           : {
+            promotionProjectId: project && project.id ? project.id : null,
+            targetUrl: project && project.targetUrl ? project.targetUrl : '',
+            targetDomain: project && project.targetDomain ? project.targetDomain : '',
             sourceUrl: sourceUrl.input.value,
             sourceTitle: document.title || '',
-            resourceType: resourceType.input.value || 'generic',
+            resourceType: selectedResourceType,
             pageAscore: pageAscore.input.value || null,
             traffic: traffic.input.value || null,
             qualityLabel: qualityLabel.input.value || '',
@@ -6487,11 +7912,18 @@
             discoveryTargetUrl: scan.sourceUrl || location.href,
             submitSource: 'manual_assistant'
           };
+        payload.resourceType = selectedResourceType;
+        payload.pageType = selectedResourceType;
+        payload.promotionProjectId = project && project.id ? project.id : null;
+        payload.targetUrl = project && project.targetUrl ? project.targetUrl : '';
+        payload.targetDomain = project && project.targetDomain ? project.targetDomain : '';
         await contentLinkAssistantApiJson('/link-assistant/resources', { method: 'POST', body: payload });
         manualAssistantLog('resource.saved', {
           sourceUrl: payload.sourceUrl,
           resourceType: payload.resourceType,
-          submitSource: 'manual_assistant'
+          submitSource: 'manual_assistant',
+          promotionProjectId: payload.promotionProjectId || '',
+          targetDomain: payload.targetDomain || ''
         });
         status.textContent = '已保存到资源库';
         status.style.color = '#22c55e';
@@ -6513,13 +7945,13 @@
     manualAssistantState.nativeWatcherInstalled = true;
     const maybeRecord = async (reason, target) => {
       if (await isBatchAssistantActiveNow()) return;
-      const scan = manualAssistantState.scan || collectManualAssistantCandidates();
+      const scan = collectManualAssistantCandidates();
+      manualAssistantState.scan = scan;
       const candidate = scan.candidates[manualAssistantState.selectedCandidateIndex] || scan.candidates[0];
       if (!candidate) return;
       const root = candidate.root || candidate.form;
       if (root && target && !root.contains(target) && target !== root) return;
       try {
-        manualAssistantState.scan = scan;
         await recordManualAssistantSubmission({
           result: 'submitted_unconfirmed',
           errorMessage: reason
@@ -6577,6 +8009,41 @@
     throw new Error('无法打开推广配置页');
   }
 
+  async function openExtensionPageFromContent(messageType, pagePath, operation) {
+    const pageUrl = typeof chrome !== 'undefined' && chrome.runtime && typeof chrome.runtime.getURL === 'function'
+      ? chrome.runtime.getURL(pagePath)
+      : '';
+    if (typeof chrome !== 'undefined' && chrome.runtime && typeof chrome.runtime.sendMessage === 'function') {
+      try {
+        const response = await chrome.runtime.sendMessage({ type: messageType });
+        if (response && response.ok) return response;
+        throw new Error(response && response.error ? response.error : `${messageType}_failed`);
+      } catch (error) {
+        manualAssistantLog('error', {
+          operation,
+          message: error && error.message ? error.message : String(error)
+        });
+      }
+    }
+    if (pageUrl) {
+      window.open(pageUrl, '_blank', 'noopener');
+      return { ok: true, fallback: true };
+    }
+    throw new Error('无法打开扩展页面');
+  }
+
+  function openResourceLibraryFromContent() {
+    return openExtensionPageFromContent('OPEN_RESOURCE_LIBRARY', 'resource-library.html', 'open_resource_library_message');
+  }
+
+  function openArchivePageFromContent() {
+    return openExtensionPageFromContent('OPEN_BATCH_ARCHIVE', 'batch.html#archive', 'open_batch_archive_message');
+  }
+
+  function openManualSubmissionRecordsFromContent() {
+    return openExtensionPageFromContent('OPEN_MANUAL_SUBMISSION_RECORDS', 'batch.html#manual-records', 'open_manual_submission_records_message');
+  }
+
   function activateQwenProgressTabForBatch() {
     removeManualAssistantIcon();
     if (!qwenPanelEl || !qwenPanelEl.parentNode || typeof qwenPanelEl._qwenSetActiveTab !== 'function') return;
@@ -6597,9 +8064,9 @@
     btn.type = 'button';
     btn.textContent = label;
     btn.style.border = variant === 'primary' ? 'none' : '1px solid rgba(148,163,184,0.42)';
-    btn.style.borderRadius = '7px';
-    btn.style.padding = '7px 9px';
-    btn.style.fontSize = '12px';
+    btn.style.borderRadius = '6px';
+    btn.style.padding = '6px 8px';
+    btn.style.fontSize = '11px';
     btn.style.fontWeight = variant === 'primary' ? '700' : '600';
     btn.style.lineHeight = '1.1';
     btn.style.cursor = 'pointer';
@@ -6609,30 +8076,53 @@
     return btn;
   }
 
+  function getManualAssistantStatusToneLocal(color) {
+    const logic = getManualAssistantFieldLogicLocal();
+    if (logic && typeof logic.getManualAssistantStatusTone === 'function') {
+      return logic.getManualAssistantStatusTone(color);
+    }
+    const text = String(color || '').toLowerCase();
+    if (text === '#f97373' || /red|error|danger/.test(text)) {
+      return { textColor: '#fecaca', borderColor: 'rgba(248,113,113,0.75)', backgroundColor: 'rgba(127,29,29,0.68)' };
+    }
+    if (text === '#f59e0b' || /amber|yellow|warn/.test(text)) {
+      return { textColor: '#fde68a', borderColor: 'rgba(245,158,11,0.78)', backgroundColor: 'rgba(120,53,15,0.7)' };
+    }
+    if (text === '#22c55e' || /green|success/.test(text)) {
+      return { textColor: '#bbf7d0', borderColor: 'rgba(34,197,94,0.66)', backgroundColor: 'rgba(20,83,45,0.62)' };
+    }
+    return { textColor: '#cbd5e1', borderColor: 'rgba(148,163,184,0.34)', backgroundColor: 'rgba(15,23,42,0.74)' };
+  }
+
   function buildManualAssistantPanelBody(body, helpers = {}) {
     body.textContent = '';
-    body.style.padding = '10px';
-    body.style.gap = '8px';
-    body.style.overflowY = 'auto';
-    body.style.maxHeight = 'calc(78vh - 54px)';
+    body.style.padding = '8px';
+    body.style.gap = '6px';
+    body.style.overflowY = 'visible';
+    body.style.maxHeight = 'none';
 
     const statusEl = document.createElement('div');
-    statusEl.style.fontSize = '11px';
-    statusEl.style.color = '#94a3b8';
-    statusEl.style.lineHeight = '1.35';
-    statusEl.style.minHeight = '16px';
+    statusEl.style.display = 'none';
 
     const summary = document.createElement('div');
     summary.style.border = '1px solid rgba(148,163,184,0.24)';
-    summary.style.borderRadius = '8px';
+    summary.style.borderRadius = '7px';
     summary.style.background = 'rgba(2,6,23,0.42)';
-    summary.style.padding = '8px';
-    summary.style.fontSize = '11px';
-    summary.style.lineHeight = '1.45';
+    summary.style.padding = '6px 7px';
+    summary.style.fontSize = '10.5px';
+    summary.style.lineHeight = '1.34';
     summary.style.color = '#cbd5e1';
+    summary.style.whiteSpace = 'pre-line';
+    summary.style.overflowWrap = 'anywhere';
 
     const pageType = document.createElement('select');
-    ['blog_comment', 'directory', 'media', 'profile', 'generic'].forEach((value) => {
+    [
+      'blog_comment',
+      'directory_submission',
+      'media_submission',
+      'profile_link',
+      'generic_form'
+    ].forEach((value) => {
       const opt = document.createElement('option');
       opt.value = value;
       opt.textContent = value;
@@ -6640,19 +8130,19 @@
     });
     pageType.style.width = '100%';
     pageType.style.border = '1px solid rgba(148,163,184,0.42)';
-    pageType.style.borderRadius = '7px';
+    pageType.style.borderRadius = '6px';
     pageType.style.background = 'rgba(15,23,42,0.86)';
     pageType.style.color = '#f8fafc';
-    pageType.style.padding = '6px 8px';
-    pageType.style.fontSize = '12px';
+    pageType.style.padding = '5px 7px';
+    pageType.style.fontSize = '11px';
 
     const topRow = document.createElement('div');
     topRow.style.display = 'grid';
-    topRow.style.gridTemplateColumns = '1fr 1fr';
+    topRow.style.gridTemplateColumns = '1.35fr 0.82fr 0.82fr';
     topRow.style.gap = '6px';
     const rescanBtn = makeManualAssistantButton('重新扫描');
     const nextBtn = makeManualAssistantButton('下一个位置');
-    topRow.append(rescanBtn, nextBtn);
+    topRow.append(pageType, rescanBtn, nextBtn);
 
     const detectRow = document.createElement('div');
     detectRow.style.display = 'grid';
@@ -6665,14 +8155,14 @@
     const textarea = document.createElement('textarea');
     textarea.style.width = '100%';
     textarea.style.boxSizing = 'border-box';
-    textarea.style.minHeight = '98px';
-    textarea.style.maxHeight = '170px';
-    textarea.style.borderRadius = '8px';
+    textarea.style.minHeight = '72px';
+    textarea.style.maxHeight = '112px';
+    textarea.style.borderRadius = '7px';
     textarea.style.border = '1px solid rgba(148,163,184,0.42)';
     textarea.style.background = 'rgba(2,6,23,0.78)';
     textarea.style.color = '#e5e7eb';
-    textarea.style.fontSize = '12px';
-    textarea.style.lineHeight = '1.42';
+    textarea.style.fontSize = '11px';
+    textarea.style.lineHeight = '1.34';
     textarea.style.fontFamily = "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace";
     textarea.style.padding = '8px';
     textarea.placeholder = 'AI 生成或手动填写的提交内容';
@@ -6700,26 +8190,94 @@
     const saveResourceBtn = makeManualAssistantButton('加入外链资源库');
     resourceRow.appendChild(saveResourceBtn);
 
+    const bottomNavRow = document.createElement('div');
+    bottomNavRow.style.display = 'grid';
+    bottomNavRow.style.gridTemplateColumns = '1fr 1fr 1fr';
+    bottomNavRow.style.gap = '6px';
+    bottomNavRow.style.marginTop = '-1px';
+    const openManualRecordsBtn = makeManualAssistantButton('提交记录');
+    const openResourceLibraryBtn = makeManualAssistantButton('外链资源库');
+    const openArchiveBtn = makeManualAssistantButton('历史归档');
+    [openManualRecordsBtn, openResourceLibraryBtn, openArchiveBtn].forEach((btn) => {
+      btn.style.padding = '5px 6px';
+      btn.style.fontSize = '10.5px';
+    });
+    bottomNavRow.append(openManualRecordsBtn, openResourceLibraryBtn, openArchiveBtn);
+
+    let manualBusyAction = '';
+    const manualTaskButtons = [generateFillBtn, submitBtn, manualRecordBtn];
+
+    function setManualTaskButtonsBusy(isBusy) {
+      manualTaskButtons.forEach((btn) => {
+        btn.disabled = !!isBusy;
+        btn.style.opacity = isBusy ? '0.58' : '1';
+        btn.style.cursor = isBusy ? 'not-allowed' : 'pointer';
+      });
+    }
+
+    function shouldBlockManualActionLocal(action) {
+      const logic = getManualAssistantFieldLogicLocal();
+      if (logic && typeof logic.shouldBlockManualAssistantAction === 'function') {
+        return logic.shouldBlockManualAssistantAction(manualBusyAction, action);
+      }
+      return !!manualBusyAction;
+    }
+
+    function startManualAction(action) {
+      if (shouldBlockManualActionLocal(action)) {
+        setLocalStatus('任务执行中，请稍候', '#f59e0b');
+        return false;
+      }
+      manualBusyAction = action;
+      setManualTaskButtonsBusy(true);
+      return true;
+    }
+
+    function finishManualAction(action) {
+      if (manualBusyAction && manualBusyAction !== action) return;
+      manualBusyAction = '';
+      setManualTaskButtonsBusy(false);
+    }
+
     function setLocalStatus(text, color) {
       statusEl.textContent = text || '';
       statusEl.style.color = color || '#94a3b8';
+      if (qwenPanelEl && qwenPanelEl._manualHeaderStatusPill) {
+        const pill = qwenPanelEl._manualHeaderStatusPill;
+        const tone = getManualAssistantStatusToneLocal(color || '#94a3b8');
+        pill.textContent = text || '待命';
+        pill.style.color = tone.textColor;
+        pill.style.borderColor = tone.borderColor;
+        pill.style.background = tone.backgroundColor;
+        pill.title = text || '待命';
+      }
       if (helpers.setStatus) helpers.setStatus(text || '', color || '#94a3b8');
     }
 
     function refreshSummary() {
       const scan = manualAssistantState.scan || collectManualAssistantCandidates();
       manualAssistantState.scan = scan;
-      pageType.value = scan.pageType || 'generic';
+      const effectivePageType = getEffectiveManualPageType(scan);
+      pageType.value = effectivePageType;
       const project = manualAssistantState.currentProject || {};
       const hit = manualAssistantState.existingBacklink;
       const source = scan.sourceUrl || location.href;
       summary.textContent = [
         `推广：${project.targetDomain || project.targetUrl || '未配置'}`,
-        `页面：${scan.pageType || 'generic'} · 可提交区 ${scan.candidates.length} 个`,
+        `页面：${effectivePageType} · 可提交区 ${scan.candidates.length} 个`,
         `地址：${source.length > 86 ? source.slice(0, 83) + '...' : source}`,
         hit && hit.success ? '状态：源码已命中，避免重复提交' : '状态：未发现已存在外链'
       ].join('\n');
     }
+
+    pageType.addEventListener('change', () => {
+      manualAssistantState.pageTypeOverride = normalizeManualPageTypeLocal(pageType.value);
+      manualAssistantLog('page_type.override', {
+        pageType: manualAssistantState.pageTypeOverride,
+        sourceUrl: manualAssistantState.scan && manualAssistantState.scan.sourceUrl || location.href
+      });
+      refreshSummary();
+    });
 
     rescanBtn.addEventListener('click', async () => {
       setLocalStatus('正在扫描...', '#94a3b8');
@@ -6763,25 +8321,51 @@
       }
     });
     textarea.addEventListener('input', () => {
-      manualAssistantState.currentText = textarea.value;
-      lastGeneratedPromotionCopy = textarea.value;
+      setManualAssistantTextForProject(textarea.value, manualAssistantState.currentProject || {});
     });
     generateFillBtn.addEventListener('click', async () => {
-      generateFillBtn.disabled = true;
+      if (!startManualAction('generate_fill')) return;
       setLocalStatus('正在生成并填充...', '#94a3b8');
       try {
-        const text = await generatePromotionCopyWithRetry(3);
+        const project = await ensureManualAssistantCurrentProject('generate_fill_click');
+        const promotionInputs = await buildManualPromotionInputsForProject(project);
+        const activeScan = await prepareManualAssistantScanForGeneration({
+          reason: 'before_generate_click',
+          scroll: true
+        });
+        refreshSummary();
+        const activeCandidate = activeScan.candidates[manualAssistantState.selectedCandidateIndex] || activeScan.candidates[0] || null;
+        const manualFieldSpecs = buildManualFieldSpecs(activeCandidate);
+        const text = await generatePromotionCopyWithRetry(3, {
+          promotionInputs,
+          manualAssistant: true,
+          manualPageType: getEffectiveManualPageType(activeScan),
+          manualFieldSpecs
+        });
         if (!text) {
           setLocalStatus('当前页面命中黑名单，已跳过生成', '#f59e0b');
           return;
         }
-        manualAssistantState.currentText = text;
-        lastGeneratedPromotionCopy = text;
+        setManualAssistantTextForProject(text, promotionInputs);
         textarea.value = text;
-        await recordGenerationTime(text);
-        const fill = await fillManualAssistantFields(text);
+        refreshManualAssistantDomScanQuietly('after_generate_before_fill');
+        refreshSummary();
+        manualAssistantLog('generate.before_fill', {
+          pageType: getEffectiveManualPageType(manualAssistantState.scan),
+          contentLength: text.length,
+          fieldSpecCount: manualFieldSpecs.length,
+          hasHomepageProfile: !!promotionInputs.homepageProfile,
+          hasAiFieldValues: !!(lastGeneratedManualFieldValues && Object.keys(lastGeneratedManualFieldValues).length)
+        });
+        const fill = await fillManualAssistantFields(text, { project, fieldValues: lastGeneratedManualFieldValues });
+        recordGenerationTime(text, promotionInputs).catch((error) => {
+          manualAssistantLog('error', {
+            operation: 'record_generation_time',
+            message: error && error.message ? error.message : String(error)
+          });
+        });
         manualAssistantLog('generate.done', {
-          pageType: manualAssistantState.scan && manualAssistantState.scan.pageType,
+          pageType: getEffectiveManualPageType(manualAssistantState.scan),
           contentLength: text.length,
           filledCount: fill.filledCount
         });
@@ -6789,7 +8373,7 @@
       } catch (error) {
         setLocalStatus(error && error.message ? error.message : '生成失败', '#f97373');
       } finally {
-        generateFillBtn.disabled = false;
+        finishManualAction('generate_fill');
       }
     });
     copyBtn.addEventListener('click', async () => {
@@ -6807,14 +8391,28 @@
       }
     });
     submitBtn.addEventListener('click', async () => {
-      submitBtn.disabled = true;
+      if (!startManualAction('submit_record')) return;
       setLocalStatus('正在填充并尝试提交...', '#94a3b8');
       try {
-        const text = textarea.value || manualAssistantState.currentText || '';
-        manualAssistantState.currentText = text;
-        await fillManualAssistantFields(text);
+        const project = await ensureManualAssistantCurrentProject('submit_click');
+        const text = getManualAssistantTextForProject(project, textarea);
+        setManualAssistantTextForProject(text, project);
+        await fillManualAssistantFields(text, { project });
         const scan = manualAssistantState.scan || collectManualAssistantCandidates();
         const candidate = scan.candidates[manualAssistantState.selectedCandidateIndex] || scan.candidates[0];
+        const beforeSubmitUrl = window.location.href;
+        await setManualSubmitRestoreContext({
+          beforeUrl: beforeSubmitUrl,
+          sourceUrl: scan.sourceUrl || beforeSubmitUrl,
+          promotionProjectId: project && project.id ? project.id : null,
+          targetDomain: project && project.targetDomain ? project.targetDomain : ''
+        });
+        await recordManualAssistantSubmission({
+          project,
+          result: 'submitted_unconfirmed',
+          aiContent: text,
+          errorMessage: 'manual_assistant_submit_clicked'
+        });
         let clickResult = null;
         if (candidate && candidate.kind === 'blog_comment') {
           clickResult = await clickCommentSubmitButton(candidate.form || null).catch((error) => ({ success: false, error: error.message || String(error) }));
@@ -6830,7 +8428,28 @@
           }
         }
         const result = clickResult && clickResult.success ? 'submitted_unconfirmed' : 'manual_required';
+        if (clickResult && clickResult.success) {
+          await new Promise((resolve) => setTimeout(resolve, 1200));
+          if (isLikelyManualSubmitRedirect(beforeSubmitUrl, window.location.href)) {
+            manualAssistantLog('manual_submit.restore_same_document', {
+              beforeUrlKey: normalizeManualArchiveSourceKey(beforeSubmitUrl),
+              currentUrlKey: normalizeManualArchiveSourceKey(window.location.href),
+              projectId: project && project.id ? project.id : ''
+            });
+            await clearManualSubmitRestoreContext();
+            try {
+              window.history.replaceState(window.history.state, document.title, beforeSubmitUrl);
+            } catch (_) {
+              window.location.replace(beforeSubmitUrl);
+            }
+          } else if (window.location.href === beforeSubmitUrl) {
+            await clearManualSubmitRestoreContext();
+          }
+        } else {
+          await clearManualSubmitRestoreContext();
+        }
         await recordManualAssistantSubmission({
+          project,
           result,
           aiContent: text,
           errorMessage: clickResult && clickResult.error ? clickResult.error : ''
@@ -6839,28 +8458,68 @@
       } catch (error) {
         setLocalStatus(error && error.message ? error.message : '提交记录失败', '#f97373');
       } finally {
-        submitBtn.disabled = false;
+        finishManualAction('submit_record');
       }
     });
     manualRecordBtn.addEventListener('click', async () => {
-      manualRecordBtn.disabled = true;
+      if (!startManualAction('manual_record')) return;
       setLocalStatus('正在记录...', '#94a3b8');
       try {
+        const project = await ensureManualAssistantCurrentProject('manual_record_click');
+        const text = getManualAssistantTextForProject(project, textarea);
         await recordManualAssistantSubmission({
+          project,
           result: 'submitted_unconfirmed',
-          aiContent: textarea.value || manualAssistantState.currentText || '',
+          aiContent: text,
           errorMessage: 'user_marked_manual_submitted'
         });
         setLocalStatus('已记录本次手动提交', '#22c55e');
       } catch (error) {
         setLocalStatus(error && error.message ? error.message : '记录失败', '#f97373');
       } finally {
-        manualRecordBtn.disabled = false;
+        finishManualAction('manual_record');
       }
     });
     saveResourceBtn.addEventListener('click', openManualResourceModal);
+    openManualRecordsBtn.addEventListener('click', async () => {
+      openManualRecordsBtn.disabled = true;
+      setLocalStatus('正在打开提交记录...', '#94a3b8');
+      try {
+        await openManualSubmissionRecordsFromContent();
+        setLocalStatus('已打开提交记录', '#22c55e');
+      } catch (error) {
+        setLocalStatus(error && error.message ? error.message : '打开提交记录失败', '#f97373');
+      } finally {
+        openManualRecordsBtn.disabled = false;
+      }
+    });
+    openResourceLibraryBtn.addEventListener('click', async () => {
+      openResourceLibraryBtn.disabled = true;
+      setLocalStatus('正在打开外链资源库...', '#94a3b8');
+      try {
+        await openResourceLibraryFromContent();
+        setLocalStatus('已打开外链资源库', '#22c55e');
+      } catch (error) {
+        setLocalStatus(error && error.message ? error.message : '打开外链资源库失败', '#f97373');
+      } finally {
+        openResourceLibraryBtn.disabled = false;
+      }
+    });
+    openArchiveBtn.addEventListener('click', async () => {
+      openArchiveBtn.disabled = true;
+      setLocalStatus('正在打开历史归档...', '#94a3b8');
+      try {
+        await openArchivePageFromContent();
+        setLocalStatus('已打开历史归档', '#22c55e');
+      } catch (error) {
+        setLocalStatus(error && error.message ? error.message : '打开历史归档失败', '#f97373');
+      } finally {
+        openArchiveBtn.disabled = false;
+      }
+    });
 
-    body.append(summary, pageType, topRow, detectRow, textarea, contentRow, submitRow, resourceRow, statusEl);
+    setLocalStatus('', '#94a3b8');
+    body.append(topRow, detectRow, textarea, contentRow, submitRow, resourceRow, bottomNavRow, summary, statusEl);
     if (qwenPanelEl) {
       qwenPanelEl._qwenTextarea = textarea;
       qwenPanelEl._manualAssistantRefresh = refreshSummary;
@@ -6891,9 +8550,9 @@
     panel.style.position = 'fixed';
     panel.style.right = '24px';
     panel.style.bottom = '24px';
-    panel.style.width = qwenPanelRequestedMode === 'progress-only' ? '340px' : '382px';
+    panel.style.width = qwenPanelRequestedMode === 'progress-only' ? '340px' : '360px';
     panel.style.maxWidth = '80vw';
-    panel.style.maxHeight = qwenPanelRequestedMode === 'progress-only' ? '60vh' : '78vh';
+    panel.style.maxHeight = qwenPanelRequestedMode === 'progress-only' ? '60vh' : '88vh';
     panel.style.zIndex = '2147483647';
     panel.style.background = 'rgba(15,23,42,0.97)';
     panel.style.color = '#e5e7eb';
@@ -6910,11 +8569,37 @@
     header.style.display = 'flex';
     header.style.alignItems = 'center';
     header.style.justifyContent = 'space-between';
-    header.style.padding = '10px 14px';
+    header.style.padding = '8px 10px';
     header.style.borderBottom = '1px solid rgba(148,163,184,0.25)';
     header.style.fontSize = '13px';
     header.style.fontWeight = '600';
-    header.textContent = qwenPanelRequestedMode === 'progress-only' ? '批量进度' : '手动外链助手';
+    const headerLeft = document.createElement('div');
+    headerLeft.style.display = 'flex';
+    headerLeft.style.alignItems = 'center';
+    headerLeft.style.gap = '8px';
+    headerLeft.style.minWidth = '0';
+    headerLeft.style.flex = '1';
+
+    const headerTitle = document.createElement('span');
+    headerTitle.textContent = qwenPanelRequestedMode === 'progress-only' ? '批量进度' : '手动外链助手';
+    headerTitle.style.whiteSpace = 'nowrap';
+
+    const manualHeaderStatusPill = document.createElement('span');
+    manualHeaderStatusPill.textContent = '待命';
+    manualHeaderStatusPill.style.display = qwenPanelRequestedMode === 'progress-only' ? 'none' : 'inline-block';
+    manualHeaderStatusPill.style.maxWidth = '170px';
+    manualHeaderStatusPill.style.overflow = 'hidden';
+    manualHeaderStatusPill.style.textOverflow = 'ellipsis';
+    manualHeaderStatusPill.style.whiteSpace = 'nowrap';
+    manualHeaderStatusPill.style.border = '1px solid rgba(148,163,184,0.34)';
+    manualHeaderStatusPill.style.borderRadius = '999px';
+    manualHeaderStatusPill.style.padding = '2px 7px';
+    manualHeaderStatusPill.style.fontSize = '10.5px';
+    manualHeaderStatusPill.style.fontWeight = '700';
+    manualHeaderStatusPill.style.lineHeight = '1.3';
+    manualHeaderStatusPill.style.color = '#cbd5e1';
+    manualHeaderStatusPill.style.background = 'rgba(15,23,42,0.74)';
+    headerLeft.append(headerTitle, manualHeaderStatusPill);
 
     const closeBtn = document.createElement('button');
     closeBtn.textContent = '×';
@@ -6936,7 +8621,8 @@
       }
     });
 
-    header.appendChild(closeBtn);
+    header.append(headerLeft, closeBtn);
+    installQwenPanelDraggingLocal(panel, header);
 
     const tabBar = document.createElement('div');
     tabBar.style.display = 'flex';
@@ -7128,6 +8814,8 @@
     document.documentElement.appendChild(panel);
     qwenPanelEl = panel;
 
+    qwenPanelEl._manualHeaderStatusPill = manualHeaderStatusPill;
+    qwenPanelEl._manualHeaderTitle = headerTitle;
     qwenPanelEl._qwenTextarea = textarea;
     qwenPanelEl._qwenSetStatus = setStatus;
     qwenPanelEl._qwenSetCopyEnabled = setCopyEnabled;
@@ -7154,11 +8842,11 @@
     qwenPanelEl._qwenApplyMode = (mode) => {
       const progressOnly = mode === 'progress-only';
       qwenPanelEl._qwenPanelMode = progressOnly ? 'progress-only' : 'manual';
-      panel.style.width = progressOnly ? '340px' : '382px';
-      panel.style.maxHeight = progressOnly ? '60vh' : '78vh';
+      panel.style.width = progressOnly ? '340px' : '360px';
+      panel.style.maxHeight = progressOnly ? '60vh' : '88vh';
       tabBar.style.display = 'none';
-      const firstTextNode = Array.from(header.childNodes).find((node) => node.nodeType === Node.TEXT_NODE);
-      if (firstTextNode) firstTextNode.textContent = progressOnly ? '批量进度' : '手动外链助手';
+      headerTitle.textContent = progressOnly ? '批量进度' : '手动外链助手';
+      manualHeaderStatusPill.style.display = progressOnly ? 'none' : 'inline-block';
       if (!progressOnly && qwenPanelEl._manualAssistantBuilt !== true) {
         buildManualAssistantPanelBody(body, {
           setStatus,
@@ -7855,7 +9543,7 @@
           _sendResponse({ ok: true, accepted: true, duplicate: true, urlIndex: message.urlIndex });
           return;
         }
-        setBatchContext(message.batchId, message.urlIndex, message.url);
+        setBatchContext(message.batchId, message.urlIndex, message.url, message);
         _sendResponse({ ok: true, accepted: true, urlIndex: message.urlIndex });
         handleBatchTask(message.batchId, message.urlIndex, message.url)
           .then(() => {
@@ -7899,6 +9587,9 @@
     console.warn('[content] 检测到非法网站，上报 blocked_illegal 并关闭网页:', { batchId, urlIndex, url, reason });
     await writePendingResult(batchId, urlIndex, url, 'blocked_illegal', null, reason);
 
+    const promotionInputs = await getBatchPromotionInputsForContent();
+    const promotionWebsiteUrl = promotionInputs.promotionWebsiteUrl || '';
+    const promotionWebsiteKey = promotionInputs.promotionWebsiteKey || normalizePromotionWebsiteKey(promotionWebsiteUrl);
     await new Promise((resolve) => {
       chrome.runtime.sendMessage({
         type: 'BATCH_HANDLE_CONFIRM',
@@ -7907,6 +9598,9 @@
         url: url || location.href || '',
         aiContent: '',
         result: 'blocked_illegal',
+        promotionWebsiteUrl,
+        promotionWebsiteKey,
+        copyPromotionWebsiteKey: promotionWebsiteKey,
         errorMessage: reason
       }).then((response) => {
         console.log('[content] blocked_illegal BATCH_HANDLE_CONFIRM 响应:', response);
@@ -7937,6 +9631,16 @@
     }
     runningBatchTaskKey = taskKey;
     try {
+      const batchPromotionInputs = await getBatchPromotionInputsForContent();
+      const batchPromotionWebsiteUrl = batchPromotionInputs.promotionWebsiteUrl || '';
+      const batchFillOverrides = getBatchFillOverridesFromInputs(batchPromotionInputs);
+      logBatchSubmit('task.promotion_context', {
+        batchId,
+        urlIndex,
+        promotionProjectId: batchPromotionInputs.projectId || null,
+        promotionWebsiteKey: batchPromotionInputs.promotionWebsiteKey || '',
+        targetDomain: batchPromotionInputs.targetDomain || ''
+      });
       console.log('[content] 1/6 等待页面加载...');
       await waitForPageReady();
       logBatchSubmit('page.ready', { title: document.title || '', href: location.href });
@@ -7965,10 +9669,9 @@
         return;
       }
       console.log('[content] 2/6 检查是否已处理过...');
-      const promotionWebsiteForSourceCheck = await getWebsiteUrl();
       const sourceHit = detectPromotionSourceHitLocal(
         document.documentElement ? document.documentElement.outerHTML : '',
-        promotionWebsiteForSourceCheck
+        batchPromotionWebsiteUrl
       );
       logBatchSubmit('page.source_hit_check', {
         hit: !!sourceHit.hit,
@@ -8105,7 +9808,7 @@
         await reportManualRequiredAndClose(batchId, urlIndex, url, null);
         return;
       }
-      let aiContent = await getReusablePromotionCopy();
+      let aiContent = await getReusablePromotionCopy(batchPromotionInputs);
       if (!isUsableGeneratedCopy(aiContent)) {
         aiContent = '';
       }
@@ -8118,8 +9821,11 @@
       } else {
         console.log('[content] 4/6 生成AI文案...');
         aiGenerated = true; // AI即将生成，标记用于失败时补偿
-        logBatchSubmit('ai.generate_start');
-        aiContent = await generatePromotionCopyWithRetry(1);
+        logBatchSubmit('ai.generate_start', {
+          promotionProjectId: batchPromotionInputs.projectId || null,
+          promotionWebsiteKey: batchPromotionInputs.promotionWebsiteKey || ''
+        });
+        aiContent = await generatePromotionCopyWithRetry(1, { promotionInputs: batchPromotionInputs });
         if (!aiContent) {
           aiGenerated = false;
           console.log('[content] AI文案命中黑名单，已由后端退回积分，跳过当前URL');
@@ -8139,7 +9845,7 @@
         textareaId: ta && ta.id ? ta.id : '',
         textareaName: ta && ta.name ? ta.name : ''
       });
-      const promotionUrlForFill = await getWebsiteUrl();
+      const promotionUrlForFill = batchPromotionWebsiteUrl;
       const batchCommentFillOptions = {
         fast: false,
         typingStrategy: 'human-fast',
@@ -8216,7 +9922,7 @@
       }
       // 预检查只验证姓名/邮箱/网站字段是否存在，不验证comment（尚未生成）
       logBatchSubmit('fill.fields_precheck_start');
-      const fillResult = await ensureAllCommentFormFieldsFilled('', true);
+      const fillResult = await ensureAllCommentFormFieldsFilled('', true, batchFillOverrides);
       logBatchSubmit('fill.fields_precheck_done', {
         success: !!(fillResult && fillResult.success),
         missingFields: fillResult && fillResult.missingFields ? fillResult.missingFields : []
@@ -8225,7 +9931,7 @@
         throw new Error('表单字段缺失: ' + (fillResult.missingFields || []).join(', '));
       }
       logBatchSubmit('fill.fields_refill_start');
-      let refillResult = await ensureAllCommentFormFieldsFilled('', true);
+      let refillResult = await ensureAllCommentFormFieldsFilled('', true, batchFillOverrides);
       logBatchSubmit('fill.fields_refill_done', {
         success: !!(refillResult && refillResult.success),
         missingFields: refillResult && refillResult.missingFields ? refillResult.missingFields : []
@@ -8238,7 +9944,7 @@
         });
         const retryFillResult = await fillSpecificCommentTextareaHumanLike(latestTextarea, aiContent, batchCommentFillOptions);
         if (retryFillResult && retryFillResult.success) {
-          refillResult = await ensureAllCommentFormFieldsFilled('', true);
+          refillResult = await ensureAllCommentFormFieldsFilled('', true, batchFillOverrides);
         }
         logBatchSubmit('fill.comment_retry_done', {
           success: !!(refillResult && refillResult.success),
@@ -8263,7 +9969,7 @@
       }
 
       logBatchSubmit('submit.ready_check_start');
-      const promotionWebsiteForSubmit = await getWebsiteUrl();
+      const promotionWebsiteForSubmit = batchPromotionWebsiteUrl;
       await ensureCommentReadyForSubmitWithRecovery(
         aiContent,
         form,
@@ -8350,7 +10056,7 @@
       console.log('[content] batch submit result saved after observation:', { finalResult, finalError });
 
       if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.sendMessage) {
-        const promotionWebsiteUrl = await getWebsiteUrl();
+        const promotionWebsiteUrl = batchPromotionWebsiteUrl;
         const payload = buildBatchConfirmPayloadLocal({
           batchId,
           urlIndex,
@@ -8358,8 +10064,8 @@
           aiContent,
           result: finalResult,
           promotionWebsiteUrl,
-          promotionWebsiteKey: normalizePromotionWebsiteKey(promotionWebsiteUrl),
-          copyPromotionWebsiteKey: normalizePromotionWebsiteKey(promotionWebsiteUrl),
+          promotionWebsiteKey: batchPromotionInputs.promotionWebsiteKey || normalizePromotionWebsiteKey(promotionWebsiteUrl),
+          copyPromotionWebsiteKey: batchPromotionInputs.promotionWebsiteKey || normalizePromotionWebsiteKey(promotionWebsiteUrl),
           errorMessage: finalError,
           linkVerified: !!(submitOutcome.linkVerification && submitOutcome.linkVerification.linkVerified),
           matchedHref: submitOutcome.linkVerification ? submitOutcome.linkVerification.matchedHref : '',
@@ -8414,6 +10120,9 @@
         console.log('[content] 未找到评论框，上报并关闭标签页');
         await writePendingResult(batchId, urlIndex, url, 'no_comment_box', null, '未找到评论框');
         // 使用 BATCH_HANDLE_CONFIRM 触发 background -> batch 的 BATCH_CONFIRMED 流程
+        const promotionInputs = await getBatchPromotionInputsForContent();
+        const promotionWebsiteUrl = promotionInputs.promotionWebsiteUrl || '';
+        const promotionWebsiteKey = promotionInputs.promotionWebsiteKey || normalizePromotionWebsiteKey(promotionWebsiteUrl);
         await new Promise((resolve) => {
           chrome.runtime.sendMessage({
             type: 'BATCH_HANDLE_CONFIRM',
@@ -8422,6 +10131,9 @@
             url: url || '',
             aiContent: '',
             result: 'no_comment_box',
+            promotionWebsiteUrl,
+            promotionWebsiteKey,
+            copyPromotionWebsiteKey: promotionWebsiteKey,
             errorMessage: '未找到评论框'
           }).then((response) => {
             console.log('[content] no_comment_box BATCH_HANDLE_CONFIRM 响应:', response);
@@ -8445,7 +10157,7 @@
       await writePendingResult(batchId, urlIndex, url, 'fail', null, err.message || String(err));
       await reportBatchResult(batchId, urlIndex, 'fail', null, err.message || String(err), url);
       if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.sendMessage) {
-        const promotionWebsiteUrl = await getWebsiteUrl();
+        const promotionWebsiteUrl = batchPromotionWebsiteUrl;
         await new Promise((resolve) => {
           chrome.runtime.sendMessage({
             type: 'BATCH_HANDLE_CONFIRM',
@@ -8455,7 +10167,8 @@
             aiContent: '',
             result: 'fail',
             promotionWebsiteUrl,
-            promotionWebsiteKey: normalizePromotionWebsiteKey(promotionWebsiteUrl),
+            promotionWebsiteKey: batchPromotionInputs.promotionWebsiteKey || normalizePromotionWebsiteKey(promotionWebsiteUrl),
+            copyPromotionWebsiteKey: batchPromotionInputs.promotionWebsiteKey || normalizePromotionWebsiteKey(promotionWebsiteUrl),
             errorMessage: err.message || String(err)
           }).then(resolve).catch(resolve);
         });
@@ -8531,7 +10244,9 @@
    * 检查 URL 是否已在 batchResults 中处理过
    */
   async function checkExistingBatchResult(batchId, url, urlIndex) {
-    const promotionWebsiteUrl = await getWebsiteUrl();
+    const promotionInputs = await getBatchPromotionInputsForContent();
+    const promotionWebsiteUrl = promotionInputs.promotionWebsiteUrl || '';
+    const promotionWebsiteKey = promotionInputs.promotionWebsiteKey || normalizePromotionWebsiteKey(promotionWebsiteUrl);
     return new Promise((resolve) => {
       chrome.storage.local.get(['batchResults'], (data) => {
         const results = data.batchResults || [];
@@ -8543,7 +10258,7 @@
           (r.result === 'success' || r.result === 'success_pending_moderation') &&
           r.confirmedBy === BATCH_SUCCESS_CONFIRMATION_MARKER &&
           isSamePromotionWebsite(r.promotionWebsiteUrl, promotionWebsiteUrl) &&
-          r.copyPromotionWebsiteKey === normalizePromotionWebsiteKey(promotionWebsiteUrl) &&
+          r.copyPromotionWebsiteKey === promotionWebsiteKey &&
           isUsableGeneratedCopy(r.aiContent)
         );
         if (currentBatchMatch) {
@@ -8564,7 +10279,9 @@
     await writePendingResult(batchId, urlIndex, url, 'skipped', aiContent, 'already_commented');
     sendBeaconReport(batchId, urlIndex, 'skipped', aiContent, 'already_commented');
     if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.sendMessage) {
-      const promotionWebsiteUrl = await getWebsiteUrl();
+      const promotionInputs = await getBatchPromotionInputsForContent();
+      const promotionWebsiteUrl = promotionInputs.promotionWebsiteUrl || '';
+      const promotionWebsiteKey = promotionInputs.promotionWebsiteKey || normalizePromotionWebsiteKey(promotionWebsiteUrl);
       await new Promise((resolve) => {
         chrome.runtime.sendMessage({
           type: 'BATCH_HANDLE_CONFIRM',
@@ -8574,8 +10291,8 @@
           aiContent: aiContent || '',
           result: 'skipped',
           promotionWebsiteUrl,
-          promotionWebsiteKey: normalizePromotionWebsiteKey(promotionWebsiteUrl),
-          copyPromotionWebsiteKey: normalizePromotionWebsiteKey(promotionWebsiteUrl),
+          promotionWebsiteKey,
+          copyPromotionWebsiteKey: promotionWebsiteKey,
           errorMessage: 'already_commented'
         }).then(resolve).catch(resolve);
       });
@@ -8743,8 +10460,7 @@
     if (!field || field.disabled) return false;
     const type = (field.type || '').toLowerCase();
     if (type === 'hidden') return false;
-    const style = window.getComputedStyle(field);
-    return style.display !== 'none' && style.visibility !== 'hidden';
+    return isElementVisibleForSelection(field);
   }
 
   function getFieldContextText(field, form) {
@@ -8785,6 +10501,9 @@
     sendBeaconReport(batchId, urlIndex, 'manual_required', aiContent || null, finalErrorMessage);
 
     if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.sendMessage) {
+      const promotionInputs = await getBatchPromotionInputsForContent();
+      const promotionWebsiteUrl = promotionInputs.promotionWebsiteUrl || '';
+      const promotionWebsiteKey = promotionInputs.promotionWebsiteKey || normalizePromotionWebsiteKey(promotionWebsiteUrl);
       await new Promise((resolve) => {
         chrome.runtime.sendMessage({
           type: 'BATCH_HANDLE_CONFIRM',
@@ -8793,6 +10512,9 @@
           url: url || '',
           aiContent: aiContent || '',
           result: 'manual_required',
+          promotionWebsiteUrl,
+          promotionWebsiteKey,
+          copyPromotionWebsiteKey: promotionWebsiteKey,
           errorMessage: finalErrorMessage
         }).then(resolve).catch(resolve);
       });
@@ -8809,7 +10531,9 @@
     sendBeaconReport(batchId, urlIndex, result, aiContent || null, errorMessage || null);
 
     if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.sendMessage) {
-      const promotionWebsiteUrl = await getWebsiteUrl();
+      const promotionInputs = await getBatchPromotionInputsForContent();
+      const promotionWebsiteUrl = promotionInputs.promotionWebsiteUrl || '';
+      const promotionWebsiteKey = promotionInputs.promotionWebsiteKey || normalizePromotionWebsiteKey(promotionWebsiteUrl);
       await new Promise((resolve) => {
         chrome.runtime.sendMessage(buildBatchConfirmPayloadLocal({
           batchId,
@@ -8818,8 +10542,8 @@
           aiContent: aiContent || '',
           result,
           promotionWebsiteUrl,
-          promotionWebsiteKey: normalizePromotionWebsiteKey(promotionWebsiteUrl),
-          copyPromotionWebsiteKey: normalizePromotionWebsiteKey(promotionWebsiteUrl),
+          promotionWebsiteKey,
+          copyPromotionWebsiteKey: promotionWebsiteKey,
           errorMessage: errorMessage || null
         })).then(resolve).catch(resolve);
       });
@@ -8840,7 +10564,9 @@
       return;
     }
     try {
-      const promotionWebsiteUrl = await getWebsiteUrl();
+      const promotionInputs = await getBatchPromotionInputsForContent();
+      const promotionWebsiteUrl = promotionInputs.promotionWebsiteUrl || '';
+      const promotionWebsiteKey = promotionInputs.promotionWebsiteKey || normalizePromotionWebsiteKey(promotionWebsiteUrl);
       const data = await new Promise((resolve) => {
         chrome.storage.local.get(['batchResults', 'batchReportedUrls'], (d) => resolve(d));
       });
@@ -8853,8 +10579,8 @@
         aiContent,
         errorMessage,
         promotionWebsiteUrl,
-        promotionWebsiteKey: normalizePromotionWebsiteKey(promotionWebsiteUrl),
-        copyPromotionWebsiteKey: normalizePromotionWebsiteKey(promotionWebsiteUrl),
+        promotionWebsiteKey,
+        copyPromotionWebsiteKey: promotionWebsiteKey,
         timestamp: Date.now()
       };
       if (result === 'success' || result === 'success_pending_moderation') {

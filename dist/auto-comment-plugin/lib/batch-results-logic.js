@@ -423,6 +423,7 @@ function buildCurrentBatchExportCsv(input) {
     'Elapsed seconds',
     'Backlink verified',
     'Matched href',
+    'Submit source',
     'Batch ID'
   ];
 
@@ -446,6 +447,7 @@ function buildCurrentBatchExportCsv(input) {
       sourceRecord.elapsed ?? '',
       sourceRecord.linkVerified === undefined || sourceRecord.linkVerified === null ? '' : String(sourceRecord.linkVerified),
       sourceRecord.matchedHref || '',
+      sourceRecord.submitSource || sourceRecord.submit_source || 'batch_auto',
       sourceRecord.batchId || batchId
     ];
     return cols.map(csvEscape).join(',');
@@ -672,6 +674,7 @@ function buildArchiveExportCsv(input) {
     'Latest Backlink Matched Href',
     'Latest Backlink Reason',
     'AI Content',
+    'Submit source',
     'Timestamp'
   ];
   const rows = records.map((record) => [
@@ -689,6 +692,7 @@ function buildArchiveExportCsv(input) {
     record.latestBacklinkMatchedHref || '',
     record.latestBacklinkReason || '',
     record.aiContent || '',
+    record.submitSource || record.submit_source || 'batch_auto',
     record.timestamp ? new Date(record.timestamp).toISOString() : ''
   ].map(csvEscape).join(','));
 

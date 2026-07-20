@@ -11,6 +11,7 @@
 /output/
 /.worktrees/
 /storage/*.log
+/logs/
 
 # Generated CSV inventory for automatic paid fulfillment.
 /storage/csv-batches/
