@@ -109,8 +109,11 @@ function countPattern(text, patterns) {
 
 function detectPageTypeFromSignals(signals) {
   const source = signals && typeof signals === 'object' ? signals : {};
+  const roles = Array.isArray(source.roles) ? source.roles.map(safeLower).filter(Boolean) : [];
+  const hasCommentRole = roles.includes('comment') || roles.includes('message') || roles.includes('content');
   const text = safeLower([
     source.formText,
+    source.bodyText,
     source.pageText,
     source.buttonText,
     source.labelsText
@@ -118,14 +121,18 @@ function detectPageTypeFromSignals(signals) {
 
   const scores = {
     blog_comment: Number(source.commentSignals || 0) +
+      (source.hasCommentForm === true ? 4 : 0) +
+      (hasCommentRole ? 3 : 0) +
       countPattern(text, [/comment/, /leave a reply/, /post comment/, /respond/, /wordpress/]) +
-      (Number(source.textareaCount || 0) > 0 ? 1 : 0),
+      (Number(source.textareaCount || 0) > 0 || hasCommentRole ? 1 : 0),
     directory_submission: Number(source.directorySignals || 0) +
+      (source.hasDirectoryFields === true ? 2 : 0) +
       countPattern(text, [/submit listing/, /add site/, /directory/, /website url/, /category/, /listing/]) +
       (Number(source.urlInputCount || 0) > 0 ? 1 : 0),
     media_submission: Number(source.mediaSignals || 0) +
       countPattern(text, [/submit article/, /abstract/, /article title/, /author bio/, /editorial/, /publish/]),
     profile_link: Number(source.profileSignals || 0) +
+      (source.hasProfileFields === true ? 2 : 0) +
       countPattern(text, [/edit profile/, /profile/, /bio/, /company/, /social link/, /website/]),
     generic_form: 1
   };

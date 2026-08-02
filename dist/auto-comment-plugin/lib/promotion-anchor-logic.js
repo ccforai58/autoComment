@@ -209,8 +209,19 @@ function extractFirstAnchor(text) {
   };
 }
 
+function removeDanglingTrailingAnchor(text) {
+  const value = String(text || '');
+  const lastAnchorStart = value.toLowerCase().lastIndexOf('<a');
+  if (lastAnchorStart < 0) return value;
+  const trailing = value.slice(lastAnchorStart);
+  if (/<\/a\s*>/i.test(trailing)) return value;
+  if (!/\bhref\s*=/i.test(trailing)) return value;
+  return value.slice(0, lastAnchorStart).trimEnd();
+}
+
 function ensurePromotionAnchor(text, options = {}) {
-  const original = String(text || '');
+  const rawOriginal = String(text || '');
+  const original = removeDanglingTrailingAnchor(rawOriginal);
   const promotionUrl = normalizePromotionUrl(options.promotionUrl);
   if (!promotionUrl) {
     return {

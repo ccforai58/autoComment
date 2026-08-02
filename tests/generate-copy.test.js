@@ -8,9 +8,14 @@ const {
   generateWithModelQueued
 } = require('../lib/model-generate');
 const {
-  stripGeneratedCopyMarkdownFences
+  stripGeneratedCopyMarkdownFences,
+  validateGeneratedComment
 } = require('../lib/generated-copy-cleanup');
 const { buildUserPrompt } = require('../lib/generate-copy-prompt');
+const { buildSkillTemplate } = require('../lib/comment-prompt-rules');
+const { parseManualAssistantJson } = require('../lib/manual-assistant-json');
+const fs = require('node:fs');
+const path = require('node:path');
 
 test('generateWithModel falls back to chat completions when responses output is empty', async () => {
   const calls = [];
@@ -218,6 +223,34 @@ test('extractModelText supports chat message content arrays', () => {
   assert.equal(text, 'First part.\nSecond part.');
 });
 
+test('extractModelText ignores Responses API reasoning and keeps the final message', () => {
+  const text = extractModelText({
+    output: [
+      {
+        type: 'reasoning',
+        summary: [{ text: 'We need plan the response and include an anchor.' }]
+      },
+      {
+        type: 'message',
+        content: [{ type: 'output_text', text: 'This is the final publishable comment.' }]
+      }
+    ]
+  });
+
+  assert.equal(text, 'This is the final publishable comment.');
+});
+
+test('parseManualAssistantJson restores a literal href newline in a manual blog comment', () => {
+  const parsed = parseManualAssistantJson([
+    '{',
+    '  "commentText": "Useful note with <a href=\\"https://example.com/',
+    '\\">natural anchor</a> included."',
+    '}'
+  ].join('\n'));
+
+  assert.equal(parsed.commentText, 'Useful note with <a href="https://example.com/\n">natural anchor</a> included.');
+});
+
 test('stripGeneratedCopyMarkdownFences removes wrapper fence without changing href newline', () => {
   const text = '```html\nHelpful note with <a href="https://example.com/\n">natural anchor</a> inside.\n```';
 
@@ -225,6 +258,61 @@ test('stripGeneratedCopyMarkdownFences removes wrapper fence without changing hr
 
   assert.equal(cleaned, 'Helpful note with <a href="https://example.com/\n">natural anchor</a> inside.');
   assert.match(cleaned, /href="https:\/\/example\.com\/\n">/);
+});
+
+test('validateGeneratedComment rejects model planning text instead of a publishable comment', () => {
+  const result = validateGeneratedComment([
+    'We need answer in Swedish.',
+    'Need craft comment 100 words approx.',
+    'Need include link exactly once as an HTML anchor.'
+  ].join(' '));
+
+  assert.deepEqual(result, { valid: false, reason: 'meta_instruction_output' });
+});
+
+test('validateGeneratedComment accepts a natural Swedish comment', () => {
+  const result = validateGeneratedComment('Texten visar fint hur musik kan hjälpa oss att omtolka minnen och identitet över tid.');
+
+  assert.deepEqual(result, { valid: true, reason: '' });
+});
+
+test('blog comment templates require a connected two-part comment structure', () => {
+  const defaultTemplate = buildSkillTemplate('Default instruction.', {
+    requireHtmlAnchor: true,
+    requireCommentStructure: true
+  });
+  const customTemplate = buildSkillTemplate('Custom instruction.', {
+    requireHtmlAnchor: true,
+    requireCommentStructure: true
+  });
+
+  assert.match(defaultTemplate, /Start by affirming the article's value/);
+  assert.match(defaultTemplate, /approximately 30 words/);
+  assert.match(defaultTemplate, /approximately 50 words/);
+  assert.match(defaultTemplate, /50 to 70 characters/);
+  assert.match(defaultTemplate, /specific direct connection/);
+  assert.match(defaultTemplate, /specific secondary connection/);
+  assert.match(defaultTemplate, /Do not use vague bridges/);
+  assert.match(defaultTemplate, /naturally embedded in the second part/);
+  assert.match(customTemplate, /Custom instruction\./);
+  assert.match(customTemplate, /Start by affirming the article's value/);
+  assert.match(defaultTemplate, /Never output planning, instructions, or an explanation/);
+});
+
+test('non-blog manual templates omit comment structure requirements', () => {
+  const template = buildSkillTemplate('Directory field instruction.', {
+    requireHtmlAnchor: false,
+    requireCommentStructure: false
+  });
+
+  assert.match(template, /Directory field instruction\./);
+  assert.doesNotMatch(template, /Start by affirming the article's value/);
+});
+
+test('extension lets the backend apply the current standard comment prompt', () => {
+  const contentScript = fs.readFileSync(path.join(__dirname, '..', 'content.js'), 'utf8');
+
+  assert.doesNotMatch(contentScript, /skillTemplate:\s*QWEN_SKILL_TEMPLATE/);
 });
 
 test('manual assistant prompt includes homepage profile and field specs', () => {
@@ -255,4 +343,13 @@ test('manual assistant prompt includes homepage profile and field specs', () => 
   assert.match(prompt, /fieldId=mf_title_1234/);
   assert.match(prompt, /fieldValuesById/);
   assert.match(prompt, /shortDescription/);
+});
+
+test('manual blog comment JSON prompt encodes the required href newline', () => {
+  const prompt = buildUserPrompt({
+    manualMode: true,
+    manualPageType: 'blog_comment'
+  });
+
+  assert.match(prompt, /JSON escape sequence \\n/);
 });

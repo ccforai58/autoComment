@@ -51,6 +51,17 @@ test('detectPageTypeFromSignals recognizes major manual assistant page types', (
   }).pageType, 'profile_link');
 });
 
+test('detectPageTypeFromSignals recognizes a comment form from content-script scan signals', () => {
+  const result = detectPageTypeFromSignals({
+    bodyText: 'DIY Guess Who Template Free Printables Leave a Comment',
+    roles: ['comment', 'author', 'email', 'websiteUrl'],
+    hasCommentForm: true,
+    hasDirectoryFields: true
+  });
+
+  assert.equal(result.pageType, 'blog_comment');
+});
+
 test('scoreFieldRole maps labels and placeholders to stable field roles', () => {
   const toolName = scoreFieldRole({
     label: 'Tool Name *',

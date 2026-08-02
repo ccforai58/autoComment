@@ -16,7 +16,7 @@
       }
 
       .container {
-        max-width: 700px;
+        max-width: 640px;
         margin: 0 auto;
       }
 
@@ -50,6 +50,21 @@
         justify-content: flex-end;
       }
 
+      .app-nav {
+        display: flex;
+        gap: 4px;
+        margin: 0 0 16px;
+        padding: 4px;
+        border: 1px solid #e5e7eb;
+        border-radius: 10px;
+        background: #fff;
+      }
+      .app-nav button { flex: 1; padding: 8px 10px; border: 0; border-radius: 7px; background: transparent; color: #6b7280; font: inherit; font-size: 13px; cursor: pointer; }
+      .app-nav button.active { color: #1d4ed8; background: #eff6ff; font-weight: 700; }
+      .app-view-hidden { display: none !important; }
+      .advanced-settings > summary { cursor: pointer; color: #4b5563; font-size: 13px; font-weight: 600; }
+      .advanced-settings[open] > summary { margin-bottom: 14px; }
+
       .card {
         background: #ffffff;
         border-radius: 12px;
@@ -57,6 +72,16 @@
         padding: 20px 24px;
         margin-bottom: 16px;
       }
+
+      .task-list { display: grid; gap: 8px; }
+      .task-list-empty { font-size: 12px; color: #6b7280; }
+      .task-item { display: grid; grid-template-columns: 1fr auto; gap: 8px; padding: 10px 12px; border: 1px solid #e5e7eb; border-radius: 8px; background: #fff; }
+      .task-item.selected { border-color: #2563eb; background: #eff6ff; }
+      .task-item-main { min-width: 0; text-align: left; border: 0; background: transparent; cursor: pointer; color: inherit; }
+      .task-item-title { display: block; font-size: 13px; font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .task-item-meta { display: block; margin-top: 4px; color: #6b7280; font-size: 12px; }
+      .task-item-actions { display: flex; align-items: center; gap: 6px; }
+      .task-item-actions .btn { padding: 5px 9px; font-size: 11px; }
 
       .card-title {
         font-size: 14px;
@@ -238,7 +263,7 @@
 
       .file-info {
         display: none;
-        align-items: center;
+        align-items: flex-start;
         gap: 10px;
         margin-top: 10px;
         padding: 10px 14px;
@@ -251,21 +276,31 @@
         display: flex;
       }
 
-      .file-name {
+      .file-details {
         flex: 1;
+        min-width: 0;
+        display: grid;
+        gap: 5px;
+      }
+
+      .file-name {
         font-size: 13px;
-        font-weight: 500;
+        font-weight: 600;
         color: #15803d;
-        word-break: break-all;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
       }
 
       .file-count {
         font-size: 12px;
         color: #15803d;
-        white-space: nowrap;
+        line-height: 1.45;
+        word-break: keep-all;
       }
 
       .file-remove {
+        flex: 0 0 auto;
         font-size: 18px;
         color: #9ca3af;
         cursor: pointer;
@@ -1018,14 +1053,22 @@
           <div class="subtitle">本地运行，上传 CSV 后批量打开原 URL，提交评论并用公开页面源码验证外链。</div>
         </div>
         <div class="topbar-actions">
+          <button class="btn btn-secondary" id="modelSettingsBtn">AI 模型配置</button>
           <button class="btn btn-secondary" id="openSettingsBtn">打开设置</button>
           <button class="btn btn-secondary" id="openResourceLibraryBtn">资源库</button>
           <button class="btn btn-secondary" id="refreshSetupBtn">刷新配置</button>
         </div>
       </div>
 
-      <div class="card">
-        <div class="card-title">运行前检查</div>
+      <nav class="app-nav" aria-label="主导航">
+        <button type="button" id="navWorkbench" class="active" data-app-nav="workbench">工作台</button>
+        <button type="button" id="navTasks" data-app-nav="tasks">任务</button>
+        <button type="button" id="navSubmissions" data-app-nav="submissions">提交记录</button>
+        <button type="button" id="navResources" data-app-nav="resources">资源库</button>
+      </nav>
+
+      <div class="card" data-app-view="workbench">
+        <div class="card-title">当前项目</div>
         <div class="setup-grid">
           <div class="setup-item">
             <div class="setup-label">推广网站</div>
@@ -1052,8 +1095,14 @@
       </div>
 
 
+      <div class="card" id="taskManagerCard" data-app-view="tasks">
+        <div class="card-title">任务</div>
+        <div class="task-list" id="taskList" aria-live="polite"></div>
+        <div class="task-list-empty" id="taskListEmpty">暂无已开始的任务。导入文件后点击开始，任务会保留在这里。</div>
+      </div>
+
       <!-- 文件上传区 -->
-      <div class="card">
+      <div class="card" data-app-view="workbench">
         <div class="card-title">上传 CSV 文件</div>
                 <div class="upload-grid">
           <div class="upload-zone" id="uploadZone">
@@ -1080,8 +1129,10 @@
         <div class="import-status" id="semrushImportStatus" aria-live="polite"></div>
 
         <div class="file-info" id="fileInfo">
-          <span class="file-name" id="fileName"></span>
-          <span class="file-count" id="fileCount"></span>
+          <div class="file-details">
+            <span class="file-name" id="fileName"></span>
+            <span class="file-count" id="fileCount"></span>
+          </div>
           <span class="file-remove" id="fileRemove" title="移除文件">×</span>
         </div>
 
@@ -1103,38 +1154,10 @@
         </div>
       </div>
 
-      <div class="card">
-        <div class="card-title">自动操作设置</div>
-
-        <div style="margin-bottom: 10px;">
-          <label style="display:flex;align-items:center;gap:8px;font-weight:500;font-size:13px;cursor:pointer;">
-            <input type="checkbox" id="batchAutoOpenPanel" />
-            <span>页面加载后自动打开"网站推广助手"浮动窗口</span>
-          </label>
-          <div class="hint" style="margin-left: 22px; margin-top: 4px;">
-            勾选后，每个页面加载后会在右下角自动弹出推广助手窗口。
-          </div>
-        </div>
-
-        <div style="margin-bottom: 10px;">
-          <label style="display:flex;align-items:center;gap:8px;font-weight:500;font-size:13px;cursor:pointer;">
-            <input type="checkbox" id="batchAutoGenerate" />
-            <span>页面加载时自动调用 AI 生成推广文案</span>
-          </label>
-          <div class="hint" style="margin-left: 22px; margin-top: 4px;">
-            勾选后，在检测到评论框后，自动调用 AI 生成推广文案。
-          </div>
-        </div>
-
-        <div>
-          <label style="display:flex;align-items:center;gap:8px;font-weight:500;font-size:13px;cursor:pointer;">
-            <input type="checkbox" id="batchAutoSubmit" />
-            <span>AI 生成文案后自动提交评论</span>
-          </label>
-          <div class="hint" style="margin-left: 22px; margin-top: 4px;">
-            勾选后，生成文案并填入评论框后，将自动点击"发送评论"按钮。
-          </div>
-        </div>
+      <div class="card" data-app-view="workbench">
+        <div class="card-title">执行规则</div>
+        <details class="advanced-settings">
+          <summary>调整超时、随机间隔与安全限制</summary>
 
         <div class="card-title" style="margin-top: 16px;">超时配置</div>
         <div style="display:flex;align-items:center;gap:10px;">
@@ -1149,23 +1172,18 @@
           />
           <span style="font-size:12px;color:#9ca3af;">范围 10~600 秒</span>
         </div>
-      </div>
-
-      <!-- 积分信息 -->
-      <div class="card">
-        <div class="card-title">积分消耗</div>
-        <div class="current-status">
-          当前状态：<span class="status-badge idle" id="statusBadge">空闲</span>
-        </div>
-        <div class="points-bar">
-          当前积分余额：<span class="balance" id="pointsBalance">—</span>
-          <span id="pointsHint" style="color:#9ca3af"></span>
-        </div>
-        <div id="costHint" class="hint warn" style="display:none; margin-top:8px;"></div>
+        <div class="card-title" style="margin-top:16px;">自动提交安全限制</div>
+            <div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;font-size:12px;">
+          <label>每日确认阈值<input type="number" id="autoSubmitCheckpoint" min="1" max="500" value="50" /></label>
+          <label style="display:flex;align-items:center;gap:6px;"><input type="checkbox" id="autoSubmitIntervalEnabled" checked />启用随机间隔</label>
+          <label>最小间隔（分钟）<input type="number" id="autoSubmitIntervalMin" min="1" max="120" value="5" /></label>
+              <label>最大间隔（分钟）<input type="number" id="autoSubmitIntervalMax" min="1" max="120" value="20" /></label>
+            </div>
+        </details>
       </div>
 
       <!-- 操作按钮 -->
-      <div class="action-bar" id="actionBar">
+      <div class="action-bar" id="actionBar" data-app-view="workbench">
         <button class="btn btn-primary" id="startBtn" disabled>
           ▶ 开始批量处理
         </button>
@@ -1175,8 +1193,8 @@
       </div>
 
       <!-- 进度显示 -->
-      <div class="card progress-section" id="progressSection">
-        <div class="card-title">处理进度</div>
+      <div class="card progress-section" id="progressSection" data-app-view="workbench">
+        <div class="card-title">当前任务</div>
         <div class="progress-bar-wrap">
           <div class="progress-bar" id="progressBar"></div>
         </div>
@@ -1196,19 +1214,23 @@
           <div class="stat-item stat-pending">
             <span class="num" id="pendingCount">0</span> 待处理
           </div>
-          <div class="stat-item" style="margin-left:auto">
-            进度：<span class="num" id="progressText">0/0</span>
+            <div class="stat-item" style="margin-left:auto">
+                    已处理：<span class="num" id="progressText">0/0</span>
+            </div>
           </div>
-        </div>
+              <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:8px;min-height:18px;">
+                <div id="progressActivity" style="font-size:12px;color:#4b5563;min-width:0;"></div>
+                <span id="dailyAutoSubmitProgress" style="flex:0 0 auto;padding:3px 8px;border-radius:999px;background:#eff6ff;color:#1d4ed8;font-size:11px;font-weight:700;white-space:nowrap;">今日自动提交 0 / 50</span>
+              </div>
       </div>
 
       <!-- Results workspace -->
-      <div class="card results-card" id="resultsCard">
+      <div class="card results-card" id="resultsCard" data-app-view="submissions">
         <div class="results-header">
-          <div class="card-title">提交结果</div>
+          <div class="card-title">提交记录</div>
           <div class="results-tabs" role="tablist" aria-label="提交结果视图">
-            <button type="button" class="results-tab active" id="resultsCurrentTab" data-results-view="current">当前批次</button>
-            <button type="button" class="results-tab" id="resultsArchiveTab" data-results-view="archive">历史归档</button>
+            <button type="button" class="results-tab active" id="resultsCurrentTab" data-results-view="current">当前任务</button>
+            <button type="button" class="results-tab" id="resultsArchiveTab" data-results-view="archive">全部记录</button>
           </div>
         </div>
         <div class="stats-summary">
@@ -1381,7 +1403,7 @@
               <tbody id="archiveTableBody"></tbody>
             </table>
           </div>
-          <div class="archive-empty" id="archiveEmpty">暂无历史归档记录。</div>
+          <div class="archive-empty" id="archiveEmpty">暂无提交记录。</div>
         </div>
         <div class="archive-pagination-bar">
           <div class="archive-pagination-controls">
@@ -1406,7 +1428,7 @@
         </div>
       </div>
 
-      <div class="footer-actions" id="footerActions">
+      <div class="footer-actions" id="footerActions" data-app-view="submissions">
         <button class="btn btn-secondary" id="exportBtn">📥 导出结果 CSV</button>
         <button class="btn btn-secondary" id="clearBtn">清空当前批次</button>
       </div>
@@ -1419,6 +1441,9 @@
     <script src="illegal-site-filter.js"></script>
     <script src="lib/link-assistant-runtime-logic.js"></script>
     <script src="lib/semrush-import-logic.js"></script>
+    <script src="lib/batch-upload-draft.js"></script>
+    <script src="lib/batch-task-manager.js"></script>
+    <script src="lib/batch-auto-submit-guard.js"></script>
     <script src="batch.js"></script>
   </body>
 </html>

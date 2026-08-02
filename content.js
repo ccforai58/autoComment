@@ -2343,6 +2343,8 @@
   // 从 chrome.storage.local 中获取"是否自动打开浮动窗口"的设置
   // 仅当当前 URL 在批量任务列表中时才返回 true
   function getAutoOpenQwenPanelSetting() {
+    // Legacy page-load floating panel automation is disabled.
+    return Promise.resolve(false);
     return new Promise((resolve) => {
       if (typeof chrome === 'undefined' || !chrome.storage || !chrome.storage.local) {
         resolve(false);
@@ -2375,6 +2377,8 @@
   // 从 chrome.storage.local 中获取"是否在页面加载时自动调用 AI 生成"的设置
   // 仅当当前 URL 在批量任务列表中时才返回 true
   function getAutoGenerateQwenOnPageLoadSetting() {
+    // Legacy page-load generation automation is disabled.
+    return Promise.resolve(false);
     return new Promise((resolve) => {
       if (typeof chrome === 'undefined' || !chrome.storage || !chrome.storage.local) {
         resolve(false);
@@ -2405,6 +2409,8 @@
   // 从 chrome.storage.local 中获取"是否自动提交评论"的设置
   // 仅当当前 URL 在批量任务列表中时才返回 true
   function getAutoSubmitCommentSetting() {
+    // Legacy floating-assistant auto-submit is disabled.
+    return Promise.resolve(false);
     return new Promise((resolve) => {
       console.log('[AutoComment] getAutoSubmitCommentSetting 开始检查...');
 
@@ -6155,7 +6161,6 @@
     ]);
     const promotionWebsiteUrl = promotionInputs.promotionWebsiteUrl;
     const promotionWebsiteContent = promotionInputs.promotionWebsiteContent;
-    const QWEN_SKILL_TEMPLATE = await getQwenSkillTemplate(promotionInputs);
     if (!promotionWebsiteUrl) {
       throw new Error('Current promotion project is not loaded. Please reopen promotion settings and select the project again.');
     }
@@ -6227,8 +6232,7 @@
           manualMode: options.manualAssistant === true,
           manualPageType: options.manualPageType || '',
           manualFieldSpecs: Array.isArray(options.manualFieldSpecs) ? options.manualFieldSpecs : [],
-          homepageProfile: promotionInputs.homepageProfile || null,
-          skillTemplate: QWEN_SKILL_TEMPLATE
+          homepageProfile: promotionInputs.homepageProfile || null
         })
       });
     } catch (error) {
@@ -6503,13 +6507,43 @@
     selectedCandidateIndex: 0,
     existingBacklink: null,
     pageTypeOverride: '',
-    nativeWatcherInstalled: false
+    nativeWatcherInstalled: false,
+    manualSessionActive: false
   };
   const MANUAL_ASSISTANT_RESTORE_CONTEXT_KEY = 'manual_assistant_submit_restore_context';
   const MANUAL_ASSISTANT_FIELD_SELECTOR = 'input, textarea, select, button[role="combobox"], [role="combobox"]';
 
   function getManualAssistantProjectKey(project) {
     return project && project.targetUrl ? normalizePromotionWebsiteKey(project.targetUrl) : '';
+  }
+
+  function getManualAssistantSessionLogicLocal() {
+    return typeof globalThis !== 'undefined' && globalThis.AutoCommentManualAssistantSessionLogic
+      ? globalThis.AutoCommentManualAssistantSessionLogic
+      : null;
+  }
+
+  function hasLocalBatchContext() {
+    return !!(_batchCtx || runningBatchTaskKey);
+  }
+
+  function shouldRecordNativeManualSubmissionLocal() {
+    const logic = getManualAssistantSessionLogicLocal();
+    if (logic && typeof logic.shouldRecordNativeManualSubmission === 'function') {
+      return logic.shouldRecordNativeManualSubmission({
+        manualSessionActive: manualAssistantState.manualSessionActive,
+        hasLocalBatchContext: hasLocalBatchContext()
+      });
+    }
+    return manualAssistantState.manualSessionActive === true && !hasLocalBatchContext();
+  }
+
+  function shouldAllowManualAssistantLocal() {
+    const logic = getManualAssistantSessionLogicLocal();
+    if (logic && typeof logic.shouldAllowManualAssistant === 'function') {
+      return logic.shouldAllowManualAssistant({ hasLocalBatchContext: hasLocalBatchContext() });
+    }
+    return !hasLocalBatchContext();
   }
 
   function normalizeManualPageTypeLocal(value) {
@@ -7003,7 +7037,7 @@
   }
 
   async function ensureManualAssistantIcon() {
-    if (await isBatchAssistantActiveNow()) {
+    if (!shouldAllowManualAssistantLocal()) {
       removeManualAssistantIcon();
       return;
     }
@@ -7070,7 +7104,7 @@
   }
 
   async function refreshManualAssistantAvailability() {
-    if (await isBatchAssistantActiveNow()) {
+    if (!shouldAllowManualAssistantLocal()) {
       removeManualAssistantIcon();
       if (qwenPanelEl && qwenPanelEl.parentNode) applyQwenPanelMode('progress-only');
       return;
@@ -7081,6 +7115,7 @@
   async function openManualAssistantPanel() {
     await runManualAssistantScan({ scroll: true });
     const shown = showQwenPanel({ tab: 'manual', manualAssistant: true });
+    manualAssistantState.manualSessionActive = shown === true;
     manualAssistantLog('panel.open', {
       shown,
       candidateCount: manualAssistantState.scan && manualAssistantState.scan.candidates ? manualAssistantState.scan.candidates.length : 0,
@@ -7433,6 +7468,7 @@
       detectedExistingBacklink: !!(manualAssistantState.existingBacklink && manualAssistantState.existingBacklink.success),
       existingBacklinkHref: manualAssistantState.existingBacklink && manualAssistantState.existingBacklink.matchedHref || '',
       manualAssistantRecordedAt: now,
+      manualSubmissionTrigger: input.trigger || 'manual_assistant_submit',
       fieldCandidateCount: scan.candidates ? scan.candidates.length : 0,
       manualFinalFieldCount: finalSnapshot && finalSnapshot.fields ? finalSnapshot.fields.length : 0
     };
@@ -7677,6 +7713,14 @@
   }
 
   async function recordManualAssistantSubmission(input = {}) {
+    if (input.nativeWatcher === true && !shouldRecordNativeManualSubmissionLocal()) {
+      manualAssistantLog('submit.native_skipped', {
+        trigger: input.trigger || '',
+        manualSessionActive: manualAssistantState.manualSessionActive,
+        hasLocalBatchContext: hasLocalBatchContext()
+      });
+      return { skipped: true, reason: 'manual_session_inactive_or_local_batch' };
+    }
     const project = input.project || await ensureManualAssistantCurrentProject('record_submission');
     manualAssistantState.currentProject = project;
     const payload = buildManualSubmissionPayload({ ...input, project });
@@ -7712,7 +7756,8 @@
         ? payload.manualFinalFields.map((field) => field.role).filter(Boolean).slice(0, 12)
         : [],
       projectId: payload.promotionProjectId,
-      sourceUrl: payload.sourceUrl
+      sourceUrl: payload.sourceUrl,
+      trigger: payload.manualSubmissionTrigger
     });
     return response;
   }
@@ -7944,7 +7989,7 @@
     if (manualAssistantState.nativeWatcherInstalled) return;
     manualAssistantState.nativeWatcherInstalled = true;
     const maybeRecord = async (reason, target) => {
-      if (await isBatchAssistantActiveNow()) return;
+      if (!shouldRecordNativeManualSubmissionLocal()) return;
       const scan = collectManualAssistantCandidates();
       manualAssistantState.scan = scan;
       const candidate = scan.candidates[manualAssistantState.selectedCandidateIndex] || scan.candidates[0];
@@ -7954,7 +7999,9 @@
       try {
         await recordManualAssistantSubmission({
           result: 'submitted_unconfirmed',
-          errorMessage: reason
+          errorMessage: reason,
+          trigger: reason,
+          nativeWatcher: true
         });
       } catch (error) {
         manualAssistantLog('error', {
@@ -7980,6 +8027,9 @@
   function applyQwenPanelMode(mode) {
     if (!qwenPanelEl || !qwenPanelEl.parentNode) return;
     const nextMode = mode === 'progress-only' ? 'progress-only' : 'manual';
+    if (nextMode === 'progress-only') {
+      manualAssistantState.manualSessionActive = false;
+    }
     qwenPanelEl._qwenPanelMode = nextMode;
     if (typeof qwenPanelEl._qwenApplyMode === 'function') {
       qwenPanelEl._qwenApplyMode(nextMode);
@@ -8411,7 +8461,8 @@
           project,
           result: 'submitted_unconfirmed',
           aiContent: text,
-          errorMessage: 'manual_assistant_submit_clicked'
+          errorMessage: 'manual_assistant_submit_clicked',
+          trigger: 'manual_assistant_submit_clicked'
         });
         let clickResult = null;
         if (candidate && candidate.kind === 'blog_comment') {
@@ -8452,7 +8503,8 @@
           project,
           result,
           aiContent: text,
-          errorMessage: clickResult && clickResult.error ? clickResult.error : ''
+          errorMessage: clickResult && clickResult.error ? clickResult.error : '',
+          trigger: 'manual_assistant_submit_result'
         });
         setLocalStatus(clickResult && clickResult.success ? '已点击提交并记录' : '已记录，需手动处理提交', clickResult && clickResult.success ? '#22c55e' : '#f59e0b');
       } catch (error) {
@@ -8471,7 +8523,8 @@
           project,
           result: 'submitted_unconfirmed',
           aiContent: text,
-          errorMessage: 'user_marked_manual_submitted'
+          errorMessage: 'user_marked_manual_submitted',
+          trigger: 'user_marked_manual_submitted'
         });
         setLocalStatus('已记录本次手动提交', '#22c55e');
       } catch (error) {
@@ -8613,6 +8666,7 @@
     closeBtn.addEventListener('mouseenter', () => { closeBtn.style.color = '#e5e7eb'; });
     closeBtn.addEventListener('mouseleave', () => { closeBtn.style.color = '#9ca3af'; });
     closeBtn.addEventListener('click', () => {
+      manualAssistantState.manualSessionActive = false;
       if (panel.parentNode) panel.parentNode.removeChild(panel);
       qwenPanelEl = null;
       if (qwenProgressTimer) {
@@ -8733,12 +8787,6 @@
     progressPane.style.gap = '8px';
     progressPane.style.fontSize = '12px';
 
-    const progressTitle = document.createElement('div');
-    progressTitle.textContent = '批量进度';
-    progressTitle.style.fontSize = '12px';
-    progressTitle.style.fontWeight = '700';
-    progressTitle.style.color = '#e5e7eb';
-
     const progressGrid = document.createElement('div');
     progressGrid.style.display = 'grid';
     progressGrid.style.gridTemplateColumns = 'repeat(2, minmax(0, 1fr))';
@@ -8800,7 +8848,6 @@
     progressWarning.style.fontSize = '11px';
     progressWarning.style.lineHeight = '1.35';
 
-    progressPane.appendChild(progressTitle);
     progressPane.appendChild(progressGrid);
     progressPane.appendChild(progressTrack);
     progressPane.appendChild(progressStage);
@@ -9511,13 +9558,11 @@
         return;
       }
       if (message && message.type === 'TOGGLE_PROMOTE_PANEL') {
-        isBatchAssistantActiveNow().then((active) => {
-          if (active) {
-            showQwenPanel({ tab: 'progress', progressOnly: true });
-          } else {
-            openManualAssistantPanel();
-          }
-        }).catch(() => openManualAssistantPanel());
+        if (!shouldAllowManualAssistantLocal()) {
+          showQwenPanel({ tab: 'progress', progressOnly: true });
+        } else {
+          openManualAssistantPanel();
+        }
         _sendResponse({ ok: true, async: true });
         return;
       }

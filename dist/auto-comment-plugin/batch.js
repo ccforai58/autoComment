@@ -14,6 +14,7 @@ if (!AUTO_COMMENT_VERBOSE_LOGS && typeof console !== 'undefined' && !console.__a
 const POLL_INTERVAL = 3000;
 const TIMEOUT_CHECK_INTERVAL = 5000;
 const TIMEOUT_STORAGE_KEY = 'batch_timeout_seconds';
+const AUTO_SUBMIT_GUARD_SETTINGS_KEY = 'batch_auto_submit_guard_settings_v1';
 const SUBMIT_CONTEXT_CONFIRMATION_GRACE_SECONDS = 8;
 const AI_REUSE_STATE_STORAGE_KEY = 'batch_ai_reuse_state_v1';
 const BATCH_RUNTIME_PERSIST_DELAY_MS = 1200;
@@ -240,7 +241,6 @@ function resetRuntimeForNewUpload(parsedUrlCount) {
   status = 'idle';
   activeTabCount = 0;
   currentIndex = 0;
-  initialPoints = parseInt(pointsBalance.textContent || '0', 10) || 0;
   currentPromotionWebsiteUrl = '';
   totalCount = Number(parsedUrlCount || 0);
   currentResultsCurrentPage = 1;
@@ -323,7 +323,6 @@ function resetRuntimeViewForPromotionSwitch() {
   if (filterResult) filterResult.value = 'all';
   if (filterTimeRange) filterTimeRange.value = 'all';
   if (filterKeyword) filterKeyword.value = '';
-  updateCostHint(0);
   renderStats();
   setStatus('idle');
   updateUI();
@@ -459,7 +458,6 @@ let parsedUrls = [];                // [{originalIndex, url}]
 let status = 'idle';                // idle | running | completed
 let activeTabCount = 0;
 let currentIndex = 0;
-let initialPoints = 0;
 let currentPromotionWebsiteUrl = '';
 let currentPromotionProject = null;
 
@@ -488,6 +486,11 @@ let batchPerformanceTimings = new Map();
 // Text cleanup: previous comment was mojibake.
 let timeoutCheckTimer = null;
 let timeoutSeconds = 60;
+let autoSubmitGuardSettings = { checkpoint: 50, intervalEnabled: true, minMinutes: 5, maxMinutes: 20 };
+let nextAutoSubmitAt = 0;
+let autoSubmitWaitTimer = null;
+let autoSubmitCountdownTimer = null;
+let confirmedAutoSubmitCheckpoints = {};
 
 // Text cleanup: previous comment was mojibake.
 let isOpeningTab = false;
@@ -527,12 +530,16 @@ const progressText = document.getElementById('progressText');
 const footerActions = document.getElementById('footerActions');
 const exportBtn = document.getElementById('exportBtn');
 const clearBtn = document.getElementById('clearBtn');
-const pointsBalance = document.getElementById('pointsBalance');
-const pointsHint = document.getElementById('pointsHint');
-const costHint = document.getElementById('costHint');
 const statusBadge = document.getElementById('statusBadge');
 const timeoutInput = document.getElementById('timeoutInput');
+const autoSubmitCheckpoint = document.getElementById('autoSubmitCheckpoint');
+const autoSubmitIntervalEnabled = document.getElementById('autoSubmitIntervalEnabled');
+const autoSubmitIntervalMin = document.getElementById('autoSubmitIntervalMin');
+const autoSubmitIntervalMax = document.getElementById('autoSubmitIntervalMax');
+const progressActivity = document.getElementById('progressActivity');
+const dailyAutoSubmitProgress = document.getElementById('dailyAutoSubmitProgress');
 const openSettingsBtn = document.getElementById('openSettingsBtn');
+const modelSettingsBtn = document.getElementById('modelSettingsBtn');
 const openResourceLibraryBtn = document.getElementById('openResourceLibraryBtn');
 const refreshSetupBtn = document.getElementById('refreshSetupBtn');
 const setupWebsiteValue = document.getElementById('setupWebsiteValue');
@@ -585,6 +592,10 @@ const archiveBacklinkProgress = document.getElementById('archiveBacklinkProgress
 const exportArchiveBtn = document.getElementById('exportArchiveBtn');
 const deleteArchiveSiteBtn = document.getElementById('deleteArchiveSiteBtn');
 const deleteArchiveAllBtn = document.getElementById('deleteArchiveAllBtn');
+const taskList = document.getElementById('taskList');
+const taskListEmpty = document.getElementById('taskListEmpty');
+const appNavButtons = Array.from(document.querySelectorAll('[data-app-nav]'));
+let activeAppView = 'workbench';
 let activeResultsView = 'current';
 let currentResultsCurrentPage = 1;
 let currentResultsPageSize = 200;
@@ -609,9 +620,6 @@ let stopBatchInProgress = false;
 let pendingPromotionRestoreAfterStop = false;
 
 // Text cleanup: previous comment was mojibake.
-const batchAutoOpenPanel = document.getElementById('batchAutoOpenPanel');
-const batchAutoGenerate = document.getElementById('batchAutoGenerate');
-const batchAutoSubmit = document.getElementById('batchAutoSubmit');
 
 // ==================== section ====================
 const BATCH_SETTINGS_KEY = 'batch_task_settings';
@@ -620,7 +628,13 @@ const BATCH_PENDING_TASK_KEY = 'batch_pending_task';
 const BATCH_RUNTIME_STATE_KEY = 'batch_runtime_state_v1';
 const BATCH_RUNTIME_STATE_BY_PROMOTION_KEY = 'batch_runtime_state_by_promotion_v1';
 const BATCH_RUNTIME_STATE_PROMOTION_PREFIX = 'batch_runtime_state_promotion_v1:';
+const BATCH_UPLOAD_DRAFT_PREFIX = 'batch_upload_draft_v1:';
+const BATCH_UPLOAD_DRAFT_PROJECT_PREFIX = 'batch_upload_draft_project_v1:';
+const BATCH_UPLOAD_DRAFT_LATEST_KEY = 'batch_upload_draft_latest_v1';
 const BATCH_ACTIVE_TASK_KEY = 'batch_active_task_v1';
+const BATCH_TASK_REGISTRY_KEY = 'batch_task_registry_v1';
+const BATCH_TASK_SNAPSHOT_PREFIX = 'batch_task_snapshot_v1:';
+const BATCH_DELETED_TASK_IDS_KEY = 'batch_deleted_task_ids_v1';
 const WEBSITE_URL_STORAGE_KEY = 'promotion_website_url';
 const WEBSITE_CONTENT_STORAGE_KEY = 'promotion_website_content';
 const PROMPT_FIELD_VALUES_STORAGE_KEY = 'auto_fill_prompt_field_values';
@@ -629,39 +643,9 @@ const BACKLINK_ARCHIVE_KEY = 'backlink_submission_archive';
 const BACKLINK_ARCHIVE_LIMIT = 5000;
 
 // Text cleanup: previous comment was mojibake.
-const BATCH_CHECKBOX_SETTINGS_KEY = 'batch_checkbox_settings';
 
 // Text cleanup: previous comment was mojibake.
-async function loadBatchCheckboxSettings() {
-  return new Promise((resolve) => {
-    chrome.storage.sync.get([BATCH_CHECKBOX_SETTINGS_KEY], (data) => {
-      const saved = data[BATCH_CHECKBOX_SETTINGS_KEY] || {};
-      batchAutoOpenPanel.checked = !!saved.autoOpenPanel;
-      batchAutoGenerate.checked = !!saved.autoGenerate;
-      batchAutoSubmit.checked = !!saved.autoSubmit;
-      console.log('[batch] message', saved);
-      resolve();
-    });
-  });
-}
-
 // Text cleanup: previous comment was mojibake.
-async function saveBatchCheckboxSettings() {
-  return new Promise((resolve) => {
-    const settings = {
-      autoOpenPanel: batchAutoOpenPanel.checked,
-      autoGenerate: batchAutoGenerate.checked,
-      autoSubmit: batchAutoSubmit.checked
-    };
-    chrome.storage.sync.set({
-      [BATCH_CHECKBOX_SETTINGS_KEY]: settings
-    }, () => {
-      console.log('[batch] message', settings);
-      resolve();
-    });
-  });
-}
-
 // ==================== section ====================
 document.addEventListener('DOMContentLoaded', init);
 
@@ -671,12 +655,12 @@ async function init() {
     apiBase: API_BASE
   });
   await loadUserId();
-  await loadPoints();
   await refreshSetupSummary();
   await refreshServiceStatus();
   await loadTimeoutSetting();
-  await loadBatchCheckboxSettings();
+  await loadAutoSubmitGuardSettings();
   bindEvents();
+  setAppView('workbench');
   await renderArchive();
   const initialHash = String(window.location.hash || '').toLowerCase();
   if (initialHash === '#archive') {
@@ -684,12 +668,304 @@ async function init() {
   } else if (initialHash === '#manual-records' || initialHash === '#current') {
     setResultsView('current');
   }
-  await restoreBatchRuntimeState().catch((error) => {
+  const restoredRuntime = await restoreBatchRuntimeState().catch((error) => {
     console.warn('[batch][runtime] restore failed:', error);
     return false;
   });
+  if (!restoredRuntime) await restoreUploadDraft();
+  await refreshTaskList();
 
   updateUI();
+}
+
+function getBatchUploadDraftLogic() {
+  return window.AutoCommentBatchUploadDraft || null;
+}
+
+function getUploadDraftContext() {
+  const promotionProjectId = currentPromotionProject && currentPromotionProject.id ? String(currentPromotionProject.id) : '';
+  const promotionKey = normalizePromotionWebsiteKey(
+    currentPromotionWebsiteUrl || (currentPromotionProject && currentPromotionProject.targetUrl) || ''
+  );
+  return { promotionProjectId, promotionKey };
+}
+
+function getUploadDraftStorageKey(context = getUploadDraftContext()) {
+  return context.promotionProjectId
+    ? `${BATCH_UPLOAD_DRAFT_PROJECT_PREFIX}${encodeURIComponent(context.promotionProjectId)}`
+    : `${BATCH_UPLOAD_DRAFT_PREFIX}${encodeURIComponent(context.promotionKey)}`;
+}
+
+function getLegacyUploadDraftStorageKey(promotionKey) {
+  return `${BATCH_UPLOAD_DRAFT_PREFIX}${encodeURIComponent(promotionKey)}`;
+}
+
+function createUploadFileFingerprint(file, importType) {
+  const name = file && file.name ? String(file.name) : '';
+  const size = file && Number.isFinite(Number(file.size)) ? Number(file.size) : 0;
+  const lastModified = file && Number.isFinite(Number(file.lastModified)) ? Number(file.lastModified) : 0;
+  return `${String(importType || '')}:${name}:${size}:${lastModified}`;
+}
+
+function buildUploadDraftDisplay() {
+  return {
+    fileCountText: fileCount ? fileCount.textContent : '',
+    duplicateCountText: duplicateCountEl ? duplicateCountEl.textContent : '',
+    semrushImportStatusText: semrushImportStatus ? semrushImportStatus.textContent : ''
+  };
+}
+
+async function getStoredUploadDraftSelection({ allowLatest = true } = {}) {
+  const logic = getBatchUploadDraftLogic();
+  const context = getUploadDraftContext();
+  const projectKey = getUploadDraftStorageKey(context);
+  const legacyKey = getLegacyUploadDraftStorageKey(context.promotionKey);
+  const data = await new Promise((resolve) => chrome.storage.local.get([projectKey, legacyKey, BATCH_UPLOAD_DRAFT_LATEST_KEY], resolve));
+  const latestIndex = data && data[BATCH_UPLOAD_DRAFT_LATEST_KEY];
+  const latestKey = allowLatest && latestIndex && latestIndex.storageKey ? latestIndex.storageKey : '';
+  const latestData = latestKey ? await new Promise((resolve) => chrome.storage.local.get([latestKey], resolve)) : {};
+  if (!logic || typeof logic.selectUploadDraftForRestore !== 'function') return { draft: null, source: '' };
+  return logic.selectUploadDraftForRestore({
+    projectDraft: context.promotionProjectId ? data[projectKey] : null,
+    urlDraft: data[legacyKey],
+    latestDraft: latestKey ? latestData[latestKey] : null,
+    currentPromotionProjectId: context.promotionProjectId,
+    currentPromotionKey: context.promotionKey
+  });
+}
+
+async function saveUploadDraft({ importType, file, fileName, parsedUrlItems }) {
+  const logic = getBatchUploadDraftLogic();
+  const context = getUploadDraftContext();
+  if (!logic || typeof logic.buildUploadDraft !== 'function') {
+    console.warn('[batch][upload-draft] save skipped because logic is unavailable');
+    return { saved: false, reason: 'logic_unavailable' };
+  }
+  const draft = logic.buildUploadDraft({
+    promotionProjectId: context.promotionProjectId,
+    promotionKey: context.promotionKey,
+    importType,
+    fileName: fileName || (file && file.name) || '',
+    fileFingerprint: createUploadFileFingerprint(file, importType),
+    parsedUrls: parsedUrlItems,
+    display: buildUploadDraftDisplay()
+  });
+  const existing = (await getStoredUploadDraftSelection({ allowLatest: false })).draft;
+  if (logic.isSameUploadDraft && logic.isSameUploadDraft(existing, draft)) {
+    console.info('[batch][upload-draft] duplicate import retained', {
+      importType: draft.importType,
+      parsedUrlCount: Array.isArray(existing.parsedUrls) ? existing.parsedUrls.length : 0
+    });
+    return { saved: false, reason: 'same_file' };
+  }
+  const storageKey = getUploadDraftStorageKey(context);
+  return new Promise((resolve) => {
+    chrome.storage.local.set({ [storageKey]: draft, [BATCH_UPLOAD_DRAFT_LATEST_KEY]: { storageKey, promotionProjectId: context.promotionProjectId, promotionKey: context.promotionKey, savedAt: draft.savedAt } }, () => {
+      const error = chrome.runtime && chrome.runtime.lastError ? chrome.runtime.lastError.message : '';
+      if (error) {
+        console.warn('[batch][upload-draft] save failed', { importType: draft.importType, parsedUrlCount: draft.parsedUrls.length, error });
+        resolve({ saved: false, reason: 'storage_error' });
+        return;
+      }
+      console.info('[batch][upload-draft] saved', { importType: draft.importType, parsedUrlCount: draft.parsedUrls.length });
+      resolve({ saved: true, reason: existing ? 'replaced' : 'saved' });
+    });
+  });
+}
+
+async function isDuplicateUploadFile(file, importType) {
+  const logic = getBatchUploadDraftLogic();
+  if (!logic || typeof logic.isSameUploadDraft !== 'function') return false;
+  const context = getUploadDraftContext();
+  const existing = (await getStoredUploadDraftSelection({ allowLatest: false })).draft;
+  return logic.isSameUploadDraft(existing, {
+    promotionProjectId: context.promotionProjectId,
+    promotionKey: context.promotionKey,
+    importType,
+    fileFingerprint: createUploadFileFingerprint(file, importType)
+  });
+}
+
+async function clearUploadDraft() {
+  const context = getUploadDraftContext();
+  const storageKey = getUploadDraftStorageKey(context);
+  const legacyKey = getLegacyUploadDraftStorageKey(context.promotionKey);
+  return new Promise((resolve) => {
+    chrome.storage.local.get([BATCH_UPLOAD_DRAFT_LATEST_KEY], (data) => {
+      const latest = data && data[BATCH_UPLOAD_DRAFT_LATEST_KEY];
+      const keys = [storageKey, legacyKey];
+      if (latest && latest.storageKey === storageKey) keys.push(BATCH_UPLOAD_DRAFT_LATEST_KEY);
+      chrome.storage.local.remove(keys, () => {
+      const error = chrome.runtime && chrome.runtime.lastError ? chrome.runtime.lastError.message : '';
+      if (error) console.warn('[batch][upload-draft] clear failed', { error });
+      else console.info('[batch][upload-draft] cleared');
+        resolve(!error);
+      });
+    });
+  });
+}
+
+async function restoreUploadDraft() {
+  const logic = getBatchUploadDraftLogic();
+  const selection = await getStoredUploadDraftSelection();
+  const draft = selection.draft;
+  if (!logic || !draft) return false;
+  if (selection.requiresConfirmation && !confirm('发现属于另一个推广网站的未启动导入草稿。是否恢复它？')) return false;
+
+  const viewState = logic.buildUploadDraftViewState(draft);
+  const activePromotionUrl = currentPromotionWebsiteUrl;
+  parsedUrls = viewState.parsedUrls;
+  resetRuntimeForNewUpload(parsedUrls.length);
+  currentPromotionWebsiteUrl = activePromotionUrl;
+  renderParsedUrlPreviewFromState();
+  fileName.textContent = viewState.fileName || '已恢复的导入';
+  fileInfo.classList.add('visible');
+  uploadZone.classList.toggle('has-file', viewState.importType !== 'semrush');
+  if (semrushUploadZone) semrushUploadZone.classList.toggle('has-file', viewState.importType === 'semrush');
+  fileCount.textContent = viewState.display.fileCountText || `${parsedUrls.length} URL(s)`;
+  if (duplicateCountEl) duplicateCountEl.textContent = viewState.display.duplicateCountText || '';
+  if (semrushImportStatus) semrushImportStatus.textContent = viewState.display.semrushImportStatusText || '已恢复未启动的导入';
+  updateStatsUI();
+  updateUI();
+  console.info('[batch][upload-draft] restored', { importType: viewState.importType, source: selection.source, parsedUrlCount: parsedUrls.length });
+  return true;
+}
+
+function getBatchTaskManager() {
+  return window.AutoCommentBatchTaskManager || null;
+}
+
+function getTaskSnapshotStorageKey(taskId) {
+  return `${BATCH_TASK_SNAPSHOT_PREFIX}${encodeURIComponent(String(taskId || ''))}`;
+}
+
+async function getStoredTaskRegistry() {
+  const data = await new Promise((resolve) => chrome.storage.local.get([BATCH_TASK_REGISTRY_KEY], resolve));
+  const registry = data && data[BATCH_TASK_REGISTRY_KEY];
+  return registry && typeof registry === 'object' ? registry : {};
+}
+
+async function saveTaskSnapshot(snapshot) {
+  const logic = getBatchTaskManager();
+  if (!logic || !snapshot || !snapshot.batchId) return;
+  const deletedData = await new Promise((resolve) => {
+    chrome.storage.local.get([BATCH_DELETED_TASK_IDS_KEY], resolve);
+  });
+  const deletedTaskIds = deletedData && deletedData[BATCH_DELETED_TASK_IDS_KEY];
+  if (deletedTaskIds && deletedTaskIds[String(snapshot.batchId)]) {
+    console.info('[batch][task-manager] snapshot skipped for deleted task', { batchId: snapshot.batchId });
+    return;
+  }
+  const registry = await getStoredTaskRegistry();
+  const summary = logic.buildTaskSummary(snapshot);
+  registry[summary.batchId] = summary;
+  await new Promise((resolve) => chrome.storage.local.set({
+    [getTaskSnapshotStorageKey(summary.batchId)]: snapshot,
+    [BATCH_TASK_REGISTRY_KEY]: registry
+  }, resolve));
+  console.info('[batch][task-manager] snapshot saved', {
+    batchId: summary.batchId,
+    status: summary.status,
+    totalCount: summary.totalCount,
+    processedCount: summary.processedCount
+  });
+  renderTaskList(Object.values(registry));
+}
+
+function renderTaskList(taskRows) {
+  if (!taskList || !taskListEmpty) return;
+  const tasks = Array.isArray(taskRows) ? taskRows : [];
+  taskList.innerHTML = '';
+  taskListEmpty.style.display = tasks.length ? 'none' : 'block';
+  tasks.sort((left, right) => Number(right.updatedAt || 0) - Number(left.updatedAt || 0)).forEach((task) => {
+    const row = document.createElement('div');
+    row.className = `task-item${String(task.batchId) === String(batchId) ? ' selected' : ''}`;
+    const main = document.createElement('button');
+    main.type = 'button';
+    main.className = 'task-item-main';
+    main.innerHTML = `<span class="task-item-title">${escapeHtml(task.currentPromotionWebsiteUrl || '未命名推广网站')}</span><span class="task-item-meta">${escapeHtml(task.status === 'terminated' ? '已暂停' : task.status === 'completed' ? '已完成' : '进行中')} · ${Number(task.processedCount || 0)}/${Number(task.totalCount || 0)}</span>`;
+    main.disabled = status === 'running';
+    main.title = status === 'running' ? '批量提交进行中，完成或暂停后可切换任务' : '打开此任务';
+    main.addEventListener('click', () => restoreTaskSnapshot(task.batchId));
+    const actions = document.createElement('div');
+    actions.className = 'task-item-actions';
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.className = 'btn btn-danger';
+    remove.textContent = '删除';
+    remove.disabled = task.status === 'running';
+    remove.title = task.status === 'running' ? '运行中的任务不可删除' : '删除此任务快照，不删除历史提交记录';
+    remove.addEventListener('click', () => deleteStoredTask(task.batchId));
+    actions.appendChild(remove);
+    row.append(main, actions);
+    taskList.appendChild(row);
+  });
+}
+
+async function refreshTaskList() {
+  const registry = await getStoredTaskRegistry();
+  renderTaskList(Object.values(registry));
+  return registry;
+}
+
+async function deleteStoredTask(taskId) {
+  const id = String(taskId || '');
+  const registry = await getStoredTaskRegistry();
+  const task = registry[id];
+  const taskManager = getBatchTaskManager();
+  const canDelete = taskManager && typeof taskManager.canDeleteTask === 'function'
+    ? taskManager.canDeleteTask(task)
+    : !!(task && task.status !== 'running');
+  if (!id || !canDelete) {
+    console.info('[batch][task-manager] delete rejected', {
+      batchId: id,
+      taskStatus: task && task.status ? task.status : 'missing',
+      runtimeStatus: status
+    });
+    if (task && task.status === 'running') alert('运行中的任务不可删除，请先暂停或完成任务。');
+    return;
+  }
+  if (!confirm('删除此任务？已同步的历史提交记录不会删除。')) return;
+  const wasCurrentTask = id === String(batchId);
+  delete registry[id];
+  const promotionKey = task.currentPromotionWebsiteKey || normalizePromotionWebsiteKey(task.currentPromotionWebsiteUrl || '');
+  const promotionStorageKey = getPromotionRuntimeStorageKey(promotionKey);
+  const runtimeKeys = ['batchLocalResults', BATCH_RUNTIME_STATE_KEY, BATCH_PENDING_TASK_KEY, BATCH_ACTIVE_TASK_KEY, 'batchCtx', 'batchSubmitCtx'];
+  if (promotionStorageKey) runtimeKeys.push(promotionStorageKey);
+  const runtimeData = await new Promise((resolve) => chrome.storage.local.get(runtimeKeys.concat([BATCH_RUNTIME_STATE_BY_PROMOTION_KEY, BATCH_DELETED_TASK_IDS_KEY]), resolve));
+  const resultsLogic = getBatchResultsLogic();
+  const removedRuntimeKeys = resultsLogic && typeof resultsLogic.selectCurrentBatchStorageKeysForRemoval === 'function'
+    ? resultsLogic.selectCurrentBatchStorageKeysForRemoval({ batchId: id, promotionKey, storageData: runtimeData })
+    : [];
+  if (promotionStorageKey && runtimeData[promotionStorageKey] && String(runtimeData[promotionStorageKey].batchId || '') === id) {
+    removedRuntimeKeys.push(promotionStorageKey);
+  }
+  const snapshotsByPromotion = runtimeData[BATCH_RUNTIME_STATE_BY_PROMOTION_KEY] && typeof runtimeData[BATCH_RUNTIME_STATE_BY_PROMOTION_KEY] === 'object'
+    ? { ...runtimeData[BATCH_RUNTIME_STATE_BY_PROMOTION_KEY] }
+    : {};
+  if (promotionKey && snapshotsByPromotion[promotionKey] && String(snapshotsByPromotion[promotionKey].batchId || '') === id) {
+    delete snapshotsByPromotion[promotionKey];
+  }
+  const deletedTaskIds = runtimeData[BATCH_DELETED_TASK_IDS_KEY] && typeof runtimeData[BATCH_DELETED_TASK_IDS_KEY] === 'object'
+    ? { ...runtimeData[BATCH_DELETED_TASK_IDS_KEY] }
+    : {};
+  deletedTaskIds[id] = Date.now();
+  await new Promise((resolve) => chrome.storage.local.set({
+    [BATCH_TASK_REGISTRY_KEY]: registry,
+    [BATCH_RUNTIME_STATE_BY_PROMOTION_KEY]: snapshotsByPromotion,
+    [BATCH_DELETED_TASK_IDS_KEY]: deletedTaskIds
+  }, () => chrome.storage.local.remove([getTaskSnapshotStorageKey(id), ...removedRuntimeKeys], resolve)));
+  if (wasCurrentTask) {
+    resetRuntimeViewForPromotionSwitch();
+    currentBatchUploadId = generateUUID();
+  }
+  await refreshTaskList();
+  console.info('[batch][task-manager] task deleted', {
+    batchId: id,
+    taskStatus: task.status,
+    wasCurrentTask,
+    removedRuntimeKeyCount: removedRuntimeKeys.length
+  });
 }
 
 async function loadUserId() {
@@ -960,25 +1236,6 @@ async function refreshServiceStatus() {
   }
 }
 
-async function loadPoints() {
-  if (!userId) {
-    pointsBalance.textContent = '--';
-    return;
-  }
-  try {
-    console.info('[batch][api] GET /get-points', { userId });
-    const resp = await fetch(`${API_BASE}/get-points?userId=${encodeURIComponent(userId)}`);
-    const json = await resp.json();
-    if (json.success && json.points !== undefined) {
-      pointsBalance.textContent = json.points;
-    } else {
-      pointsBalance.textContent = '0';
-    }
-  } catch (e) {
-    pointsBalance.textContent = '--';
-  }
-}
-
 async function loadTimeoutSetting() {
   return new Promise((resolve) => {
     chrome.storage.sync.get([TIMEOUT_STORAGE_KEY], (data) => {
@@ -996,9 +1253,154 @@ function saveTimeoutSetting() {
   if (val >= 10 && val <= 600) {
     timeoutSeconds = val;
     chrome.storage.sync.set({ [TIMEOUT_STORAGE_KEY]: val });
+    saveAutoSubmitGuardSettings({ silent: true });
   } else {
     timeoutInput.value = String(timeoutSeconds);
   }
+}
+
+function getAutoSubmitGuardLogic() {
+  return window.AutoCommentBatchAutoSubmitGuard || null;
+}
+
+function setAutoSubmitIntervalInputState() {
+  const disabled = !autoSubmitGuardSettings.intervalEnabled;
+  if (autoSubmitIntervalMin) autoSubmitIntervalMin.disabled = disabled;
+  if (autoSubmitIntervalMax) autoSubmitIntervalMax.disabled = disabled;
+}
+
+function syncAutoSubmitGuardInputs() {
+  if (autoSubmitCheckpoint) autoSubmitCheckpoint.value = String(autoSubmitGuardSettings.checkpoint);
+  if (autoSubmitIntervalEnabled) autoSubmitIntervalEnabled.checked = !!autoSubmitGuardSettings.intervalEnabled;
+  if (autoSubmitIntervalMin) autoSubmitIntervalMin.value = String(autoSubmitGuardSettings.minMinutes);
+  if (autoSubmitIntervalMax) autoSubmitIntervalMax.value = String(autoSubmitGuardSettings.maxMinutes);
+  setAutoSubmitIntervalInputState();
+}
+
+async function loadAutoSubmitGuardSettings() {
+  return new Promise((resolve) => {
+    chrome.storage.sync.get([AUTO_SUBMIT_GUARD_SETTINGS_KEY], (data) => {
+      const saved = data && data[AUTO_SUBMIT_GUARD_SETTINGS_KEY];
+      if (saved && typeof saved === 'object') {
+        autoSubmitGuardSettings = {
+          checkpoint: Math.min(500, Math.max(1, Number(saved.checkpoint) || 50)),
+          intervalEnabled: saved.intervalEnabled !== false,
+          minMinutes: Math.min(120, Math.max(1, Number(saved.minMinutes) || 5)),
+          maxMinutes: Math.min(120, Math.max(1, Number(saved.maxMinutes) || 20))
+        };
+      }
+      const guard = getAutoSubmitGuardLogic();
+      const validation = guard && typeof guard.validateAutoSubmitGuardSettings === 'function'
+        ? guard.validateAutoSubmitGuardSettings({
+          enabled: autoSubmitGuardSettings.intervalEnabled,
+          minMinutes: autoSubmitGuardSettings.minMinutes,
+          maxMinutes: autoSubmitGuardSettings.maxMinutes,
+          timeoutSeconds
+        })
+        : { valid: true };
+      if (!validation.valid) {
+        autoSubmitGuardSettings.minMinutes = validation.minimumAllowedMinutes;
+        autoSubmitGuardSettings.maxMinutes = Math.max(autoSubmitGuardSettings.maxMinutes, validation.minimumAllowedMinutes);
+      }
+      syncAutoSubmitGuardInputs();
+      resolve();
+    });
+  });
+}
+
+function saveAutoSubmitGuardSettings({ silent = false } = {}) {
+  const next = {
+    checkpoint: Math.min(500, Math.max(1, Number(autoSubmitCheckpoint && autoSubmitCheckpoint.value) || 50)),
+    intervalEnabled: !!(autoSubmitIntervalEnabled && autoSubmitIntervalEnabled.checked),
+    minMinutes: Math.min(120, Math.max(1, Number(autoSubmitIntervalMin && autoSubmitIntervalMin.value) || 1)),
+    maxMinutes: Math.min(120, Math.max(1, Number(autoSubmitIntervalMax && autoSubmitIntervalMax.value) || 1))
+  };
+  const guard = getAutoSubmitGuardLogic();
+  const validation = guard && typeof guard.validateAutoSubmitGuardSettings === 'function'
+    ? guard.validateAutoSubmitGuardSettings({ ...next, enabled: next.intervalEnabled, timeoutSeconds })
+    : { valid: true };
+  if (!validation.valid) {
+    if (silent) {
+      next.minMinutes = validation.minimumAllowedMinutes;
+      next.maxMinutes = Math.max(next.maxMinutes, validation.minimumAllowedMinutes);
+      autoSubmitGuardSettings = next;
+      syncAutoSubmitGuardInputs();
+      chrome.storage.sync.set({ [AUTO_SUBMIT_GUARD_SETTINGS_KEY]: autoSubmitGuardSettings });
+      return true;
+    }
+    if (!silent) alert(`启用随机间隔时，最小间隔必须至少为 ${validation.minimumAllowedMinutes} 分钟，并且最大间隔不能小于最小间隔。`);
+    syncAutoSubmitGuardInputs();
+    return false;
+  }
+  autoSubmitGuardSettings = next;
+  syncAutoSubmitGuardInputs();
+  chrome.storage.sync.set({ [AUTO_SUBMIT_GUARD_SETTINGS_KEY]: autoSubmitGuardSettings });
+  void refreshDailyAutoSubmitProgress();
+  if (!next.intervalEnabled) {
+    cancelAutoSubmitWait();
+    if (status === 'running' && activeTabCount === 0 && currentIndex < totalCount) openNextTabSync();
+  }
+  return true;
+}
+
+function formatAutoSubmitRemaining(remainingMs) {
+  const totalSeconds = Math.max(0, Math.ceil(remainingMs / 1000));
+  return `${Math.floor(totalSeconds / 60)} 分 ${String(totalSeconds % 60).padStart(2, '0')} 秒`;
+}
+
+function updateProgressActivity() {
+  if (!progressActivity) return;
+  if (status === 'terminated' && isTerminated) {
+    progressActivity.textContent = '任务已暂停';
+    return;
+  }
+  if (nextAutoSubmitAt > Date.now()) {
+    progressActivity.textContent = `${formatAutoSubmitRemaining(nextAutoSubmitAt - Date.now())} 后进行下一项`;
+    return;
+  }
+  if (status === 'running' && activeTabCount > 0) {
+    progressActivity.textContent = `正在进行中（第 ${Math.min(currentIndex, totalCount)}/${totalCount} 项）`;
+    return;
+  }
+  progressActivity.textContent = '';
+}
+
+function cancelAutoSubmitWait() {
+  if (autoSubmitWaitTimer) clearTimeout(autoSubmitWaitTimer);
+  if (autoSubmitCountdownTimer) clearInterval(autoSubmitCountdownTimer);
+  autoSubmitWaitTimer = null;
+  autoSubmitCountdownTimer = null;
+  nextAutoSubmitAt = 0;
+  updateProgressActivity();
+}
+
+function scheduleNextAutoSubmit() {
+  if (!autoSubmitGuardSettings.intervalEnabled) return;
+  const guard = getAutoSubmitGuardLogic();
+  if (!guard || typeof guard.createRandomWaitMs !== 'function') return;
+  const waitMs = guard.createRandomWaitMs(autoSubmitGuardSettings);
+  nextAutoSubmitAt = Date.now() + waitMs;
+  persistBatchRuntimeState({ immediate: true });
+  updateProgressActivity();
+  if (autoSubmitCountdownTimer) clearInterval(autoSubmitCountdownTimer);
+  autoSubmitCountdownTimer = setInterval(updateProgressActivity, 1000);
+}
+
+function waitForScheduledAutoSubmit() {
+  if (!autoSubmitGuardSettings.intervalEnabled || nextAutoSubmitAt <= Date.now()) {
+    if (nextAutoSubmitAt) cancelAutoSubmitWait();
+    return false;
+  }
+  const waitMs = nextAutoSubmitAt - Date.now();
+  updateProgressActivity();
+  if (!autoSubmitWaitTimer) {
+    autoSubmitWaitTimer = setTimeout(() => {
+      autoSubmitWaitTimer = null;
+      cancelAutoSubmitWait();
+      openNextTabSync();
+    }, waitMs);
+  }
+  return true;
 }
 
 // ==================== section ====================
@@ -1049,9 +1451,24 @@ function bindEvents() {
   if (exportArchiveBtn) exportArchiveBtn.addEventListener('click', exportArchiveResults);
   if (deleteArchiveSiteBtn) deleteArchiveSiteBtn.addEventListener('click', deleteSelectedArchiveWebsiteRecords);
   if (deleteArchiveAllBtn) deleteArchiveAllBtn.addEventListener('click', deleteAllArchiveWebsiteRecords);
+  appNavButtons.forEach((button) => {
+    button.addEventListener('click', () => {
+      const view = button.dataset.appNav;
+      if (view === 'resources') {
+        chrome.tabs.create({ url: chrome.runtime.getURL('resource-library.html') });
+        return;
+      }
+      setAppView(view);
+    });
+  });
   if (openSettingsBtn) {
     openSettingsBtn.addEventListener('click', () => {
       chrome.tabs.create({ url: chrome.runtime.getURL('link-assistant-settings.html') });
+    });
+  }
+  if (modelSettingsBtn) {
+    modelSettingsBtn.addEventListener('click', () => {
+      chrome.tabs.create({ url: chrome.runtime.getURL('model-settings.html') });
     });
   }
   if (openResourceLibraryBtn) {
@@ -1063,7 +1480,6 @@ function bindEvents() {
     refreshSetupBtn.addEventListener('click', () => {
       refreshSetupSummary();
       refreshServiceStatus();
-      loadPoints();
     });
   }
   if (chrome.storage && chrome.storage.onChanged) {
@@ -1090,12 +1506,14 @@ function bindEvents() {
 
   // Text cleanup: previous comment was mojibake.
   timeoutInput.addEventListener('change', saveTimeoutSetting);
+  [autoSubmitCheckpoint, autoSubmitIntervalMin, autoSubmitIntervalMax].forEach((input) => {
+    if (input) input.addEventListener('change', () => saveAutoSubmitGuardSettings());
+  });
+  if (autoSubmitIntervalEnabled) {
+    autoSubmitIntervalEnabled.addEventListener('change', () => saveAutoSubmitGuardSettings());
+  }
 
   // Text cleanup: previous comment was mojibake.
-  batchAutoOpenPanel.addEventListener('change', saveBatchCheckboxSettings);
-  batchAutoGenerate.addEventListener('change', saveBatchCheckboxSettings);
-  batchAutoSubmit.addEventListener('change', saveBatchCheckboxSettings);
-
   // Text cleanup: previous comment was mojibake.
   chrome.runtime.onMessage.addListener((message) => {
     // Text cleanup: previous comment was mojibake.
@@ -1232,7 +1650,6 @@ async function refreshWorkbenchConfig() {
       reason: 'setup_refresh_promotion_changed'
     });
   }
-  await loadPoints();
 }
 
 // ==================== section ====================
@@ -1332,15 +1749,20 @@ async function reviewSemrushDomain({ domain, sampleUrl }) {
   }
 }
 
-function processFile(file) {
+async function processFile(file) {
   if (!file.name.endsWith('.csv')) {
     alert('请上传 CSV 文件');
     return;
   }
 
+  if (await isDuplicateUploadFile(file, 'csv')) {
+    alert('该文件已导入，保留当前列表');
+    return;
+  }
+
   const reader = new FileReader();
   reader.onload = async (e) => {
-    await parseCSV(e.target.result, file.name);
+    await parseCSV(e.target.result, file.name, file);
   };
   reader.onerror = () => {
     alert('文件读取失败');
@@ -1414,7 +1836,7 @@ function normalizeEncoding(arrayBuffer) {
   return utf8Text;
 }
 
-async function parseCSV(raw, fileNameParam) {
+async function parseCSV(raw, fileNameParam, file) {
   const text = normalizeEncoding(raw);
   const lines = text.split(/\r?\n/).filter((line) => line.trim());
   if (lines.length < 2) {
@@ -1450,7 +1872,6 @@ async function parseCSV(raw, fileNameParam) {
 
   if (colUrl === -1) {
     alert('CSV file is missing the source URL column. Please check the file format.');
-    resetFile();
     return;
   }
 
@@ -1528,22 +1949,36 @@ async function parseCSV(raw, fileNameParam) {
     fileCount.textContent += `, deduped ${duplicateCount} duplicate source URL(s)`;
     if (duplicateCountEl) duplicateCountEl.textContent = `deduped ${duplicateCount} duplicate source URL(s)`;
   }
-  updateCostHint(Math.max(0, validCount - illegalCount));
   if (validCount > 0) {
     if (startBtn) startBtn.disabled = true;
     const uploadPromotionKey = normalizePromotionWebsiteKey(
       currentPromotionWebsiteUrl || (currentPromotionProject && currentPromotionProject.targetUrl) || ''
     );
+    const draftResult = await saveUploadDraft({
+      importType: 'csv',
+      file,
+      fileName: fileNameParam,
+      parsedUrlItems: parsedUrls
+    });
+    if (!draftResult.saved) {
+      alert('导入列表已显示，但未能保存草稿；刷新页面前请检查扩展存储空间。');
+    }
     await clearRuntimeStorageForNewUpload({ promotionKey: uploadPromotionKey });
     resetRuntimeForNewUpload(parsedUrls.length);
   }
   updateStatsUI();
   updateUI();
+  if (fileInput) fileInput.value = '';
 }
 
 async function processSemrushFile(file) {
   if (!file.name.endsWith('.csv')) {
     alert('请上传 CSV 文件');
+    return;
+  }
+
+  if (await isDuplicateUploadFile(file, 'semrush')) {
+    setSemrushImportStatus('该文件已导入，保留当前列表');
     return;
   }
 
@@ -1623,11 +2058,19 @@ async function processSemrushFile(file) {
     uploadZone.classList.remove('has-file');
     if (semrushUploadZone) semrushUploadZone.classList.add('has-file');
     fileCount.textContent = logic.buildSemrushImportSummary(result.stats);
-    updateCostHint(parsedUrls.length);
     if (startBtn) startBtn.disabled = true;
     const uploadPromotionKey = normalizePromotionWebsiteKey(
       currentPromotionWebsiteUrl || (currentPromotionProject && currentPromotionProject.targetUrl) || ''
     );
+    const draftResult = await saveUploadDraft({
+      importType: 'semrush',
+      file,
+      fileName: file.name,
+      parsedUrlItems: parsedUrls
+    });
+    if (!draftResult.saved) {
+      setSemrushImportStatus('导入列表已显示，但未能保存草稿；刷新页面前请检查扩展存储空间。');
+    }
     await clearRuntimeStorageForNewUpload({ promotionKey: uploadPromotionKey });
     resetRuntimeForNewUpload(parsedUrls.length);
     updateStatsUI();
@@ -1737,7 +2180,7 @@ function parseCSVLine(line) {
   return result;
 }
 
-function resetFile() {
+async function resetFile() {
   fileInput.value = '';
   if (semrushFileInput) semrushFileInput.value = '';
   fileInfo.classList.remove('visible');
@@ -1750,15 +2193,7 @@ function resetFile() {
   fileCount.textContent = '';
   if (duplicateCountEl) duplicateCountEl.textContent = '';
   if (semrushImportStatus) semrushImportStatus.textContent = '';
-  updateCostHint(0);
-}
-
-function updateCostHint(count) {
-  if (count === 0) {
-    costHint.textContent = '';
-  } else {
-    costHint.textContent = `Estimated cost: ${count} point(s)`;
-  }
+  await clearUploadDraft();
 }
 
 // ==================== section ====================
@@ -1770,6 +2205,15 @@ async function startBatch() {
   if (parsedUrls.length === 0) {
     alert('请先上传有效的 CSV 文件');
     return;
+  }
+  const taskManager = getBatchTaskManager();
+  if (taskManager) {
+    const registry = await getStoredTaskRegistry();
+    const eligibility = taskManager.getTaskStartEligibility(Object.values(registry), batchId);
+    if (!eligibility.allowed) {
+      alert('已有批量任务正在进行中，请先完成或暂停该任务。');
+      return;
+    }
   }
 
   await new Promise((resolve) => {
@@ -1786,7 +2230,8 @@ async function startBatch() {
     return;
   }
   currentPromotionWebsiteUrl = currentPromotionProject.targetUrl;
-  initialPoints = parseInt(pointsBalance.textContent || '0', 10);
+  cancelAutoSubmitWait();
+  confirmedAutoSubmitCheckpoints = {};
   batchId = currentBatchUploadId || generateUUID();
   currentBatchUploadId = batchId;
   totalCount = parsedUrls.length;
@@ -1811,6 +2256,7 @@ async function startBatch() {
     promotionKey: normalizePromotionWebsiteKey(currentPromotionWebsiteUrl || '')
   });
   await persistBatchRuntimeState({ immediate: true });
+  await clearUploadDraft();
 
   // Text cleanup: previous comment was mojibake.
   openNextTabSync();
@@ -1820,9 +2266,6 @@ async function startBatch() {
 async function saveBatchTaskSettings() {
   return new Promise((resolve) => {
     const settings = {
-      autoOpenPanel: batchAutoOpenPanel.checked,
-      autoGenerate: batchAutoGenerate.checked,
-      autoSubmit: batchAutoSubmit.checked,
       savedAt: Date.now()
     };
     const urls = parsedUrls.map(item => item.url);
@@ -1867,6 +2310,7 @@ async function stopBatch() {
   });
   // Text cleanup: previous comment was mojibake.
   isTerminated = true;
+  cancelAutoSubmitWait();
   setStatus('terminated');
 
   // Text cleanup: previous comment was mojibake.
@@ -1988,6 +2432,49 @@ async function openNextTabSync() {
   isOpeningTab = false;
 }
 
+async function getTodayAutoSubmitCount() {
+  const guard = getAutoSubmitGuardLogic();
+  if (!guard || typeof guard.countTodayAutoSubmissions !== 'function') return 0;
+  const promotionWebsiteKey = normalizePromotionWebsiteKey(currentPromotionWebsiteUrl || '');
+  const archiveData = await new Promise((resolve) => chrome.storage.local.get([BACKLINK_ARCHIVE_KEY], resolve));
+  const archiveRecords = Array.isArray(archiveData && archiveData[BACKLINK_ARCHIVE_KEY])
+    ? archiveData[BACKLINK_ARCHIVE_KEY].filter((record) => String(record.batchId || '') !== String(batchId || ''))
+    : [];
+  return guard.countTodayAutoSubmissions(archiveRecords.concat(localResults), { promotionWebsiteKey });
+}
+
+async function refreshDailyAutoSubmitProgress() {
+  if (!dailyAutoSubmitProgress) return;
+  const checkpoint = Math.max(1, Number(autoSubmitGuardSettings.checkpoint) || 50);
+  const count = await getTodayAutoSubmitCount();
+  dailyAutoSubmitProgress.textContent = `今日自动提交 ${count} / ${checkpoint}`;
+  dailyAutoSubmitProgress.title = '仅统计当前推广网站当日的批量自动提交成功或待确认记录';
+  dailyAutoSubmitProgress.style.background = count >= checkpoint ? '#fff7ed' : '#eff6ff';
+  dailyAutoSubmitProgress.style.color = count >= checkpoint ? '#c2410c' : '#1d4ed8';
+}
+
+async function confirmAutoSubmitCheckpointBeforeNextItem() {
+  const guard = getAutoSubmitGuardLogic();
+  if (!guard || typeof guard.getConfirmationCheckpoint !== 'function') return true;
+  const count = await getTodayAutoSubmitCount();
+  const checkpoint = guard.getConfirmationCheckpoint(count, autoSubmitGuardSettings.checkpoint);
+  if (!checkpoint || confirmedAutoSubmitCheckpoints[checkpoint]) return true;
+  updateProgressActivity();
+  const shouldContinue = confirm(`当前推广网站今天已有 ${count} 次自动提交成功或待确认记录。\n\n是否继续下一项自动提交？`);
+  if (shouldContinue) {
+    confirmedAutoSubmitCheckpoints[checkpoint] = true;
+    await persistBatchRuntimeState({ immediate: true });
+    return true;
+  }
+  isTerminated = true;
+  setStatus('terminated');
+  updateUI();
+  updateStatsUI();
+  await persistBatchRuntimeState({ immediate: true });
+  logRuntimeState('daily_auto_submit_checkpoint_paused', { checkpoint, count });
+  return false;
+}
+
 async function openNextTab() {
   console.log('[openNextTab] check conditions', { status, isTerminated, activeTabCount, currentIndex, totalCount });
 
@@ -2007,6 +2494,9 @@ async function openNextTab() {
     console.log('[batch] message');
     return;
   }
+
+  if (waitForScheduledAutoSubmit()) return;
+  if (!await confirmAutoSubmitCheckpointBeforeNextItem()) return;
 
   const urlIndex = currentIndex;
   const item = parsedUrls[urlIndex];
@@ -2299,6 +2789,7 @@ function handleTabResult(urlIndex, result, aiContent, errorMessage, forcedElapse
     return;
   }
 
+  const processedInBrowserTab = activeTabsByIndex.has(urlIndex);
   let elapsed = forcedElapsed !== undefined ? forcedElapsed : null;
   if (elapsed === null) {
     const tabInfo = activeTabsByIndex.get(urlIndex);
@@ -2313,6 +2804,8 @@ function handleTabResult(urlIndex, result, aiContent, errorMessage, forcedElapse
     targetUrl: currentPromotionProject && currentPromotionProject.targetUrl ? currentPromotionProject.targetUrl : currentPromotionWebsiteUrl || '',
     targetDomain: currentPromotionProject && currentPromotionProject.targetDomain ? currentPromotionProject.targetDomain : '',
     promotionWebsiteUrl: currentPromotionWebsiteUrl || '',
+    promotionWebsiteKey: normalizePromotionWebsiteKey(currentPromotionWebsiteUrl || ''),
+    submitSource: 'batch_auto',
     discoveryTargetUrl: item.semrushMeta && item.semrushMeta.targetUrl ? item.semrushMeta.targetUrl : '',
     semrushMeta: item.semrushMeta || null,
     result: result,
@@ -2375,6 +2868,13 @@ function handleTabResult(urlIndex, result, aiContent, errorMessage, forcedElapse
 
   // Text cleanup: previous comment was mojibake.
   saveLocalResults();
+  const autoSubmitGuard = getAutoSubmitGuardLogic();
+  const shouldWaitBeforeNextItem = autoSubmitGuard && typeof autoSubmitGuard.shouldScheduleAutoSubmitInterval === 'function'
+    ? autoSubmitGuard.shouldScheduleAutoSubmitInterval(result)
+    : ['success', 'success_pending_moderation', 'submitted_unconfirmed'].includes(result);
+  if (processedInBrowserTab && status === 'running' && !isTerminated && shouldWaitBeforeNextItem) {
+    scheduleNextAutoSubmit();
+  }
   persistBatchRuntimeState();
   if (!options.suppressArchive) {
     saveArchiveRecord(resultEntry).catch((error) => {
@@ -2577,6 +3077,7 @@ function buildBatchRuntimeSnapshot() {
     status,
     totalCount,
     batchStartedAt,
+    createdAt: batchStartedAt || Date.now(),
     currentIndex,
     parsedUrls,
     localResults: recentLocalResults,
@@ -2591,6 +3092,8 @@ function buildBatchRuntimeSnapshot() {
     manualRequiredCount,
     blockedIllegalCount,
     pendingCount,
+    nextAutoSubmitAt,
+    confirmedAutoSubmitCheckpoints,
     updatedAt: Date.now()
   };
 }
@@ -2735,6 +3238,12 @@ function writeBatchRuntimeSnapshot(snapshot) {
         parsedUrlCount: Array.isArray(storageSnapshot.parsedUrls) ? storageSnapshot.parsedUrls.length : 0,
         resultCount: snapshot.localResultCount || snapshot.localResults.length
       });
+      saveTaskSnapshot(storageSnapshot).catch((taskError) => {
+        console.warn('[batch][task-manager] snapshot registration failed', {
+          batchId: snapshot.batchId,
+          message: taskError && taskError.message ? taskError.message : String(taskError)
+        });
+      });
       resolve({ success: true });
     });
   });
@@ -2790,9 +3299,79 @@ function renderParsedUrlPreviewFromState() {
   }
 }
 
+async function restoreTaskSnapshot(taskId, options = {}) {
+  const id = String(taskId || '');
+  let snapshot = options.snapshot || null;
+  if (!snapshot && id) {
+    const data = await new Promise((resolve) => chrome.storage.local.get([getTaskSnapshotStorageKey(id)], resolve));
+    snapshot = data && data[getTaskSnapshotStorageKey(id)];
+  }
+  if (!snapshot || !snapshot.batchId || !Array.isArray(snapshot.parsedUrls)) return false;
+  if (status === 'running' && String(snapshot.batchId) !== String(batchId)) return false;
+
+  const restoredFromRunning = snapshot.status === 'running';
+  batchId = snapshot.batchId;
+  status = snapshot.status === 'running' ? 'terminated' : (snapshot.status || 'terminated');
+  totalCount = Number(snapshot.totalCount || snapshot.parsedUrls.length || 0);
+  batchStartedAt = Number(snapshot.batchStartedAt || 0);
+  currentIndex = Number(snapshot.currentIndex || 0);
+  parsedUrls = snapshot.parsedUrls;
+  localResults = Array.isArray(snapshot.localResults) ? snapshot.localResults : [];
+  currentPromotionWebsiteUrl = snapshot.currentPromotionWebsiteUrl || '';
+  successCount = Number(snapshot.successCount || 0);
+  failCount = Number(snapshot.failCount || 0);
+  skippedCount = Number(snapshot.skippedCount || 0);
+  noCommentBoxCount = Number(snapshot.noCommentBoxCount || 0);
+  manualRequiredCount = Number(snapshot.manualRequiredCount || 0);
+  blockedIllegalCount = Number(snapshot.blockedIllegalCount || 0);
+  nextAutoSubmitAt = Number(snapshot.nextAutoSubmitAt || 0);
+  confirmedAutoSubmitCheckpoints = snapshot.confirmedAutoSubmitCheckpoints && typeof snapshot.confirmedAutoSubmitCheckpoints === 'object'
+    ? snapshot.confirmedAutoSubmitCheckpoints : {};
+  pendingCount = Math.max(0, totalCount - getProcessedCount());
+  activeTabs.clear();
+  activeTabsByIndex.clear();
+  batchPerformanceTimings.clear();
+  tabsPendingConfirm.clear();
+  tabsWaitingClose.clear();
+  activeTabCount = 0;
+  isOpeningTab = false;
+  isTerminated = status === 'terminated';
+  if (nextAutoSubmitAt > Date.now()) updateProgressActivity();
+  renderParsedUrlPreviewFromState();
+  renderStats();
+  updateStatsUI();
+  setStatus(status);
+  updateUI();
+  if (restoredFromRunning) await saveTaskSnapshot({ ...snapshot, status, updatedAt: Date.now() });
+  await refreshTaskList();
+  console.info('[batch][task-manager] snapshot restored', {
+    batchId,
+    reason: options.reason || 'task_selection',
+    status,
+    totalCount,
+    resultCount: localResults.length
+  });
+  return true;
+}
+
 async function restoreBatchRuntimeState(options = {}) {
   await loadCurrentPromotionProject({ createFromLegacy: false }).catch(() => null);
   if (options.shouldContinue && !options.shouldContinue()) return false;
+  const taskManager = getBatchTaskManager();
+  if (taskManager) {
+    const registry = await getStoredTaskRegistry();
+    const currentProjectId = currentPromotionProject && currentPromotionProject.id ? String(currentPromotionProject.id) : '';
+    const currentPromotionKey = normalizePromotionWebsiteKey(currentPromotionWebsiteUrl || '');
+    const selectedTask = taskManager.selectTaskForRestore({
+      tasks: Object.values(registry),
+      currentPromotionProjectId: currentProjectId,
+      currentPromotionKey
+    });
+    if (selectedTask) {
+      const restoredTask = await restoreTaskSnapshot(selectedTask.batchId, { reason: 'task_registry' });
+      if (restoredTask) return true;
+    }
+  }
   const activePromotionWebsiteUrl = currentPromotionWebsiteUrl || '';
   const activePromotionKey = normalizePromotionWebsiteKey(activePromotionWebsiteUrl || '');
   const promotionStorageKey = getPromotionRuntimeStorageKey(activePromotionKey);
@@ -2865,6 +3444,10 @@ async function restoreBatchRuntimeState(options = {}) {
   noCommentBoxCount = Number(snapshot.noCommentBoxCount || 0);
   manualRequiredCount = Number(snapshot.manualRequiredCount || 0);
   blockedIllegalCount = Number(snapshot.blockedIllegalCount || 0);
+  nextAutoSubmitAt = Number(snapshot.nextAutoSubmitAt || 0);
+  confirmedAutoSubmitCheckpoints = snapshot.confirmedAutoSubmitCheckpoints && typeof snapshot.confirmedAutoSubmitCheckpoints === 'object'
+    ? snapshot.confirmedAutoSubmitCheckpoints
+    : {};
   pendingCount = Math.max(0, totalCount - getProcessedCount());
   activeTabs.clear();
   activeTabsByIndex.clear();
@@ -2874,6 +3457,7 @@ async function restoreBatchRuntimeState(options = {}) {
   activeTabCount = 0;
   isOpeningTab = false;
   isTerminated = status === 'terminated';
+  if (nextAutoSubmitAt > Date.now()) updateProgressActivity();
 
   renderParsedUrlPreviewFromState();
   renderStats();
@@ -2898,6 +3482,7 @@ async function restoreBatchRuntimeState(options = {}) {
     restoredResultCount: localResults.length,
     persistedResultCount: snapshot.localResultCount || localResults.length
   });
+  await saveTaskSnapshot({ ...snapshot, status, updatedAt: Date.now() });
   return true;
 }
 
@@ -2932,6 +3517,7 @@ async function saveArchiveRecord(resultEntry) {
     targetDomain: resultEntry.targetDomain || (currentPromotionProject && currentPromotionProject.targetDomain) || '',
     promotionWebsiteUrl,
     promotionWebsiteKey: normalizePromotionWebsiteKey(promotionWebsiteUrl),
+    submitSource: resultEntry.submitSource || 'batch_auto',
     sourceUrl: resultEntry.url || '',
     sourceDomain: resultEntry.sourceDomain || extractDomain(resultEntry.url || ''),
     discoveryTargetUrl: resultEntry.discoveryTargetUrl || '',
@@ -3285,7 +3871,11 @@ function updateArchiveActionButtons(records, selectedWebsiteKey) {
     deleteArchiveAllBtn.disabled = !hasRecords;
   }
   if (checkArchiveBacklinksBtn) {
-    checkArchiveBacklinksBtn.disabled = !hasRecords || archiveBacklinkCheckRunning;
+    const blockedByBatch = status === 'running';
+    checkArchiveBacklinksBtn.disabled = !hasRecords || archiveBacklinkCheckRunning || blockedByBatch;
+    checkArchiveBacklinksBtn.title = blockedByBatch
+      ? '批量提交进行中，完成或暂停后可检测'
+      : (!hasRecords ? '当前没有已提交记录可检测' : '检测已提交记录的外链状态');
   }
   if (exportArchiveBtn) {
     exportArchiveBtn.disabled = !hasRecords || archiveBacklinkCheckRunning;
@@ -3376,24 +3966,9 @@ async function onAllCompleted() {
     } catch (_) {}
   }
 
-  // Text cleanup: previous comment was mojibake.
-  let finalPoints = initialPoints;
-  try {
-    console.info('[batch][api] GET /get-points final', { userId });
-    const resp = await fetch(`${API_BASE}/get-points?userId=${encodeURIComponent(userId)}`);
-    const json = await resp.json();
-    if (json.success && json.points !== undefined) {
-      finalPoints = json.points;
-    }
-  } catch (_) {}
-
-  const pointsDiff = initialPoints - finalPoints;
-  if (pointsDiff > 0 && Math.abs(pointsDiff - successCount) > 2) {
-    console.warn(`Points diff (${pointsDiff}) does not match success count (${successCount}); using actual results.`);
-  }
-
   updateStatsUI();
   updateUI();
+  await persistBatchRuntimeState({ immediate: true });
 }
 
 // Text cleanup: previous comment was mojibake.
@@ -3504,13 +4079,34 @@ async function checkTimeouts() {
 // ==================== section ====================
 function setStatus(s) {
   status = s;
-  statusBadge.textContent = {
-    idle: 'Idle',
-    running: 'Running',
-    completed: 'Completed',
-    terminated: 'Terminated'
-  }[s] || s;
-  statusBadge.className = 'status-badge ' + s;
+  if (statusBadge) {
+    statusBadge.textContent = {
+      idle: 'Idle',
+      running: 'Running',
+      completed: 'Completed',
+      terminated: 'Terminated'
+    }[s] || s;
+    statusBadge.className = 'status-badge ' + s;
+  }
+}
+
+function setAppView(view) {
+  const nextView = ['workbench', 'tasks', 'submissions'].includes(view) ? view : 'workbench';
+  activeAppView = nextView;
+  document.querySelectorAll('[data-app-view]').forEach((element) => {
+    element.classList.toggle('app-view-hidden', element.dataset.appView !== nextView);
+  });
+  appNavButtons.forEach((button) => {
+    const isActive = button.dataset.appNav === nextView;
+    button.classList.toggle('active', isActive);
+    button.setAttribute('aria-current', isActive ? 'page' : 'false');
+  });
+  if (nextView === 'submissions') setResultsView('archive');
+  if (nextView === 'tasks') refreshTaskList().catch((error) => {
+    console.warn('[batch][task-manager] task list refresh failed', {
+      message: error && error.message ? error.message : String(error)
+    });
+  });
 }
 
 function setResultsView(view) {
@@ -3604,6 +4200,8 @@ function updateStatsUI() {
   noCommentBoxCountEl.textContent = noCommentBoxCount;
   if (manualRequiredCountEl) manualRequiredCountEl.textContent = manualRequiredCount;
   pendingCountEl.textContent = pendingCount;
+  updateProgressActivity();
+  void refreshDailyAutoSubmitProgress();
 }
 
 // ==================== section ====================
@@ -4079,10 +4677,18 @@ async function checkArchiveBacklinkStatus(options = {}) {
   }
 
   if (archiveBacklinkCheckState.active) return;
+  if (status === 'running') {
+    alert('批量提交进行中，请暂停或完成后再检测。');
+    return;
+  }
   resetArchiveBacklinkCheckState();
 
   const records = await getArchiveRecords();
-  const filtered = getFilteredArchiveRecords(records);
+  const taskManager = getBatchTaskManager();
+  const filteredRows = getFilteredArchiveRecords(records);
+  const filtered = taskManager
+    ? taskManager.selectBacklinkCheckableRecords(filteredRows)
+    : filteredRows;
   if (filtered.length === 0) {
     alert('当前筛选条件下没有可检查的历史记录。');
     return;

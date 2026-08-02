@@ -1,5 +1,6 @@
 const express = require('express');
 const { queryOne } = require('./db');
+const { getModelHealth } = require('../lib/model-settings');
 
 const router = express.Router();
 
@@ -29,7 +30,7 @@ router.get('/local-status', async (_req, res) => {
       ok: false,
       message: 'Checking'
     },
-    model: getModelStatus(),
+    model: { ...getModelStatus(), ...getModelHealth() },
     timestamp: new Date().toISOString()
   };
 

@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AI 模型配置</title>
+  <link rel="stylesheet" href="model-settings.css">
+</head>
+<body>
+  <main class="page-shell">
+    <header class="page-header">
+      <div>
+        <p class="eyebrow">BacklinkAssistant</p>
+        <h1>AI 模型配置</h1>
+        <p class="intro">支持 OpenAI 兼容接口。令牌仅保存到当前电脑的后端 <code>.env</code>，页面不会读取或显示完整令牌。</p>
+      </div>
+      <button id="back" class="button secondary" type="button">返回首页</button>
+    </header>
+    <section class="panel" aria-labelledby="connection-heading">
+      <div class="section-heading">
+        <div><h2 id="connection-heading">连接参数</h2><p>可先使用 PackyAPI 预设，再填写令牌和实际可用的模型名。</p></div>
+        <button id="packyPreset" class="button secondary" type="button">使用 PackyAPI 预设</button>
+      </div>
+      <form id="settingsForm" novalidate>
+        <div class="form-grid">
+          <label>接口基础地址<input id="apiBase" name="apiBase" type="url" placeholder="https://www.packyapi.com/v1" required></label>
+          <label>模型名称<input id="model" name="model" type="text" placeholder="例如：deepseek-chat" required></label>
+          <label>请求模式<select id="wireApi" name="wireApi"><option value="chat_completions">Chat Completions</option><option value="responses">Responses</option></select></label>
+          <label>请求路径<input id="chatPath" name="chatPath" type="text" placeholder="/chat/completions" required></label>
+          <label class="wide">API 令牌<input id="apiKey" name="apiKey" type="password" autocomplete="off" placeholder="首次保存时必填；留空则保留已保存令牌"><span id="tokenState" class="help-text">正在读取令牌状态…</span></label>
+        </div>
+        <div class="actions"><button id="save" class="button primary" type="submit">保存配置</button><button id="test" class="button secondary" type="button">测试连通性</button></div>
+      </form>
+    </section>
+    <section class="panel" aria-labelledby="status-heading"><h2 id="status-heading">当前状态</h2><output id="health" class="status pending">正在读取后端状态…</output><output id="result" class="result" aria-live="polite"></output></section>
+  </main>
+  <script src="model-settings.js"></script>
+</body>
+</html>

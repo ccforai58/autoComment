@@ -1,11 +1,25 @@
 const { execute, queryOne } = require('./db');
 const { findBlockedKeyword, loadBlockedKeywords } = require('./blocked-keywords');
 const { cancelModelRequest, generateWithModelQueued } = require('../lib/model-generate');
-const { stripGeneratedCopyMarkdownFences } = require('../lib/generated-copy-cleanup');
+const { stripGeneratedCopyMarkdownFences, validateGeneratedComment } = require('../lib/generated-copy-cleanup');
 const { ensurePromotionAnchor } = require('../lib/promotion-anchor-logic');
 const promptLogic = require('../lib/generate-copy-prompt');
+const { buildSkillTemplate } = require('../lib/comment-prompt-rules');
+const { parseManualAssistantJson } = require('../lib/manual-assistant-json');
 
 const POINTS_COST_PER_GENERATION = 1;
+
+const COMMENT_STRUCTURE_RULE = [
+  '',
+  'Comment structure requirements:',
+  "Start by affirming the article's value using a specific topic, insight, method, example, or reader benefit from the current page.",
+  'Then add one substantive follow-up viewpoint, suggestion, or extension and integrate the promoted website as a useful resource within that second part.',
+  'For space-delimited languages, make the value affirmation approximately 30 words and the follow-up viewpoint approximately 50 words.',
+  'For Chinese, Japanese, Korean, Thai, Lao, and Burmese, make the value affirmation approximately 50 to 70 characters and the follow-up viewpoint approximately 100 to 140 characters.',
+  'Prefer a specific direct connection between the article and promoted website. If their primary topics differ, find and state a specific secondary connection grounded in their supplied content, such as writing method, content structure, user experience, page speed, visual presentation, workflow, creative inspiration, case presentation, or audience need.',
+  'Do not use vague bridges such as "worth learning" or "very helpful", and do not invent facts, capabilities, results, or claims for either website.',
+  'The HTML anchor must be naturally embedded in the second part, not added as a detached link.'
+].join('\n');
 
 const LINK_HREF_NEWLINE_RULE = [
   '',
@@ -95,23 +109,7 @@ function getDefaultSkillTemplateV2() {
   ].join('\n');
 }
 
-function appendRequiredOutputRules(skillTemplate) {
-  return `${skillTemplate.trim()}\n${LINK_HREF_NEWLINE_RULE}`;
-}
-
 const buildUserPrompt = promptLogic.buildUserPrompt;
-
-function parseManualAssistantJson(text) {
-  const raw = stripGeneratedCopyMarkdownFences(text || '').trim();
-  const match = raw.match(/\{[\s\S]*\}/);
-  if (!match) return null;
-  try {
-    const parsed = JSON.parse(match[0]);
-    return parsed && typeof parsed === 'object' ? parsed : null;
-  } catch (_) {
-    return null;
-  }
-}
 
 function normalizeManualFieldValues(value) {
   const source = value && typeof value === 'object' ? value : {};
@@ -230,12 +228,15 @@ module.exports = async function handler(req, res) {
       });
     }
 
+    const isManualMode = manualMode === true;
+    const shouldRequireHtmlAnchor = !isManualMode || String(manualPageType || '').trim() === 'blog_comment';
     const baseTemplate = skillTemplate && skillTemplate.trim()
       ? skillTemplate.trim()
       : getDefaultSkillTemplateV2();
-    const isManualMode = manualMode === true;
-    const shouldRequireHtmlAnchor = !isManualMode || String(manualPageType || '').trim() === 'blog_comment';
-    const template = shouldRequireHtmlAnchor ? appendRequiredOutputRules(baseTemplate) : baseTemplate.trim();
+    const template = buildSkillTemplate(baseTemplate, {
+      requireHtmlAnchor: shouldRequireHtmlAnchor,
+      requireCommentStructure: shouldRequireHtmlAnchor
+    });
     const userPrompt = buildUserPrompt({
       websiteUrl,
       title,
@@ -260,6 +261,19 @@ module.exports = async function handler(req, res) {
     const cleanedGeneratedText = manualJson
       ? (fieldValues.commentText || fieldValues.longDescription || fieldValues.shortDescription || fieldValues.bio)
       : stripGeneratedCopyMarkdownFences(generatedText);
+    if (shouldRequireHtmlAnchor) {
+      const validation = validateGeneratedComment(cleanedGeneratedText);
+      if (!validation.valid) {
+        console.warn('[generate-copy] rejected non-comment model output', {
+          reason: validation.reason,
+          generatedLength: cleanedGeneratedText.length,
+          manualMode: isManualMode
+        });
+        const error = new Error(`Model output rejected: ${validation.reason}`);
+        error.code = 'MODEL_OUTPUT_INVALID';
+        throw error;
+      }
+    }
     const anchored = shouldRequireHtmlAnchor ? ensurePromotionAnchor(cleanedGeneratedText, {
       promotionUrl: promotionWebsiteUrl || websiteUrl,
       promotionContent: promotionWebsiteContent || '',

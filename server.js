@@ -13,7 +13,7 @@ app.use(express.urlencoded({ extended: true }));
 
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   if (req.method === 'OPTIONS') {
     res.status(200).end();
@@ -38,6 +38,7 @@ app.use('/api', require('./api/refund-points'));
 app.use('/api', batchRouter);
 app.use('/api', require('./api/debug-log'));
 app.use('/api', require('./api/local-status'));
+app.use('/api', require('./api/model-settings'));
 app.use('/api', require('./api/semrush-domain-review'));
 app.use('/api', require('./api/backlink-check'));
 app.use('/api', linkAssistantRouter);
@@ -65,6 +66,9 @@ app.use((req, res) => {
 app.listen(PORT, () => {
   console.log(`[Server] local backend listening on port ${PORT}`);
   console.info('[Server] ENABLE_PAYMENT =', ENABLE_PAYMENT);
+  require('./lib/model-settings').refreshModelHealth().catch((error) => {
+    console.warn('[Server] model health check failed:', error && error.message ? error.message : String(error));
+  });
 
   blogRunStatsHandler.ensureTable().catch((err) => {
     console.error('[Server] blog_run_stats table init failed:', err);

@@ -3,11 +3,11 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 
-const runtimeLogic = require('../../load-this-extension/lib/link-assistant-runtime-logic');
+const runtimeLogic = require('../lib/link-assistant-runtime-logic');
 
 test('loaded extension can create backlink submissions without a stored promotion project id', () => {
   const batchScript = fs.readFileSync(
-    path.join(__dirname, '..', '..', 'load-this-extension', 'batch.js'),
+    path.join(__dirname, '..', 'batch.js'),
     'utf8'
   );
 
@@ -44,7 +44,7 @@ test('archive backlink check payload carries Semrush page ascore from stored met
 
 test('loaded extension emits batch performance timing logs for submission diagnosis', () => {
   const batchScript = fs.readFileSync(
-    path.join(__dirname, '..', '..', 'load-this-extension', 'batch.js'),
+    path.join(__dirname, '..', 'batch.js'),
     'utf8'
   );
 

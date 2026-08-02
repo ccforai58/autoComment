@@ -8,7 +8,7 @@ const {
   getPagedResources,
   getSubmitSourceLabel,
   sortResources
-} = require('../../load-this-extension/resource-library');
+} = require('../resource-library');
 
 test('getPagedResources returns only the selected page rows', () => {
   const rows = Array.from({ length: 60 }, (_, index) => ({ id: String(index + 1) }));
